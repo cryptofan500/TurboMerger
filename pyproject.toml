@@ -1,0 +1,62 @@
+[project]
+name = "turbomerger"
+version = "4.0.0"
+description = "High-performance code merger with secret scanning for LLM context"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11,<3.14"
+authors = [{ name = "Pawel", email = "zawadzkipawel37@outlook.com" }]
+keywords = ["code", "merger", "LLM", "context", "pdf", "security"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "customtkinter>=5.2.2",
+    "pypdf>=5.1.0",
+    "darkdetect>=0.8.0",
+    "pywin32>=306",
+    "setuptools>=69.0.0",
+    "pillow>=10.0.0",
+    "tiktoken>=0.8.0",
+]
+
+[project.gui-scripts]
+turbomerger = "turbomerger.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/cryptofan500/turbomerger"
+
+[build-system]
+requires = ["hatchling>=1.21.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/turbomerger"]
+
+[dependency-groups]
+dev = [
+    "nuitka>=2.8.0",
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.8.0",
+    "pre-commit>=3.6.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --cov=src/turbomerger --cov-report=term-missing"
