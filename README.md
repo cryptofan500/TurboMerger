@@ -1,169 +1,225 @@
-# TurboMerger v4.0
+# TurboMerger v6
 
-High-performance code merger with secret scanning, optimized for feeding large codebases into LLM context windows.
+A high-performance codebase merger that transforms entire project directories into a single, LLM-ready markdown file. Built with Rust and Tauri 2.0 for Windows.
+
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
+![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)
 
 ## Features
 
-- **Smart Scanning** - Intelligently filters code files, skips binaries and dependencies
-- **Secret Detection** - Catches API keys, tokens, and credentials before they leak
-- **PDF Extraction** - Extracts text from PDF documentation
-- **Token Counting** - Accurate tiktoken-based token estimation for GPT models
-- **Multithreaded** - Parallel file processing with cooperative cancellation
-- **Config Profiles** - Save and load scan configurations
-- **.gitignore Support** - Respects your project's .gitignore patterns
-- **Dark/Light Themes** - Modern CustomTkinter interface
-- **Windows Integration** - Right-click context menu support via installer
+- **Parallel Processing** - Multi-core file scanning with jwalk and Rayon
+- **Smart Binary Detection** - 7-layer NuclearSieve pipeline filters non-text files
+- **Memory Efficient** - Streaming architecture handles codebases of any size
+- **Secret Redaction** - Pattern-based detection of API keys, passwords, and credentials
+- **Virtual Environment Auto-Skip** - Detects and skips Python venv directories (500%+ faster on Python projects)
+- **Lock File Exclusion** - Skips package-lock.json, Cargo.lock, yarn.lock to reduce context bloat
+- **Modern UI** - React frontend with progress tracking and cancel support
 
 ## Installation
 
-### From Source (Development)
+### Option 1: Download Release
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/):
+Download the latest installer from [Releases](https://github.com/yourusername/turbomerger/releases):
+- `TurboMerger_x.x.x_x64-setup.exe` (NSIS installer)
+- `TurboMerger_x.x.x_x64_en-US.msi` (MSI installer)
 
-```bash
+### Option 2: Build from Source
+
+#### Prerequisites
+
+| Requirement | Version | Installation |
+|-------------|---------|--------------|
+| Windows | 10 or newer | - |
+| Node.js | 18+ | [nodejs.org](https://nodejs.org/) |
+| Rust | 1.70+ | [rustup.rs](https://rustup.rs/) |
+| Visual Studio Build Tools | 2019+ | [Visual Studio](https://visualstudio.microsoft.com/downloads/) with "Desktop development with C++" workload |
+
+#### Build Steps
+
+```powershell
 # Clone the repository
-git clone https://github.com/cryptofan500/turbomerger.git
+git clone https://github.com/yourusername/turbomerger.git
 cd turbomerger
 
-# Install dependencies
-uv sync
+# Install Node.js dependencies
+npm install
 
-# Run the application
-uv run python -m turbomerger
+# Build the application (creates installer)
+npm run tauri build
 ```
 
-### Windows Installer
+The built executable will be at:
+```
+src-tauri\target\release\turbomerger.exe
+```
 
-Download the latest `TurboMerger-X.X.X-Setup.exe` from [Releases](https://github.com/cryptofan500/turbomerger/releases).
-
-### Standalone Executable
-
-Download `turbomerger.exe` from [Releases](https://github.com/cryptofan500/turbomerger/releases) - no installation required.
+Installers will be at:
+```
+src-tauri\target\release\bundle\nsis\TurboMerger_x.x.x_x64-setup.exe
+src-tauri\target\release\bundle\msi\TurboMerger_x.x.x_x64_en-US.msi
+```
 
 ## Usage
 
-### GUI Mode
+1. **Launch TurboMerger** - Run the executable or installed application
+2. **Select Source Directory** - Click "Select Folder" to choose a codebase
+3. **Configure Options**:
+   - Include directory tree (generates visual file structure)
+   - Include virtual environments (default: skip for speed)
+4. **Select Output Location** - Choose where to save the merged markdown file
+5. **Click Merge** - Progress bar shows scanning and merging status
+6. **Open Result** - Click "Open File" or "Open Folder" to access output
 
-```bash
-# Using uv (development)
-uv run python -m turbomerger
+## Architecture
 
-# Using the executable
-turbomerger.exe
+```
+turbomerger/
+├── src/                    # React/TypeScript frontend
+│   ├── App.tsx             # Main UI component
+│   └── styles/             # CSS styling
+├── src-tauri/              # Rust backend
+│   ├── src/
+│   │   ├── lib.rs          # Tauri entry point
+│   │   ├── commands.rs     # IPC command handlers
+│   │   ├── merger/         # Core merge logic with streaming I/O
+│   │   ├── scanner/        # Directory walking (jwalk + PHF)
+│   │   └── security/       # Secret detection and path validation
+│   └── resources/
+│       └── extensions.json # Text/binary extension definitions
+└── scripts/
+    └── build_msi.ps1       # Build automation script
 ```
 
-### Scan Modes
+## Binary Detection (NuclearSieve)
 
-| Mode | Description |
-|------|-------------|
-| **Smart Scan** | Code files only (.py, .js, .ts, .go, .rs, etc.) |
-| **Complete Scan** | Code + documentation (.md, .txt, .rst, etc.) |
+The 7-layer pipeline ensures only text files are included:
 
-### Configuration Options
-
-- **Max File Size** - Skip files larger than this (default: 2 MB)
-- **Max Characters** - Truncate files exceeding this limit (default: 100,000)
-- **Respect .gitignore** - Honor project's .gitignore patterns (default: on)
-
-### Output Format
-
-TurboMerger creates a structured markdown file with:
-
-```markdown
-# Project: my-project
-Generated: 2024-12-27 10:30:00
-
-## Table of Contents
-- [src/main.py](#src-main-py)
-- [src/utils.py](#src-utils-py)
-
----
-
-## src/main.py
-```python
-# File contents here
-```
+| Layer | Check | Purpose |
+|-------|-------|---------|
+| 1 | Filename | Skip system files (NTUSER.DAT, Thumbs.db) |
+| 2 | Extension | PHF lookup for 100+ known extensions |
+| 3 | File Size | Skip files > 50MB |
+| 4 | Magic Bytes | Detect PNG, JPEG, PDF, EXE, archives |
+| 5 | NULL Bytes | Binary indicator scan |
+| 6 | content_inspector | Library-based detection |
+| 7 | Shannon Entropy | Detect compressed/encrypted content |
 
 ## Security Features
 
-TurboMerger scans for:
+- **Strict CSP** - Content-Security-Policy prevents XSS attacks
+- **Symlink Protection** - Reparse points (junctions/symlinks) are never followed
+- **System Path Blocking** - Windows, Program Files, AppData directories blocked
+- **Sensitive File Exclusion** - SSH keys, credentials, and secret files excluded
+- **Secret Redaction** - Regex patterns detect and redact API keys in output
 
-- AWS Access Keys & Secret Keys
-- OpenAI API Keys (including new sk-proj- format)
-- Stripe Live/Test Keys
+### Detected Secret Patterns
+
+- AWS Access Keys and Secret Keys
 - GitHub Personal Access Tokens
+- Stripe API Keys (live and test)
 - Google API Keys
-- SSH Private Keys
-- Generic high-entropy secrets
+- Private Keys (RSA, OpenSSH, PGP)
+- Database Connection Strings
+- JWT Tokens
+- And 20+ more patterns
 
-Files flagged with secrets are highlighted in the Security tab and excluded from output.
+## Performance
 
-## Building from Source
+| Project Size | Files | Approximate Time |
+|--------------|-------|------------------|
+| Small | 1,000 | ~2 seconds |
+| Medium | 10,000 | ~15 seconds |
+| Large | 50,000 | ~1 minute |
+| Enterprise | 100,000+ | ~3 minutes |
 
-### Windows Executable (Nuitka)
+Performance achieved through:
+- **jwalk** - Parallel directory traversal
+- **Rayon** - Multi-core file processing
+- **PHF** - Compile-time perfect hash for O(1) extension lookups
+- **Memory-mapped I/O** - Large file handling without memory exhaustion
 
-```bash
-# One-file build (smaller, slower startup)
-build_scripts\build_exe.bat
+## Skipped Directories (55+)
 
-# Folder build (larger, faster startup)
-build_scripts\build_standalone.bat
-```
+TurboMerger automatically skips directories that bloat output without adding value:
 
-### Windows Installer (Inno Setup)
-
-1. Build the executable first
-2. Install [Inno Setup 6.6+](https://jrsoftware.org/isinfo.php)
-3. Compile `build_scripts\setup.iss`
+- **Version Control**: .git, .svn, .hg
+- **Dependencies**: node_modules, vendor, packages
+- **Build Outputs**: target, dist, build, out
+- **Python**: venv, .venv, __pycache__, .pytest_cache
+- **IDE**: .idea, .vscode, .vs
+- **Caches**: .cache, .next, .nuxt
 
 ## Development
 
-### Running Tests
+```powershell
+# Install dependencies
+npm install
 
-```bash
-uv run pytest
+# Run in development mode (hot reload)
+npm run tauri dev
+
+# Type check TypeScript
+npm run typecheck
+
+# Lint code
+npm run lint
+
+# Build for production
+npm run tauri build
 ```
 
-### Code Quality
+## Configuration Files
 
-```bash
-# Linting
-uv run ruff check src tests
+| File | Purpose |
+|------|---------|
+| `package.json` | Node.js dependencies and scripts |
+| `tauri.conf.json` | Tauri app configuration |
+| `Cargo.toml` | Rust dependencies |
+| `tsconfig.json` | TypeScript configuration |
+| `vite.config.ts` | Vite bundler settings |
 
-# Formatting
-uv run ruff format src tests
+## Troubleshooting
 
-# Type checking
-uv run mypy src
+### Build fails with "MSVC not found"
+
+Install Visual Studio Build Tools with the "Desktop development with C++" workload.
+
+### Rust compilation errors
+
+Ensure Rust is up to date:
+```powershell
+rustup update
 ```
 
-## Requirements
+### WebView2 runtime missing
 
-- Python 3.11+
-- Windows 10 version 1903+ (for installer)
+The installer includes WebView2 bootstrapper. For manual builds, download from [Microsoft](https://developer.microsoft.com/en-us/microsoft-edge/webview2/).
 
-### Dependencies
+### Large codebase runs out of memory
 
-- customtkinter - Modern Tkinter widgets
-- pypdf - PDF text extraction
-- tiktoken - OpenAI token counting
-
-## License
-
-MIT License - See [LICENSE](LICENSE) for details.
+TurboMerger uses streaming I/O, but extremely large files (>50MB) are skipped. Check logs for skipped files.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
-## Changelog
+## License
 
-### v4.0.0
+MIT License - See [LICENSE](LICENSE) file for details.
 
-- Complete rewrite with CustomTkinter GUI
-- Added secret scanning with comprehensive patterns
-- Added tiktoken token counting
-- Added .gitignore support
-- Multithreaded file processing
-- Config profile save/load
-- Windows installer with context menu integration
+## Acknowledgments
+
+- [Tauri](https://tauri.app/) - Desktop app framework
+- [Rayon](https://github.com/rayon-rs/rayon) - Data parallelism library
+- [jwalk](https://github.com/jessegrosjean/jwalk) - Parallel directory walking
+- [content_inspector](https://crates.io/crates/content_inspector) - Binary detection
+- [PHF](https://github.com/rust-phf/rust-phf) - Compile-time hash maps
+
+---
+
+**Made for developers who need to feed entire codebases to LLMs.**
