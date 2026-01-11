@@ -1,0 +1,76 @@
+# Build artifacts
+target/
+dist/
+node_modules/
+*.exe
+*.msi
+*.dmg
+*.app
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS generated
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+__MACOSX/
+
+# Secrets - CRITICAL
+.env
+.env.*
+.env.local
+.env.production
+secrets.local.json
+*.pem
+*.key
+*.pfx
+id_rsa*
+id_dsa*
+id_ed25519*
+
+# Logs and temp
+*.log
+*.tmp
+*.temp
+npm-debug.log*
+
+# Python (if any)
+*.pyc
+__pycache__/
+*.pyo
+venv/
+.venv/
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Caches
+.cache/
+.parcel-cache/
+
+# Rust specific
+**/*.rs.bk
+Cargo.lock.bak
+
+# Tauri generated
+src-tauri/target/
+src-tauri/gen/
+
+# Development handoff and AI notes
+CLAUDE_CODE_MASTER_HANDOFF*.md
+HANDOFF*.md
+CLAUDE.md
+CHANGES.md
+*_merged.md
+*.backup
+*handoff*
+*critique*
+
+# Claude Code
+.claude/

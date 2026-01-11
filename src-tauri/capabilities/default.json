@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "default",
+  "description": "TurboMerger default capabilities with security hardening",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    {
+      "identifier": "fs:allow-read-file",
+      "allow": [
+        { "path": "$DOCUMENT/**" },
+        { "path": "$DOWNLOAD/**" },
+        { "path": "$HOME/**" }
+      ],
+      "deny": [
+        { "path": "$HOME/.*" },
+        { "path": "$HOME/.ssh/**" },
+        { "path": "$HOME/.gnupg/**" },
+        { "path": "$HOME/.aws/**" },
+        { "path": "$APPCONFIG/**" },
+        { "path": "C:\\Windows/**" },
+        { "path": "C:\\Program Files/**" },
+        { "path": "C:\\Program Files (x86)/**" },
+        { "path": "C:\\ProgramData/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-write-file",
+      "allow": [
+        { "path": "$DOWNLOAD/**" },
+        { "path": "$DOCUMENT/**" }
+      ]
+    },
+    "fs:allow-exists",
+    "fs:allow-mkdir",
+    "fs:deny-read-file"
+  ]
+}

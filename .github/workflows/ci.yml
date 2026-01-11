@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Check Rust formatting
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: TypeScript type check
+        run: npm run typecheck
+
+      - name: ESLint
+        run: npm run lint
+
+  test:
+    name: Test
+    runs-on: windows-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test --all-features
+
+  build:
+    name: Build
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Create binaries directory
+        run: New-Item -ItemType Directory -Force -Path src-tauri/binaries
+
+      - name: Create placeholder for Tesseract
+        run: |
+          # Create a placeholder file for CI (actual Tesseract downloaded in release)
+          echo "placeholder" > src-tauri/binaries/tesseract-x86_64-pc-windows-msvc.exe
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build Tauri app (debug)
+        run: npm run tauri build -- --debug
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-build
+          path: |
+            src-tauri/target/debug/turbomerger.exe
+          retention-days: 7
