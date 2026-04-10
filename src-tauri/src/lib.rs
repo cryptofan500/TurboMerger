@@ -1,4 +1,5 @@
 mod commands;
+mod config;
 mod merger;
 mod scanner;
 pub mod security;

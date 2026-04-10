@@ -10,6 +10,9 @@ interface MergeResult {
   files_skipped: number;
   total_bytes: number;
   duration_ms: number;
+  files_by_extension: number;
+  files_by_content: number;
+  files_skipped_binary: number;
 }
 
 interface ProgressUpdate {
@@ -24,6 +27,7 @@ interface MergeOptions {
   output_path: string | null;
   include_venv: boolean;
   include_tree: boolean;
+  content_detection: boolean;
 }
 
 type Status = "ready" | "scanning" | "merging" | "done" | "error" | "cancelled";
@@ -34,6 +38,7 @@ function App() {
   const [outputPath, setOutputPath] = useState<string>("");
   const [includeVenv, setIncludeVenv] = useState<boolean>(false);
   const [includeTree, setIncludeTree] = useState<boolean>(true);
+  const [contentDetection, setContentDetection] = useState<boolean>(true);
   const [result, setResult] = useState<MergeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressUpdate | null>(null);
@@ -102,6 +107,7 @@ function App() {
         output_path: outputPath || null,
         include_venv: includeVenv,
         include_tree: includeTree,
+        content_detection: contentDetection,
       };
 
       const mergeResult = await invoke<MergeResult>("merge_folder", { options });
@@ -150,7 +156,7 @@ function App() {
       <div className="container">
         <header className="header">
           <h1 className="title">TurboMerger</h1>
-          <span className="version">v6.0</span>
+          <span className="version">v7.0</span>
         </header>
 
         {/* Source Selection */}
@@ -212,6 +218,20 @@ function App() {
               />
               <span>Generate directory tree</span>
             </label>
+          </div>
+          <div className="checkbox-group">
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={contentDetection}
+                onChange={(e) => setContentDetection(e.target.checked)}
+                disabled={isWorking}
+              />
+              <span>Include all text files (content-based detection)</span>
+            </label>
+            <p className="checkbox-hint" style={{ color: 'var(--text-muted)' }}>
+              Detects text files by reading content, not just file extension
+            </p>
           </div>
         </section>
 
@@ -280,6 +300,13 @@ function App() {
                 <span className="stat-label">time</span>
               </div>
             </div>
+            {(result.files_by_extension > 0 || result.files_by_content > 0) && (
+              <p className="detection-breakdown">
+                {result.files_by_extension.toLocaleString()} by extension
+                {result.files_by_content > 0 && `, ${result.files_by_content.toLocaleString()} by content detection`}
+                {result.files_skipped_binary > 0 && `, ${result.files_skipped_binary.toLocaleString()} binary skipped`}
+              </p>
+            )}
             <div className="action-buttons">
               <button className="btn btn-success" onClick={handleOpenFile}>
                 Open File
@@ -308,7 +335,7 @@ function App() {
       </div>
 
       <footer className="footer">
-        <span>TurboMerger v6.0.0</span>
+        <span>TurboMerger v7.0.0</span>
       </footer>
     </div>
   );

@@ -31,6 +31,9 @@ pub struct MergeResult {
     pub files_skipped: usize,
     pub total_bytes: usize,
     pub duration_ms: u64,
+    pub files_by_extension: usize,
+    pub files_by_content: usize,
+    pub files_skipped_binary: usize,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -47,6 +50,7 @@ pub struct MergeOptions {
     pub output_path: Option<String>,
     pub include_venv: bool,
     pub include_tree: bool,
+    pub content_detection: bool,
 }
 
 /// Get the default Downloads folder path
@@ -123,10 +127,26 @@ pub async fn merge_folder(
         percentage: 0.0,
     });
 
+    // Load per-project config (turbomerger.toml)
+    let config = crate::config::load_from_dir(&root);
+
+    // Build scan options: merge UI settings with config file
+    let scan_options = scanner::ScanOptions {
+        include_venv: options.include_venv || config.scanning.include_venvs,
+        content_sniff: options.content_detection && config.scanning.content_sniff,
+        include_hidden: config.scanning.include_hidden,
+        max_file_size: config.scanning.max_file_size_mb * 1024 * 1024,
+        extra_text_exts: config.extensions.include,
+        extra_skip_exts: config.extensions.exclude,
+        extra_binary_exts: config.extensions.binary,
+    };
+
     // Scan for text files
-    let files = scanner::scan_text_files(&root, options.include_venv)
+    let scan_result = scanner::scan_text_files(&root, &scan_options)
         .map_err(|e| format!("Scan failed: {}", e))?;
 
+    let scan_stats = scan_result.stats;
+    let files = scan_result.files;
     let file_count = files.len();
 
     if file_count == 0 {
@@ -175,6 +195,9 @@ pub async fn merge_folder(
         files_skipped,
         total_bytes,
         duration_ms,
+        files_by_extension: scan_stats.by_extension,
+        files_by_content: scan_stats.by_content,
+        files_skipped_binary: scan_stats.skipped_binary,
     })
 }
 
