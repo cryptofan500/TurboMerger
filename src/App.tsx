@@ -156,7 +156,7 @@ function App() {
       <div className="container">
         <header className="header">
           <h1 className="title">TurboMerger</h1>
-          <span className="version">v7.0</span>
+          <span className="version">v7.1</span>
         </header>
 
         {/* Source Selection */}
@@ -335,7 +335,7 @@ function App() {
       </div>
 
       <footer className="footer">
-        <span>TurboMerger v7.0.0</span>
+        <span>TurboMerger v7.1.0</span>
       </footer>
     </div>
   );

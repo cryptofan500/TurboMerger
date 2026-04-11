@@ -29,6 +29,21 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 /// Number of bytes to read for content-based binary detection
 const SNIFF_SIZE: usize = 8192;
 
+/// Max line length before a file is considered minified/binary
+const MAX_LINE_LENGTH: usize = 1000;
+
+/// If >10% of bytes are control chars (0x01-0x08, 0x0E-0x1F), treat as binary
+const CONTROL_CHAR_THRESHOLD_PCT: usize = 10;
+
+/// If >40% of bytes have high bit set (0x80-0xFF), treat as binary/encoded
+const NON_ASCII_THRESHOLD_PCT: usize = 40;
+
+/// Files larger than this with unknown extensions are skipped (500KB)
+const LARGE_FILE_UNKNOWN_EXT: u64 = 524_288;
+
+/// Files larger than this are always skipped (2MB)
+const LARGE_FILE_ABSOLUTE: u64 = 2_097_152;
+
 // ============================================================================
 // EXTENSION SETS
 // ============================================================================
@@ -107,6 +122,8 @@ static BINARY_EXTENSIONS: phf::Set<&'static str> = phf_set! {
     "deb", "rpm", "apk", "ipa", "snap", "flatpak",
     // Other binary
     "swf",
+    // Build artifacts & caches
+    "map", "lock", "tsbuildinfo", "eslintcache", "stylelintcache",
 };
 
 /// Lock files to always skip (bloat LLM context without value)
@@ -146,6 +163,13 @@ static SKIP_DIRS_ALWAYS: phf::Set<&'static str> = phf_set! {
 
     // Caches
     ".cache", ".parcel-cache", ".next", ".nuxt", ".output",
+    ".svelte-kit", ".turbo",
+
+    // Deployment
+    ".vercel", ".netlify",
+
+    // Generated / docs
+    "__generated__", ".docusaurus", "storybook-static",
 
     // Misc
     "vendor", "packages", "bower_components",
@@ -288,10 +312,27 @@ fn is_venv_by_name(lower_name: &str) -> bool {
 // CONTENT-BASED BINARY DETECTION
 // ============================================================================
 
+/// Check if a filename matches minified/generated file patterns.
+/// These are compound extensions that can't be represented in a simple PHF set.
+#[inline]
+fn is_minified_filename(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.ends_with(".min.js")
+        || lower.ends_with(".min.css")
+        || lower.ends_with(".chunk.js")
+        || lower.ends_with(".bundle.js")
+}
+
 /// Read first 8192 bytes and check if the file appears to be text.
 ///
 /// Returns Ok(true) if the file appears to be text, Ok(false) if binary.
 /// Empty files are considered text. IO errors return Err.
+///
+/// Detection pipeline (in order):
+/// 1. Magic bytes + null byte ratio (via security::is_binary_content)
+/// 2. Control character ratio >10% → binary
+/// 3. Non-ASCII byte ratio >40% → binary/encoded
+/// 4. Any line >1000 chars → minified/binary
 fn sniff_file_content(path: &Path) -> Result<bool> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
@@ -303,7 +344,36 @@ fn sniff_file_content(path: &Path) -> Result<bool> {
     }
 
     buffer.truncate(bytes_read);
-    Ok(!crate::security::is_binary_content(&buffer))
+
+    // Check 1: Existing binary detection (magic bytes + null bytes + printable ratio)
+    if crate::security::is_binary_content(&buffer) {
+        return Ok(false);
+    }
+
+    // Check 2: Control character ratio (catches binary-as-UTF8 like SOH, DC1, NAK, etc.)
+    // Excludes tab (0x09), newline (0x0A), carriage return (0x0D)
+    let control_count = buffer
+        .iter()
+        .filter(|&&b| (0x01..=0x08).contains(&b) || (0x0E..=0x1F).contains(&b))
+        .count();
+    if control_count * 100 > bytes_read * CONTROL_CHAR_THRESHOLD_PCT {
+        return Ok(false);
+    }
+
+    // Check 3: Non-ASCII ratio (catches base64-encoded fonts, encrypted content)
+    let high_byte_count = buffer.iter().filter(|&&b| b >= 0x80).count();
+    if high_byte_count * 100 > bytes_read * NON_ASCII_THRESHOLD_PCT {
+        return Ok(false);
+    }
+
+    // Check 4: Max line length (catches minified JS/CSS bundles)
+    // No human-written source file has 1000+ character lines
+    let max_line_len = buffer.split(|&b| b == b'\n').map(|line| line.len()).max().unwrap_or(0);
+    if max_line_len > MAX_LINE_LENGTH {
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 /// Check if an extensionless file has a well-known text filename
@@ -397,9 +467,30 @@ pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult>
                     continue;
                 }
 
-                // Skip files exceeding max size
+                // Skip files exceeding max size (config-based, default 50MB)
                 if meta.len() > options.max_file_size {
                     continue;
+                }
+
+                // Hard limit: no file > 2MB regardless of extension
+                if meta.len() > LARGE_FILE_ABSOLUTE {
+                    stats.skipped_binary += 1;
+                    continue;
+                }
+
+                // Soft limit: files > 500KB must be known text extensions
+                if meta.len() > LARGE_FILE_UNKNOWN_EXT {
+                    let is_known_text = if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        let ext_lower = ext.to_ascii_lowercase();
+                        TEXT_EXTENSIONS.contains(ext_lower.as_str())
+                            || options.extra_text_exts.iter().any(|e| e == &ext_lower)
+                    } else {
+                        false
+                    };
+                    if !is_known_text {
+                        stats.skipped_binary += 1;
+                        continue;
+                    }
                 }
             }
 
@@ -408,9 +499,13 @@ pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult>
                 continue;
             }
 
-            // Skip lock files by name
+            // Skip lock files and minified/generated files by name
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if SKIP_FILES.iter().any(|&skip| name.eq_ignore_ascii_case(skip)) {
+                    continue;
+                }
+                if is_minified_filename(name) {
+                    stats.skipped_binary += 1;
                     continue;
                 }
             }
@@ -720,5 +815,138 @@ mod tests {
         assert!(!result.unwrap(), "Data with >5% null bytes should be binary");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- v7.1 binary detection upgrade tests ---
+
+    #[test]
+    fn test_sniff_rejects_minified_js() {
+        let dir = std::env::temp_dir().join("turbomerger_test_minified");
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("bundle.xyz");
+        // Create a single line with 5000 characters (simulates minified JS)
+        let data = "a".repeat(5000);
+        std::fs::write(&file_path, data.as_bytes()).unwrap();
+
+        let result = sniff_file_content(&file_path);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "File with 5000-char line should be rejected as minified");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sniff_rejects_control_chars() {
+        let dir = std::env::temp_dir().join("turbomerger_test_control");
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("control.xyz");
+        // Create data with >10% control characters (SOH, DC1, DC2, NAK, etc.)
+        let mut data = Vec::with_capacity(200);
+        for i in 0..200u8 {
+            if i % 5 == 0 {
+                // 20% control chars (well above 10% threshold)
+                data.push(0x01 + (i % 8)); // SOH through BS
+            } else {
+                data.push(b'X');
+            }
+        }
+        std::fs::write(&file_path, &data).unwrap();
+
+        let result = sniff_file_content(&file_path);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "File with >10% control chars should be rejected");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sniff_rejects_high_nonascii() {
+        let dir = std::env::temp_dir().join("turbomerger_test_nonascii");
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("encoded.xyz");
+        // Create data with >40% high bytes (0x80-0xFF)
+        let mut data = Vec::with_capacity(200);
+        for i in 0..200u8 {
+            if i % 2 == 0 {
+                // 50% high bytes (above 40% threshold)
+                data.push(0x80 + (i % 0x7F));
+            } else {
+                data.push(b'A');
+            }
+        }
+        std::fs::write(&file_path, &data).unwrap();
+
+        let result = sniff_file_content(&file_path);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "File with >40% non-ASCII bytes should be rejected");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sniff_accepts_normal_source() {
+        let dir = std::env::temp_dir().join("turbomerger_test_normal");
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("normal.xyz");
+        let code = r#"fn main() {
+    println!("Hello, world!");
+    let x = 42;
+    if x > 0 {
+        println!("positive");
+    }
+}
+"#;
+        std::fs::write(&file_path, code.as_bytes()).unwrap();
+
+        let result = sniff_file_content(&file_path);
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Normal source code should be accepted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_minified_extension_patterns() {
+        assert!(is_minified_filename("vendor.min.js"));
+        assert!(is_minified_filename("styles.min.css"));
+        assert!(is_minified_filename("app.chunk.js"));
+        assert!(is_minified_filename("main.bundle.js"));
+        assert!(is_minified_filename("VENDOR.MIN.JS")); // case insensitive
+
+        assert!(!is_minified_filename("app.js"));
+        assert!(!is_minified_filename("style.css"));
+        assert!(!is_minified_filename("bundle.ts"));
+        assert!(!is_minified_filename("chunk.json"));
+    }
+
+    #[test]
+    fn test_expanded_binary_extensions() {
+        assert!(BINARY_EXTENSIONS.contains("map"));
+        assert!(BINARY_EXTENSIONS.contains("lock"));
+        assert!(BINARY_EXTENSIONS.contains("snap")); // already in Packages section
+        assert!(BINARY_EXTENSIONS.contains("tsbuildinfo"));
+        assert!(BINARY_EXTENSIONS.contains("eslintcache"));
+        assert!(BINARY_EXTENSIONS.contains("stylelintcache"));
+    }
+
+    #[test]
+    fn test_skip_directories_expanded() {
+        assert!(SKIP_DIRS_ALWAYS.contains("dist"));
+        assert!(SKIP_DIRS_ALWAYS.contains("build"));
+        assert!(SKIP_DIRS_ALWAYS.contains(".next"));
+        assert!(SKIP_DIRS_ALWAYS.contains(".svelte-kit"));
+        assert!(SKIP_DIRS_ALWAYS.contains(".turbo"));
+        assert!(SKIP_DIRS_ALWAYS.contains(".vercel"));
+        assert!(SKIP_DIRS_ALWAYS.contains(".netlify"));
+        assert!(SKIP_DIRS_ALWAYS.contains("__generated__"));
+        assert!(SKIP_DIRS_ALWAYS.contains(".docusaurus"));
+        assert!(SKIP_DIRS_ALWAYS.contains("storybook-static"));
+    }
+
+    #[test]
+    fn test_file_size_constants() {
+        assert_eq!(LARGE_FILE_UNKNOWN_EXT, 524_288); // 500KB
+        assert_eq!(LARGE_FILE_ABSOLUTE, 2_097_152);  // 2MB
+        assert!(LARGE_FILE_ABSOLUTE > LARGE_FILE_UNKNOWN_EXT);
     }
 }
