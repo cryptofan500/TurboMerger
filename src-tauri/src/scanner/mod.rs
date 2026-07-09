@@ -479,8 +479,14 @@ fn keep_entry(entry: &ignore::DirEntry, include_venv: bool, include_hidden: bool
         return true;
     }
 
-    // Files: hidden gate (dot-prefix) with the config-file allowlist
-    if name_lower.starts_with('.') && !include_hidden && !is_allowlisted_dotfile(&name_lower) {
+    // Files: hidden gate (dot-prefix) with the config-file allowlist. Sensitive
+    // files (.env, *.pem, id_rsa…) are let through even when hidden so they get
+    // RECORDED as skipped-with-reason in classify(), never dropped silently.
+    if name_lower.starts_with('.')
+        && !include_hidden
+        && !is_allowlisted_dotfile(&name_lower)
+        && sensitive_reason(entry.path()).is_none()
+    {
         return false;
     }
 
