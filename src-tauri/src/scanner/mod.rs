@@ -344,11 +344,21 @@ fn is_minified_filename(name: &str) -> bool {
         || lower.ends_with(".bundle.js")
 }
 
-/// Previous TurboMerger outputs — re-merging them snowballs dumps-into-dumps
+/// Previous TurboMerger outputs — re-merging them snowballs dumps-into-dumps.
+/// Covers every output format and split parts; watch mode's stable
+/// `*_watch_merged.*` name matches too.
 #[inline]
 fn is_own_output(name_lower: &str) -> bool {
-    name_lower.ends_with("_merged.md")
-        || (name_lower.contains("_merged.part") && name_lower.ends_with(".md"))
+    let Some(pos) = name_lower.rfind("_merged.") else {
+        return false;
+    };
+    let tail = &name_lower[pos + "_merged.".len()..];
+    matches!(tail, "md" | "xml" | "json" | "txt")
+        || (tail.starts_with("part")
+            && (tail.ends_with(".md")
+                || tail.ends_with(".xml")
+                || tail.ends_with(".json")
+                || tail.ends_with(".txt")))
 }
 
 /// Check if an extensionless file has a well-known text filename
@@ -820,8 +830,13 @@ mod tests {
     fn test_own_output_detection() {
         assert!(is_own_output("apartment_2026-07-09_merged.md"));
         assert!(is_own_output("repo_merged.part1-of-3.md"));
+        assert!(is_own_output("repo_merged.xml"));
+        assert!(is_own_output("repo_merged.json"));
+        assert!(is_own_output("repo_merged.part2-of-3.json"));
+        assert!(is_own_output("myrepo_watch_merged.md"));
         assert!(!is_own_output("merged_results.md"));
         assert!(!is_own_output("notes.md"));
+        assert!(!is_own_output("data_merged.csv"));
     }
 
     #[test]

@@ -26,7 +26,7 @@ impl Default for AppState {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MergeResult {
     pub output_path: String,
     pub output_paths: Vec<String>,
@@ -55,7 +55,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MergeOptions {
     pub folder_path: String,
     pub output_path: Option<String>,
@@ -88,6 +88,12 @@ pub struct MergeOptions {
     /// Remove comments via tree-sitter (T2-4).
     #[serde(default)]
     pub strip_comments: bool,
+    /// Append `git diff HEAD` as a final section (T2-5).
+    #[serde(default)]
+    pub git_diff: bool,
+    /// Append `git log -n N` as a final section; 0 = off (T2-5).
+    #[serde(default)]
+    pub git_log_count: usize,
     /// Exact relative paths to merge (curated in the file tree). None = all.
     #[serde(default)]
     pub selected_paths: Option<Vec<String>>,
@@ -171,6 +177,8 @@ fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         truncate_base64: options.truncate_base64,
         compress: options.compress,
         strip_comments: options.strip_comments,
+        git_diff: options.git_diff,
+        git_log: options.git_log_count,
     };
 
     Ok(ResolvedJob {
@@ -432,6 +440,163 @@ pub async fn merge_folder(
     })
 }
 
+// ============================================================================
+// WATCH MODE (T2-6)
+// ============================================================================
+
+/// Holds the live watcher; dropping the debouncer stops watching.
+#[derive(Default)]
+pub struct WatchState {
+    debouncer: Option<notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>>,
+}
+
+/// Filesystem events that must NOT retrigger a watch merge: anything under
+/// .git (index churn on every git command) and our own outputs.
+fn watch_event_is_relevant(path: &std::path::Path) -> bool {
+    if path.components().any(|c| c.as_os_str() == ".git") {
+        return false;
+    }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name.to_ascii_lowercase().contains("_merged.") {
+            return false;
+        }
+    }
+    true
+}
+
+/// One watch-triggered merge to a fixed output path (no timestamp — the
+/// point is a stable file that overwrites in place).
+fn run_watch_merge(options: &MergeOptions, output: &std::path::Path) -> Result<MergeResult, String> {
+    let start = std::time::Instant::now();
+    let job = resolve_job(options)?;
+    let scan = scanner::scan_text_files(&job.root, &job.scan_options)
+        .map_err(|e| format!("Scan failed: {}", e))?;
+    let scan_stats = scan.stats;
+    let mut scan_skips = scan.skipped;
+    let mut files = scan.files;
+    apply_selection(
+        &job.root,
+        &mut files,
+        &mut scan_skips,
+        &options.selected_paths,
+        &options.force_include,
+    );
+    if files.is_empty() {
+        return Err("No text files found in directory".to_string());
+    }
+    let cancel = AtomicBool::new(false);
+    let outcome = crate::merger::merge_files_with_progress(
+        &job.root,
+        &files,
+        output,
+        &job.merge_config,
+        &cancel,
+        |_, _, _| {},
+        &scan_skips,
+    )
+    .map_err(|e| format!("Merge failed: {}", e))?;
+    Ok(MergeResult {
+        output_path: outcome
+            .outputs
+            .first()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        output_paths: outcome
+            .outputs
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect(),
+        files_processed: outcome.files_processed,
+        files_skipped: outcome.files_skipped + scan_skips.len(),
+        total_bytes: outcome.total_bytes,
+        duration_ms: start.elapsed().as_millis() as u64,
+        files_by_extension: scan_stats.by_extension,
+        files_by_content: scan_stats.by_content,
+        files_skipped_binary: scan_stats.skipped_binary,
+        files_unreadable: scan_stats.unreadable,
+        secrets_redacted: outcome.secrets_redacted,
+        tokens_o200k: outcome.tokens_o200k,
+        tokens_claude_est: crate::tokens::claude_estimate(outcome.tokens_o200k),
+    })
+}
+
+fn emit_watch_result(app: &AppHandle, result: &Result<MergeResult, String>) {
+    match result {
+        Ok(r) => {
+            let _ = app.emit("watch-merged", r.clone());
+        }
+        Err(e) => {
+            let _ = app.emit("watch-error", e.clone());
+        }
+    }
+}
+
+/// Start watching `options.folder_path`; re-merge (debounced 300 ms) on
+/// changes. Returns the stable output path.
+#[tauri::command]
+pub fn start_watch(
+    app: AppHandle,
+    watch: State<'_, Mutex<WatchState>>,
+    options: MergeOptions,
+) -> Result<String, String> {
+    let job = resolve_job(&options)?;
+    let folder_name = job
+        .root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(security::sanitize_filename)
+        .unwrap_or_else(|| "merged".to_string());
+    let stable_name = format!(
+        "{}_watch_merged.{}",
+        folder_name,
+        job.merge_config.format.extension()
+    );
+    let output = job.output_path.with_file_name(stable_name);
+    let root = job.root.clone();
+
+    // Merge once up front so the output exists before the first change.
+    let first = run_watch_merge(&options, &output);
+    emit_watch_result(&app, &first);
+    first?;
+
+    let app2 = app.clone();
+    let opts2 = options.clone();
+    let out2 = output.clone();
+    let busy = Arc::new(Mutex::new(()));
+    let mut debouncer = notify_debouncer_mini::new_debouncer(
+        std::time::Duration::from_millis(300),
+        move |res: notify_debouncer_mini::DebounceEventResult| match res {
+            Ok(events) => {
+                if !events.iter().any(|e| watch_event_is_relevant(&e.path)) {
+                    return;
+                }
+                // A merge already running: skip; the next change re-fires.
+                let Ok(_guard) = busy.try_lock() else { return };
+                let result = run_watch_merge(&opts2, &out2);
+                emit_watch_result(&app2, &result);
+            }
+            Err(e) => {
+                let _ = app2.emit("watch-error", format!("watch error: {}", e));
+            }
+        },
+    )
+    .map_err(|e| format!("watcher init failed: {}", e))?;
+    debouncer
+        .watcher()
+        .watch(&root, notify::RecursiveMode::Recursive)
+        .map_err(|e| format!("watch failed: {}", e))?;
+
+    watch.lock().map_err(|e| e.to_string())?.debouncer = Some(debouncer);
+    Ok(output.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn stop_watch(watch: State<'_, Mutex<WatchState>>) -> Result<(), String> {
+    // Dropping the debouncer shuts the watcher thread down.
+    watch.lock().map_err(|e| e.to_string())?.debouncer.take();
+    Ok(())
+}
+
 #[tauri::command]
 pub fn open_file(path: String) -> Result<(), String> {
     open::that(&path).map_err(|e| format!("Failed to open file: {}", e))
@@ -474,6 +639,8 @@ pub struct CliArgs {
     pub truncate_base64: bool,
     pub compress: bool,
     pub strip_comments: bool,
+    pub git_diff: bool,
+    pub git_log: usize,
     pub include_globs: Vec<String>,
     pub exclude_globs: Vec<String>,
     pub quiet: bool,
@@ -500,6 +667,8 @@ impl CliArgs {
             truncate_base64: false,
             compress: false,
             strip_comments: false,
+            git_diff: false,
+            git_log: 0,
             include_globs: Vec::new(),
             exclude_globs: Vec::new(),
             quiet: false,
@@ -528,12 +697,14 @@ impl CliArgs {
                 "--truncate-base64" => a.truncate_base64 = true,
                 "--compress" => a.compress = true,
                 "--strip-comments" => a.strip_comments = true,
+                "--git-diff" => a.git_diff = true,
+                "--git-log" => a.git_log = it.next().and_then(|s| s.parse().ok()).unwrap_or(10),
                 "--quiet" | "-q" => a.quiet = true,
                 other => positionals.push(other.to_string()),
             }
         }
         if positionals.is_empty() {
-            eprintln!("usage: turbomerger merge <src_dir> [out] [--format md|xml|cxml|json|plain] [--ordering path|entry-first|important-last] [--max-tokens N] [--include GLOB] [--exclude GLOB] [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--remove-empty-lines] [--truncate-base64] [--compress] [--strip-comments]");
+            eprintln!("usage: turbomerger merge <src_dir> [out] [--format md|xml|cxml|json|plain] [--ordering path|entry-first|important-last] [--max-tokens N] [--include GLOB] [--exclude GLOB] [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--remove-empty-lines] [--truncate-base64] [--compress] [--strip-comments] [--git-diff] [--git-log N]");
             return Some(a); // src empty -> run_cli reports error
         }
         a.src = positionals[0].clone();
@@ -631,6 +802,8 @@ pub fn run_map_cli(a: MapArgs) -> i32 {
         truncate_base64: false,
         compress: false,
         strip_comments: false,
+        git_diff: false,
+        git_log_count: 0,
         selected_paths: None,
         force_include: Vec::new(),
     };
@@ -685,6 +858,8 @@ pub fn run_cli(a: CliArgs) -> i32 {
         truncate_base64: a.truncate_base64,
         compress: a.compress,
         strip_comments: a.strip_comments,
+        git_diff: a.git_diff,
+        git_log_count: a.git_log,
         selected_paths: None,
         force_include: Vec::new(),
     };
@@ -747,6 +922,22 @@ pub fn run_cli(a: CliArgs) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_event_filter_ignores_git_and_own_outputs() {
+        use std::path::Path;
+        assert!(!watch_event_is_relevant(Path::new(
+            "C:/repo/.git/index.lock"
+        )));
+        assert!(!watch_event_is_relevant(Path::new(
+            "C:/repo/myrepo_watch_merged.md"
+        )));
+        assert!(!watch_event_is_relevant(Path::new(
+            "C:/repo/myrepo_2026-07-09_merged.part1-of-2.md"
+        )));
+        assert!(watch_event_is_relevant(Path::new("C:/repo/src/main.rs")));
+        assert!(watch_event_is_relevant(Path::new("C:/repo/.gitignore")));
+    }
 
     #[test]
     fn selection_filters_and_force_include_rescues() {

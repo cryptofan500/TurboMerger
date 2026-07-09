@@ -371,6 +371,100 @@ fn formats_and_split_produce_valid_output() {
 }
 
 #[test]
+fn git_context_blocks_append_redact_and_degrade() {
+    let run_git = |root: &Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("git_repo");
+    fs::create_dir_all(&root).unwrap();
+    run_git(&root, &["init", "-q"]);
+    run_git(&root, &["config", "user.email", "t@example.com"]);
+    run_git(&root, &["config", "user.name", "tester"]);
+    run_git(&root, &["config", "commit.gpgsign", "false"]);
+    fs::write(root.join("a.rs"), "fn a() -> u32 { 1 }\n").unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-q", "-m", "first fixture commit"]);
+    // Working-tree change containing a secret: the DIFF must be redacted too.
+    fs::write(
+        root.join("a.rs"),
+        "fn a() -> u32 { let t = \"ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\"; 2 }\n",
+    )
+    .unwrap();
+
+    let scan = scan_text_files(&root, &ScanOptions::default()).unwrap();
+    let out = tmp.path().join("git_out.md");
+    let cancel = AtomicBool::new(false);
+    let cfg = MergeConfig {
+        git_diff: true,
+        git_log: 3,
+        ..MergeConfig::default()
+    };
+    merge_files_with_progress(
+        &root,
+        &scan.files,
+        &out,
+        &cfg,
+        &cancel,
+        |_, _, _| {},
+        &scan.skipped,
+    )
+    .unwrap();
+    let text = fs::read_to_string(&out).unwrap();
+    assert!(text.contains("## GIT DIFF (working tree vs HEAD)"));
+    assert!(text.contains("diff --git"), "real diff body expected");
+    assert!(text.contains("## GIT LOG (last 3 commits)"));
+    assert!(text.contains("first fixture commit"));
+    assert!(
+        !text.contains("ghp_BBBB"),
+        "secret inside the git diff must be redacted"
+    );
+    // The project tree must not list the synthetic sections.
+    let tree = text
+        .split("## Project Structure")
+        .nth(1)
+        .unwrap()
+        .split("## Contents")
+        .next()
+        .unwrap();
+    assert!(!tree.contains("GIT DIFF"), "tree lists synthetic block:\n{}", tree);
+
+    // Non-repo: merge still succeeds, report explains why there's no section.
+    let plain = tmp.path().join("plain_dir");
+    fs::create_dir_all(&plain).unwrap();
+    fs::write(plain.join("x.rs"), "fn x() {}\n").unwrap();
+    let scan2 = scan_text_files(&plain, &ScanOptions::default()).unwrap();
+    let out2 = tmp.path().join("plain_out.md");
+    merge_files_with_progress(
+        &plain,
+        &scan2.files,
+        &out2,
+        &cfg,
+        &cancel,
+        |_, _, _| {},
+        &scan2.skipped,
+    )
+    .unwrap();
+    let text2 = fs::read_to_string(&out2).unwrap();
+    assert!(
+        text2.contains("git diff unavailable"),
+        "non-repo must be noted in the report"
+    );
+}
+
+#[test]
 fn compress_elides_bodies_and_strip_removes_comments() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("cmp_repo");

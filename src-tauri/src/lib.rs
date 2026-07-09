@@ -16,10 +16,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(commands::AppState::default()))
+        .manage(Mutex::new(commands::WatchState::default()))
         .invoke_handler(tauri::generate_handler![
             commands::merge_folder,
             commands::scan_folder,
             commands::repo_map,
+            commands::start_watch,
+            commands::stop_watch,
             commands::cancel_merge,
             commands::reset_cancel,
             commands::get_downloads_path,

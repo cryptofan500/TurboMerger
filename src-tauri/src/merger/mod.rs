@@ -82,6 +82,10 @@ pub struct MergeConfig {
     pub compress: bool,
     /// Remove comments via tree-sitter.
     pub strip_comments: bool,
+    /// Append `git diff HEAD` as a final section (T2-5).
+    pub git_diff: bool,
+    /// Append `git log -n N` as a final section; 0 = off (T2-5).
+    pub git_log: usize,
 }
 
 impl Default for MergeConfig {
@@ -96,6 +100,8 @@ impl Default for MergeConfig {
             truncate_base64: false,
             compress: false,
             strip_comments: false,
+            git_diff: false,
+            git_log: 0,
         }
     }
 }
@@ -119,6 +125,9 @@ struct Block {
     utf8_note: Option<String>,
     redactions: Vec<(&'static str, usize)>,
     compressed: bool,
+    /// Git-context sections and similar: real output, but not part of the
+    /// scanned file set, so the project tree must not list them.
+    synthetic: bool,
 }
 
 /// (relative_path, reason) for a file dropped at merge time
@@ -179,6 +188,12 @@ where
                 }
             }
         }
+    }
+
+    // Git context rides at the very end (LLMs weight the end of context;
+    // "review my change" wants the diff last).
+    if !cancel_flag.load(AtomicOrd::Relaxed) && (cfg.git_diff || cfg.git_log > 0) {
+        blocks.extend(git_context_blocks(root, cfg, &mut merge_skips));
     }
 
     // Aggregate stats.
@@ -364,7 +379,109 @@ fn process_file(
         utf8_note,
         redactions,
         compressed,
+        synthetic: false,
     })
+}
+
+// ============================================================================
+// GIT CONTEXT (T2-5)
+// ============================================================================
+
+/// Cap for the diff section so a giant rebase can't dwarf the codebase.
+const GIT_DIFF_MAX_BYTES: usize = 512 * 1024;
+
+fn run_git(root: &Path, args: &[&str]) -> std::result::Result<String, String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(root).args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().map_err(|e| format!("git not runnable: {}", e))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(err.lines().next().unwrap_or("git failed").to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Build the synthetic git-context blocks. Failures (not a repo, no git) are
+/// reported as skip entries, never errors — git context is best-effort.
+fn git_context_blocks(root: &Path, cfg: &MergeConfig, skips: &mut Vec<SkipEntry>) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    let mut push = |relative: &str, lang: &str, mut content: String, cfg: &MergeConfig| {
+        let redactions = if cfg.redact {
+            let (clean, events) = crate::security::redact_secrets(&content);
+            content = clean;
+            events.into_iter().map(|ev| (ev.rule, ev.count)).collect()
+        } else {
+            Vec::new()
+        };
+        let tokens = tokens::count(&content);
+        blocks.push(Block {
+            relative: relative.to_string(),
+            content,
+            lang: lang.to_string(),
+            tokens,
+            utf8_note: None,
+            redactions,
+            compressed: false,
+            synthetic: true,
+        });
+    };
+
+    if cfg.git_diff {
+        match run_git(root, &["diff", "HEAD"]) {
+            Ok(diff) if diff.trim().is_empty() => skips.push(SkipEntry {
+                path: "GIT DIFF".into(),
+                reason: "working tree clean — no diff section".into(),
+            }),
+            Ok(mut diff) => {
+                if diff.len() > GIT_DIFF_MAX_BYTES {
+                    let mut cut = GIT_DIFF_MAX_BYTES;
+                    while !diff.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    diff.truncate(cut);
+                    diff.push_str("\n[... diff truncated at 512 KB ...]\n");
+                }
+                push("GIT DIFF (working tree vs HEAD)", "diff", diff, cfg);
+            }
+            Err(e) => skips.push(SkipEntry {
+                path: "GIT DIFF".into(),
+                reason: format!("git diff unavailable: {}", e),
+            }),
+        }
+    }
+    if cfg.git_log > 0 {
+        let n = cfg.git_log.to_string();
+        match run_git(
+            root,
+            &[
+                "log",
+                "-n",
+                &n,
+                "--pretty=format:%h %ad %an — %s",
+                "--date=short",
+            ],
+        ) {
+            Ok(log) if log.trim().is_empty() => skips.push(SkipEntry {
+                path: "GIT LOG".into(),
+                reason: "no commits".into(),
+            }),
+            Ok(log) => {
+                let title = format!("GIT LOG (last {} commits)", cfg.git_log);
+                push(&title, "", log, cfg);
+            }
+            Err(e) => skips.push(SkipEntry {
+                path: "GIT LOG".into(),
+                reason: format!("git log unavailable: {}", e),
+            }),
+        }
+    }
+    blocks
 }
 
 /// Decode raw file bytes to a String: BOM → strict UTF-8 → chardetng-guessed
@@ -960,6 +1077,9 @@ fn generate_tree(root: &Path, blocks: &[&Block]) -> String {
     }
     let mut top = Node::default();
     for b in blocks {
+        if b.synthetic {
+            continue;
+        }
         let comps: Vec<&str> = b.relative.split('/').collect();
         if comps.is_empty() {
             continue;
