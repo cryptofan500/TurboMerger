@@ -1,225 +1,138 @@
-# TurboMerger v6
+# TurboMerger
 
-A high-performance codebase merger that transforms entire project directories into a single, LLM-ready markdown file. Built with Rust and Tauri 2.0 for Windows.
+A fast Windows desktop app that merges a codebase into a single, LLM-ready markdown
+file — gitignore-aware, secret-redacting, with a per-file merge report. Built with
+Rust + Tauri 2 and a React/TypeScript UI (WebView2).
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
-![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)
+
+## What it does
+
+Point it at a folder; it produces `<folder>_<timestamp>_merged.md` in your Downloads
+(or a location you pick) containing a directory tree, a linked table of contents, every
+text file wrapped in a collision-proof code fence, and a **Merge Report** listing exactly
+what was skipped and why. Designed for pasting a whole project into ChatGPT / Claude /
+Gemini.
 
 ## Features
 
-- **Parallel Processing** - Multi-core file scanning with jwalk and Rayon
-- **Smart Binary Detection** - 7-layer NuclearSieve pipeline filters non-text files
-- **Memory Efficient** - Streaming architecture handles codebases of any size
-- **Secret Redaction** - Pattern-based detection of API keys, passwords, and credentials
-- **Virtual Environment Auto-Skip** - Detects and skips Python venv directories (500%+ faster on Python projects)
-- **Lock File Exclusion** - Skips package-lock.json, Cargo.lock, yarn.lock to reduce context bloat
-- **Modern UI** - React frontend with progress tracking and cancel support
+- **Gitignore-aware scanning** — honors `.gitignore`, `.ignore`, `.git/info/exclude`, and
+  a highest-precedence `.turbomergerignore` (via the `ignore` crate, ripgrep's walker).
+  Works even outside a git repo. Toggle off if you want everything.
+- **Secret redaction** — API keys, tokens, private keys, and DB connection strings
+  (AWS, GitHub, GitLab, OpenAI, Anthropic, Google, Stripe, Slack, JWTs, …) are replaced
+  with `[REDACTED]` before writing, with an entropy gate + placeholder stopwords to avoid
+  false positives on ordinary code. On by default; counted in the report.
+- **Nothing dropped silently** — every excluded file appears in the Merge Report with a
+  reason (binary, too large, gitignored, sensitive, unreadable, previous dump, …).
+- **Sensible dotfile handling** — well-known config dotfiles (`.gitignore`, `.mcp.json`,
+  `.github/`, `.env.example`, `.eslintrc*`, …) are included; sensitive ones (`.env`,
+  `*.pem`, `id_rsa`) are excluded-with-reason. "Include hidden dotfiles" opts in to the rest.
+- **Content-based text detection** — files with unknown extensions are classified by
+  sniffing the first 8 KB (magic bytes, null/control/non-ASCII ratios, line length).
+- **Collision-proof fences** — a file containing ```` ``` ```` gets a longer wrapper fence,
+  so markdown-heavy repos don't scramble the output.
+- **Token estimate + fit hint** — reports approximate tokens and whether the result fits
+  common context windows (GPT 128k / Claude 200k / Gemini 1M).
+- **Parallel + memory-bounded** — parallel directory walk (ripgrep walker) and parallel,
+  chunked file processing (Rayon); output is streamed in batches rather than held whole.
+- **Safe by construction** — symlinks/junctions never followed; system roots blocked;
+  cloud-placeholder files skipped rather than force-downloaded.
 
-## Installation
+## Install
 
-### Option 1: Download Release
+Grab the latest `.msi` or `-setup.exe` from
+[Releases](https://github.com/cryptofan500/TurboMerger/releases), or build from source.
 
-Download the latest installer from [Releases](https://github.com/cryptofan500/turbomerger/releases):
-- `TurboMerger_x.x.x_x64-setup.exe` (NSIS installer)
-- `TurboMerger_x.x.x_x64_en-US.msi` (MSI installer)
+### Build from source
 
-### Option 2: Build from Source
-
-#### Prerequisites
-
-| Requirement | Version | Installation |
-|-------------|---------|--------------|
-| Windows | 10 or newer | - |
-| Node.js | 18+ | [nodejs.org](https://nodejs.org/) |
-| Rust | 1.70+ | [rustup.rs](https://rustup.rs/) |
-| Visual Studio Build Tools | 2019+ | [Visual Studio](https://visualstudio.microsoft.com/downloads/) with "Desktop development with C++" workload |
-
-#### Build Steps
+Requirements: Windows 10/11, Node.js 20+, Rust (stable, MSVC target), Visual Studio Build
+Tools with the "Desktop development with C++" workload.
 
 ```powershell
-# Clone the repository
-git clone https://github.com/cryptofan500/turbomerger.git
-cd turbomerger
-
-# Install Node.js dependencies
+git clone https://github.com/cryptofan500/TurboMerger.git
+cd TurboMerger
 npm install
-
-# Build the application (creates installer)
-npm run tauri build
+npm run tauri:build   # exe + NSIS/MSI installers under src-tauri/target/release/
 ```
 
-The built executable will be at:
-```
-src-tauri\target\release\turbomerger.exe
-```
-
-Installers will be at:
-```
-src-tauri\target\release\bundle\nsis\TurboMerger_x.x.x_x64-setup.exe
-src-tauri\target\release\bundle\msi\TurboMerger_x.x.x_x64_en-US.msi
-```
+> Build from a PowerShell / Developer prompt, **not** Git Bash — Git Bash's `link.exe`
+> shadows the MSVC linker and breaks the build.
 
 ## Usage
 
-1. **Launch TurboMerger** - Run the executable or installed application
-2. **Select Source Directory** - Click "Select Folder" to choose a codebase
-3. **Configure Options**:
-   - Include directory tree (generates visual file structure)
-   - Include virtual environments (default: skip for speed)
-4. **Select Output Location** - Choose where to save the merged markdown file
-5. **Click Merge** - Progress bar shows scanning and merging status
-6. **Open Result** - Click "Open File" or "Open Folder" to access output
+1. Launch TurboMerger.
+2. **Browse** to a source folder.
+3. Adjust options (respect gitignore, redact secrets, tree/TOC, content detection, hidden
+   files, virtual environments).
+4. Optionally **Change** the output path (a folder auto-names the file; a file path is used
+   verbatim).
+5. **Merge**, then **Open File** or **Show in Folder**.
 
-## Architecture
+## Configuration — `turbomerger.toml` (optional)
 
-```
-turbomerger/
-├── src/                    # React/TypeScript frontend
-│   ├── App.tsx             # Main UI component
-│   └── styles/             # CSS styling
-├── src-tauri/              # Rust backend
-│   ├── src/
-│   │   ├── lib.rs          # Tauri entry point
-│   │   ├── commands.rs     # IPC command handlers
-│   │   ├── merger/         # Core merge logic with streaming I/O
-│   │   ├── scanner/        # Directory walking (jwalk + PHF)
-│   │   └── security/       # Secret detection and path validation
-│   └── resources/
-│       └── extensions.json # Text/binary extension definitions
-└── scripts/
-    └── build_msi.ps1       # Build automation script
+Drop a `turbomerger.toml` in the scanned folder's root to override behavior per project:
+
+```toml
+[extensions]
+include = ["myformat", "custom1"]  # extra extensions to treat as text
+exclude = ["log", "tmp"]           # extensions to always skip
+binary  = ["dat"]                  # extra extensions to treat as binary
+
+[scanning]
+include_hidden   = false
+include_venvs    = false
+max_file_size_mb = 2               # absolute per-file cap
+content_sniff    = true
 ```
 
-## Binary Detection (NuclearSieve)
+UI checkboxes take precedence; the config file can additionally force inclusions and
+supplies the extension overrides + size cap. For path-level control, add a
+`.turbomergerignore` (gitignore syntax, highest precedence).
 
-The 7-layer pipeline ensures only text files are included:
+## How detection works
 
-| Layer | Check | Purpose |
-|-------|-------|---------|
-| 1 | Filename | Skip system files (NTUSER.DAT, Thumbs.db) |
-| 2 | Extension | PHF lookup for 100+ known extensions |
-| 3 | File Size | Skip files > 50MB |
-| 4 | Magic Bytes | Detect PNG, JPEG, PDF, EXE, archives |
-| 5 | NULL Bytes | Binary indicator scan |
-| 6 | content_inspector | Library-based detection |
-| 7 | Shannon Entropy | Detect compressed/encrypted content |
+Each candidate file runs through: config exclude list → known binary extension → known text
+extension → content sniff (magic bytes → null-byte ratio → control-char ratio → non-ASCII
+ratio → max line length). Directories in the always-skip set (`.git`, `node_modules`,
+`target`, build/cache dirs, credential dirs) and gitignored paths are pruned before descent.
+Lock files, minified bundles, and previous TurboMerger outputs are skipped by name.
 
-## Security Features
+## Security
 
-- **Strict CSP** - Content-Security-Policy prevents XSS attacks
-- **Symlink Protection** - Reparse points (junctions/symlinks) are never followed
-- **System Path Blocking** - Windows, Program Files, AppData directories blocked
-- **Sensitive File Exclusion** - SSH keys, credentials, and secret files excluded
-- **Secret Redaction** - Regex patterns detect and redact API keys in output
-
-### Detected Secret Patterns
-
-- AWS Access Keys and Secret Keys
-- GitHub Personal Access Tokens
-- Stripe API Keys (live and test)
-- Google API Keys
-- Private Keys (RSA, OpenSSH, PGP)
-- Database Connection Strings
-- JWT Tokens
-- And 20+ more patterns
-
-## Performance
-
-| Project Size | Files | Approximate Time |
-|--------------|-------|------------------|
-| Small | 1,000 | ~2 seconds |
-| Medium | 10,000 | ~15 seconds |
-| Large | 50,000 | ~1 minute |
-| Enterprise | 100,000+ | ~3 minutes |
-
-Performance achieved through:
-- **jwalk** - Parallel directory traversal
-- **Rayon** - Multi-core file processing
-- **PHF** - Compile-time perfect hash for O(1) extension lookups
-- **Memory-mapped I/O** - Large file handling without memory exhaustion
-
-## Skipped Directories (55+)
-
-TurboMerger automatically skips directories that bloat output without adding value:
-
-- **Version Control**: .git, .svn, .hg
-- **Dependencies**: node_modules, vendor, packages
-- **Build Outputs**: target, dist, build, out
-- **Python**: venv, .venv, __pycache__, .pytest_cache
-- **IDE**: .idea, .vscode, .vs
-- **Caches**: .cache, .next, .nuxt
+- Symlinks and reparse points (junctions) are never followed.
+- Windows system roots (`C:\Windows`, `Program Files`, `ProgramData`, …) are blocked as
+  scan roots.
+- Sensitive files (`.env`, key/cert material, SSH keys, credential stores) are excluded and
+  listed in the report.
+- Detected secrets are redacted from file contents before writing.
+- Strict Content-Security-Policy on the WebView.
 
 ## Development
 
 ```powershell
-# Install dependencies
 npm install
-
-# Run in development mode (hot reload)
-npm run tauri dev
-
-# Type check TypeScript
-npm run typecheck
-
-# Lint code
-npm run lint
-
-# Build for production
-npm run tauri build
+npm run tauri:dev     # hot-reload GUI
+npm run typecheck     # tsc --noEmit
+npm run lint          # eslint
+cargo test --manifest-path src-tauri/Cargo.toml   # Rust unit + integration tests
 ```
 
-## Configuration Files
+## Architecture
 
-| File | Purpose |
-|------|---------|
-| `package.json` | Node.js dependencies and scripts |
-| `tauri.conf.json` | Tauri app configuration |
-| `Cargo.toml` | Rust dependencies |
-| `tsconfig.json` | TypeScript configuration |
-| `vite.config.ts` | Vite bundler settings |
-
-## Troubleshooting
-
-### Build fails with "MSVC not found"
-
-Install Visual Studio Build Tools with the "Desktop development with C++" workload.
-
-### Rust compilation errors
-
-Ensure Rust is up to date:
-```powershell
-rustup update
 ```
-
-### WebView2 runtime missing
-
-The installer includes WebView2 bootstrapper. For manual builds, download from [Microsoft](https://developer.microsoft.com/en-us/microsoft-edge/webview2/).
-
-### Large codebase runs out of memory
-
-TurboMerger uses streaming I/O, but extremely large files (>50MB) are skipped. Check logs for skipped files.
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+src/                     React/TypeScript UI (App.tsx + styles)
+src-tauri/src/
+  lib.rs                 Tauri entry point + command registration
+  commands.rs            IPC handlers (merge_folder, cancel, open, …)
+  config.rs              turbomerger.toml loader
+  scanner/mod.rs         gitignore-aware walk + text/binary classification
+  security/mod.rs        path validation, binary detection, secret redaction
+  merger/mod.rs          parallel read/redact + markdown writer + merge report
+src-tauri/tests/         end-to-end fixture-tree tests
+```
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- [Tauri](https://tauri.app/) - Desktop app framework
-- [Rayon](https://github.com/rayon-rs/rayon) - Data parallelism library
-- [jwalk](https://github.com/jessegrosjean/jwalk) - Parallel directory walking
-- [content_inspector](https://crates.io/crates/content_inspector) - Binary detection
-- [PHF](https://github.com/rust-phf/rust-phf) - Compile-time hash maps
-
----
-
-**Made for developers who need to feed entire codebases to LLMs.**
+MIT — see [LICENSE](LICENSE).
