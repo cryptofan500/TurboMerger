@@ -4,6 +4,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import CuratePanel, { ScanReport } from "./components/CuratePanel";
 import "./styles/global.css";
 
 interface MergeResult {
@@ -20,6 +21,7 @@ interface MergeResult {
   secrets_redacted: number;
   tokens_o200k: number;
   tokens_claude_est: number;
+  skill_path: string | null;
 }
 
 interface ProgressUpdate {
@@ -53,12 +55,34 @@ function App() {
   const [excludeGlobs, setExcludeGlobs] = useState<string>("");
   const [removeEmptyLines, setRemoveEmptyLines] = useState(false);
   const [truncateBase64, setTruncateBase64] = useState(false);
+  const [compress, setCompress] = useState(false);
+  const [stripComments, setStripComments] = useState(false);
+  const [gitDiff, setGitDiff] = useState(false);
+  const [gitLogCount, setGitLogCount] = useState<string>("");
+  const [emitSkill, setEmitSkill] = useState(false);
   const [preset, setPreset] = useState<Preset>("custom");
   const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // Remote packing (T2-8): PAT stays in memory only — never persisted.
+  const [pat, setPat] = useState<string>("");
+
+  // Curate state (T2-1/T2-2/T2-7): exclusions + rescues for the CURRENT source.
+  const [scanReport, setScanReport] = useState<ScanReport | null>(null);
+  const [curateOpen, setCurateOpen] = useState(false);
+  const [excluded, setExcluded] = useState<Set<string>>(new Set());
+  const [forceInclude, setForceInclude] = useState<Set<string>>(new Set());
+
+  // Watch mode (T2-6)
+  const [watching, setWatching] = useState(false);
+  const [watchOutput, setWatchOutput] = useState<string>("");
 
   const [result, setResult] = useState<MergeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressUpdate | null>(null);
+
+  const isRemote =
+    /^(https?:\/\/|git@)/.test(sourcePath.trim()) ||
+    /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(sourcePath.trim());
 
   // Load persisted settings + version on mount.
   useEffect(() => {
@@ -81,30 +105,74 @@ function App() {
         if (typeof s.excludeGlobs === "string") setExcludeGlobs(s.excludeGlobs);
         if (typeof s.removeEmptyLines === "boolean") setRemoveEmptyLines(s.removeEmptyLines);
         if (typeof s.truncateBase64 === "boolean") setTruncateBase64(s.truncateBase64);
+        if (typeof s.compress === "boolean") setCompress(s.compress);
+        if (typeof s.stripComments === "boolean") setStripComments(s.stripComments);
+        if (typeof s.gitDiff === "boolean") setGitDiff(s.gitDiff);
+        if (typeof s.gitLogCount === "string") setGitLogCount(s.gitLogCount);
+        if (typeof s.emitSkill === "boolean") setEmitSkill(s.emitSkill);
         if (typeof s.sourcePath === "string") setSourcePath(s.sourcePath);
       }
     } catch { /* ignore corrupt settings */ }
   }, []);
 
-  // Persist settings on change.
+  // Persist settings on change (never the PAT).
   useEffect(() => {
     const s = {
       includeVenv, includeTree, contentDetection, respectGitignore, includeHidden,
       redactSecrets, format, ordering, maxTokens, includeGlobs, excludeGlobs,
-      removeEmptyLines, truncateBase64, sourcePath,
+      removeEmptyLines, truncateBase64, compress, stripComments, gitDiff,
+      gitLogCount, emitSkill, sourcePath,
     };
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch { /* quota */ }
   }, [includeVenv, includeTree, contentDetection, respectGitignore, includeHidden,
       redactSecrets, format, ordering, maxTokens, includeGlobs, excludeGlobs,
-      removeEmptyLines, truncateBase64, sourcePath]);
+      removeEmptyLines, truncateBase64, compress, stripComments, gitDiff,
+      gitLogCount, emitSkill, sourcePath]);
 
-  // Progress listener.
+  // Selection is per-project: reset on source change, restore on scan.
   useEffect(() => {
-    const unlisten = listen<ProgressUpdate>("merge-progress", (event) => {
+    setScanReport(null);
+    setCurateOpen(false);
+    setExcluded(new Set());
+    setForceInclude(new Set());
+    setWatching(false);
+  }, [sourcePath]);
+
+  // Persist the curation (exclusions + rescues) per project.
+  const selectionKey = (src: string) => `turbomerger.selection.${src}`;
+  useEffect(() => {
+    if (!scanReport) return;
+    try {
+      localStorage.setItem(
+        selectionKey(scanReport.root),
+        JSON.stringify({ excluded: [...excluded], forceInclude: [...forceInclude] })
+      );
+    } catch { /* quota */ }
+  }, [excluded, forceInclude, scanReport]);
+
+  // Progress + watch listeners.
+  useEffect(() => {
+    const unlistenMerge = listen<ProgressUpdate>("merge-progress", (event) => {
       setProgress(event.payload);
       if (event.payload.total > 0) setStatus("merging");
     });
-    return () => { unlisten.then((f) => f()); };
+    const unlistenScan = listen<ProgressUpdate>("scan-progress", (event) => {
+      setProgress(event.payload);
+    });
+    const unlistenWatch = listen<MergeResult>("watch-merged", (event) => {
+      setResult(event.payload);
+      setStatus("done");
+    });
+    const unlistenWatchErr = listen<string>("watch-error", (event) => {
+      setError(event.payload);
+      setStatus("error");
+    });
+    return () => {
+      unlistenMerge.then((f) => f());
+      unlistenScan.then((f) => f());
+      unlistenWatch.then((f) => f());
+      unlistenWatchErr.then((f) => f());
+    };
   }, []);
 
   // Drag-and-drop a folder onto the window.
@@ -157,6 +225,40 @@ function App() {
     setProgress(null);
   };
 
+  const buildOptions = () => {
+    const toList = (s: string) => s.split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
+    // Exact include list only when the user actually excluded something in
+    // the curate panel for THIS source.
+    const selected =
+      scanReport && excluded.size > 0
+        ? scanReport.included.map((e) => e.path).filter((p) => !excluded.has(p))
+        : null;
+    return {
+      folder_path: sourcePath,
+      output_path: outputPath || null,
+      include_venv: includeVenv,
+      include_tree: includeTree,
+      content_detection: contentDetection,
+      respect_gitignore: respectGitignore,
+      include_hidden: includeHidden,
+      redact_secrets: redactSecrets,
+      format,
+      ordering,
+      max_tokens: maxTokens ? parseInt(maxTokens, 10) || 0 : 0,
+      include_globs: toList(includeGlobs),
+      exclude_globs: toList(excludeGlobs),
+      remove_empty_lines: removeEmptyLines,
+      truncate_base64: truncateBase64,
+      compress,
+      strip_comments: stripComments,
+      git_diff: gitDiff,
+      git_log_count: gitLogCount ? parseInt(gitLogCount, 10) || 0 : 0,
+      emit_skill: emitSkill,
+      selected_paths: selected,
+      force_include: [...forceInclude],
+    };
+  };
+
   const handleMerge = async () => {
     if (!sourcePath) return;
     try {
@@ -166,32 +268,69 @@ function App() {
       setResult(null);
       setProgress(null);
 
-      const toList = (s: string) => s.split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
-      const options = {
-        folder_path: sourcePath,
-        output_path: outputPath || null,
-        include_venv: includeVenv,
-        include_tree: includeTree,
-        content_detection: contentDetection,
-        respect_gitignore: respectGitignore,
-        include_hidden: includeHidden,
-        redact_secrets: redactSecrets,
-        format,
-        ordering,
-        max_tokens: maxTokens ? parseInt(maxTokens, 10) || 0 : 0,
-        include_globs: toList(includeGlobs),
-        exclude_globs: toList(excludeGlobs),
-        remove_empty_lines: removeEmptyLines,
-        truncate_base64: truncateBase64,
-      };
-
-      const mergeResult = await invoke<MergeResult>("merge_folder", { options });
+      const options = buildOptions();
+      const mergeResult = isRemote
+        ? await invoke<MergeResult>("pack_remote", {
+            url: sourcePath.trim(),
+            pat: pat || null,
+            options,
+          })
+        : await invoke<MergeResult>("merge_folder", { options });
       setResult(mergeResult);
       setStatus("done");
     } catch (err) {
       const msg = String(err);
       if (msg.includes("cancelled")) setStatus("cancelled");
       else { setError(msg); setStatus("error"); }
+    }
+  };
+
+  const handleScan = async () => {
+    if (!sourcePath || isRemote) return;
+    try {
+      setStatus("scanning");
+      setError(null);
+      setProgress(null);
+      const report = await invoke<ScanReport>("scan_folder", { options: buildOptions() });
+      setScanReport(report);
+      // Restore this project's saved curation, dropping stale paths.
+      try {
+        const raw = localStorage.getItem(selectionKey(report.root));
+        if (raw) {
+          const s = JSON.parse(raw);
+          const valid = new Set(report.included.map((e) => e.path));
+          setExcluded(new Set((s.excluded || []).filter((p: string) => valid.has(p))));
+          setForceInclude(new Set(s.forceInclude || []));
+        } else {
+          setExcluded(new Set());
+          setForceInclude(new Set());
+        }
+      } catch { /* corrupt selection */ }
+      setCurateOpen(true);
+      setStatus("ready");
+      setProgress(null);
+    } catch (err) {
+      setError(String(err));
+      setStatus("error");
+    }
+  };
+
+  const handleWatchToggle = async () => {
+    if (watching) {
+      await invoke("stop_watch").catch(console.error);
+      setWatching(false);
+      setWatchOutput("");
+      return;
+    }
+    if (!sourcePath || isRemote) return;
+    try {
+      setError(null);
+      const out = await invoke<string>("start_watch", { options: buildOptions() });
+      setWatchOutput(out);
+      setWatching(true);
+    } catch (err) {
+      setError(String(err));
+      setStatus("error");
     }
   };
 
@@ -223,9 +362,33 @@ function App() {
         <section className="section">
           <label className="label">SOURCE CODEBASE</label>
           <div className="input-row">
-            <input type="text" className="input" value={sourcePath} readOnly placeholder="Select or drag a folder here..." />
-            <button className="btn btn-secondary" onClick={selectSource} disabled={isWorking}>Browse</button>
+            <input
+              type="text"
+              className="input"
+              value={sourcePath}
+              onChange={(e) => setSourcePath(e.target.value)}
+              placeholder="Folder, owner/repo, or GitHub URL — or drag a folder here..."
+              disabled={isWorking || watching}
+            />
+            <button className="btn btn-secondary" onClick={selectSource} disabled={isWorking || watching}>Browse</button>
           </div>
+          {isRemote && (
+            <>
+              <p className="hint">
+                Remote repo detected — it will be shallow-cloned to a temp dir, merged, then deleted.
+              </p>
+              <div className="input-row" style={{ marginTop: 6 }}>
+                <input
+                  type="password"
+                  className="input"
+                  value={pat}
+                  onChange={(e) => setPat(e.target.value)}
+                  placeholder="Personal access token (optional, private repos; kept in memory only)"
+                  disabled={isWorking}
+                />
+              </div>
+            </>
+          )}
         </section>
 
         <section className="section">
@@ -323,6 +486,39 @@ function App() {
                   <span>Truncate long base64/data blobs</span>
                 </label>
               </div>
+              <div className="checkbox-group">
+                <label className="checkbox-label">
+                  <input type="checkbox" checked={compress} disabled={isWorking}
+                    onChange={(e) => { setCompress(e.target.checked); setPreset("custom"); }} />
+                  <span>Compress to signatures (elide function bodies — ~60-80% fewer tokens)</span>
+                </label>
+              </div>
+              <div className="checkbox-group">
+                <label className="checkbox-label">
+                  <input type="checkbox" checked={stripComments} disabled={isWorking}
+                    onChange={(e) => { setStripComments(e.target.checked); setPreset("custom"); }} />
+                  <span>Strip comments (tree-sitter)</span>
+                </label>
+              </div>
+              <div className="checkbox-group">
+                <label className="checkbox-label">
+                  <input type="checkbox" checked={gitDiff} disabled={isWorking}
+                    onChange={(e) => { setGitDiff(e.target.checked); setPreset("custom"); }} />
+                  <span>Append git diff (working tree vs HEAD) at the end</span>
+                </label>
+              </div>
+              <div className="checkbox-group">
+                <label className="checkbox-label">
+                  <input type="checkbox" checked={emitSkill} disabled={isWorking}
+                    onChange={(e) => { setEmitSkill(e.target.checked); setPreset("custom"); }} />
+                  <span>Write .claude/skills/&lt;repo&gt;/SKILL.md into the repo</span>
+                </label>
+              </div>
+              <div style={{ marginTop: 8 }}>
+                <span className="field-label">Append git log (last N commits; blank = off)</span>
+                <input type="number" className="input" value={gitLogCount} placeholder="e.g. 10" min="0"
+                  onChange={(e) => { setGitLogCount(e.target.value); setPreset("custom"); }} disabled={isWorking} />
+              </div>
             </div>
           )}
         </section>
@@ -331,11 +527,64 @@ function App() {
           {isWorking ? (
             <button className="btn btn-danger btn-full" onClick={handleCancel}>CANCEL</button>
           ) : (
-            <button className="btn btn-primary btn-full" onClick={handleMerge} disabled={!sourcePath}>
-              {status === "done" ? "MERGE AGAIN" : status === "error" ? "RETRY" : "MERGE"}
-            </button>
+            <div className="merge-row">
+              <button className="btn btn-primary merge-main" onClick={handleMerge} disabled={!sourcePath || watching}>
+                {status === "done" ? "MERGE AGAIN" : status === "error" ? "RETRY" : "MERGE"}
+                {scanReport && excluded.size > 0 ? " SELECTED" : ""}
+              </button>
+              <button
+                className="btn btn-secondary"
+                onClick={handleScan}
+                disabled={!sourcePath || isRemote || watching}
+                title={isRemote ? "Curation works on local folders" : "Scan first, then curate what gets merged"}
+              >
+                Scan &amp; curate
+              </button>
+              <button
+                className={`btn ${watching ? "btn-success" : "btn-secondary"}`}
+                onClick={handleWatchToggle}
+                disabled={!sourcePath || isRemote}
+                title="Re-merge automatically when files change"
+              >
+                {watching ? "◉ Watching" : "Watch"}
+              </button>
+            </div>
+          )}
+          {watching && (
+            <p className="watch-banner">
+              ◉ Watching — re-merges on change → <span className="output-path-inline">{watchOutput}</span>
+            </p>
           )}
         </section>
+
+        {scanReport && curateOpen && (
+          <CuratePanel
+            report={scanReport}
+            excluded={excluded}
+            forceInclude={forceInclude}
+            budgetTokens={maxTokens ? parseInt(maxTokens, 10) || 200000 : 200000}
+            onSetExcluded={setExcluded}
+            onToggleForce={(path) => {
+              const next = new Set(forceInclude);
+              if (next.has(path)) next.delete(path);
+              else next.add(path);
+              setForceInclude(next);
+            }}
+            onClose={() => setCurateOpen(false)}
+          />
+        )}
+        {scanReport && !curateOpen && (excluded.size > 0 || forceInclude.size > 0) && (
+          <section className="section">
+            <p className="hint">
+              Curated selection active: {scanReport.included.length - excluded.size} of {scanReport.included.length} files
+              {forceInclude.size > 0 && `, +${forceInclude.size} rescued`}
+              {" · "}
+              <button className="link-btn" onClick={() => setCurateOpen(true)}>edit</button>
+              {" · "}
+              <button className="link-btn" onClick={() => { setExcluded(new Set()); setForceInclude(new Set()); }}>clear</button>
+            </p>
+          </section>
+        )}
 
         {isWorking && (
           <section className="section">
@@ -377,6 +626,11 @@ function App() {
             )}
             {result.output_paths.length > 1 && (
               <p className="detection-breakdown">Split into {result.output_paths.length} parts</p>
+            )}
+            {result.skill_path && (
+              <p className="detection-breakdown" style={{ color: "var(--success)" }}>
+                ✓ Claude skill written: {result.skill_path}
+              </p>
             )}
             <div className="action-buttons">
               <button className="btn btn-success" onClick={() => openThing(result.output_path)}>Open File</button>
