@@ -13,8 +13,9 @@
 use tree_sitter::{Language, Node, Parser};
 
 /// Language family: decides node kinds and the body replacement text.
+/// Shared with the repo-map module, which keys its def-extraction on it.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Family {
+pub(crate) enum Family {
     Rust,
     JsTs,
     Python,
@@ -24,7 +25,7 @@ enum Family {
     Cpp,
 }
 
-fn family_for_ext(ext: &str) -> Option<(Family, Language)> {
+pub(crate) fn family_for_ext(ext: &str) -> Option<(Family, Language)> {
     Some(match ext {
         "rs" => (Family::Rust, tree_sitter_rust::LANGUAGE.into()),
         "js" | "jsx" | "mjs" | "cjs" => (Family::JsTs, tree_sitter_javascript::LANGUAGE.into()),
@@ -68,7 +69,7 @@ const BLOCK_KINDS: &[&str] = &["block", "statement_block", "compound_statement"]
 
 const COMMENT_KINDS: &[&str] = &["comment", "line_comment", "block_comment"];
 
-fn parse(content: &str, language: &Language) -> Option<tree_sitter::Tree> {
+pub(crate) fn parse(content: &str, language: &Language) -> Option<tree_sitter::Tree> {
     let mut parser = Parser::new();
     parser.set_language(language).ok()?;
     let tree = parser.parse(content, None)?;

@@ -295,6 +295,19 @@ pub async fn scan_folder(app: AppHandle, options: MergeOptions) -> Result<ScanRe
     })
 }
 
+/// Build an aider-style repo map (tags → PageRank → budgeted signatures).
+#[tauri::command]
+pub async fn repo_map(options: MergeOptions, token_budget: Option<usize>) -> Result<String, String> {
+    let job = resolve_job(&options)?;
+    let scan = scanner::scan_text_files(&job.root, &job.scan_options)
+        .map_err(|e| format!("Scan failed: {}", e))?;
+    Ok(crate::repomap::build_repo_map(
+        &job.root,
+        &scan.files,
+        token_budget.unwrap_or(1024),
+    ))
+}
+
 #[tauri::command]
 pub fn get_downloads_path() -> Result<String, String> {
     dirs::download_dir()
@@ -527,6 +540,126 @@ impl CliArgs {
         a.out = positionals.get(1).cloned();
         Some(a)
     }
+}
+
+// ============================================================================
+// HEADLESS CLI  —  turbomerger map <src> [out] [--tokens N] [--flags]
+// ============================================================================
+
+pub struct MapArgs {
+    pub src: String,
+    pub out: Option<String>,
+    pub tokens: usize,
+    pub no_gitignore: bool,
+    pub include_hidden: bool,
+    pub include_venv: bool,
+    pub include_globs: Vec<String>,
+    pub exclude_globs: Vec<String>,
+}
+
+impl MapArgs {
+    /// Parse `map <src> [out] [--flags]`. Returns None if argv isn't a map run.
+    pub fn parse(argv: &[String]) -> Option<MapArgs> {
+        let mut it = argv.iter().skip(1);
+        if it.next().map(|s| s.as_str()) != Some("map") {
+            return None;
+        }
+        let mut a = MapArgs {
+            src: String::new(),
+            out: None,
+            tokens: 1024,
+            no_gitignore: false,
+            include_hidden: false,
+            include_venv: false,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+        };
+        let mut positionals: Vec<String> = Vec::new();
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--tokens" | "--max-tokens" => {
+                    if let Some(t) = it.next().and_then(|s| s.parse().ok()) {
+                        a.tokens = t;
+                    }
+                }
+                "--include" => {
+                    if let Some(g) = it.next() {
+                        a.include_globs.push(g.clone());
+                    }
+                }
+                "--exclude" => {
+                    if let Some(g) = it.next() {
+                        a.exclude_globs.push(g.clone());
+                    }
+                }
+                "--no-gitignore" => a.no_gitignore = true,
+                "--include-hidden" => a.include_hidden = true,
+                "--include-venv" => a.include_venv = true,
+                other => positionals.push(other.to_string()),
+            }
+        }
+        if positionals.is_empty() {
+            eprintln!("usage: turbomerger map <src_dir> [out] [--tokens N] [--include GLOB] [--exclude GLOB] [--no-gitignore] [--include-hidden] [--include-venv]");
+            return Some(a); // src empty -> run_map_cli reports error
+        }
+        a.src = positionals[0].clone();
+        a.out = positionals.get(1).cloned();
+        Some(a)
+    }
+}
+
+/// Run a headless repo-map. Prints to stdout (or writes `out`). Exit code.
+pub fn run_map_cli(a: MapArgs) -> i32 {
+    if a.src.is_empty() {
+        return 2;
+    }
+    let options = MergeOptions {
+        folder_path: a.src,
+        output_path: None,
+        include_venv: a.include_venv,
+        include_tree: false,
+        content_detection: true,
+        respect_gitignore: !a.no_gitignore,
+        include_hidden: a.include_hidden,
+        redact_secrets: true,
+        format: None,
+        ordering: None,
+        max_tokens: None,
+        include_globs: a.include_globs,
+        exclude_globs: a.exclude_globs,
+        remove_empty_lines: false,
+        truncate_base64: false,
+        compress: false,
+        strip_comments: false,
+        selected_paths: None,
+        force_include: Vec::new(),
+    };
+    let job = match resolve_job(&options) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
+    let scan = match scanner::scan_text_files(&job.root, &job.scan_options) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("scan failed: {}", e);
+            return 1;
+        }
+    };
+    let map = crate::repomap::build_repo_map(&job.root, &scan.files, a.tokens);
+    match a.out {
+        Some(out) if !out.is_empty() => {
+            if let Err(e) = std::fs::write(&out, &map) {
+                eprintln!("write failed: {}", e);
+                return 1;
+            }
+            println!("out={}", out);
+        }
+        _ => print!("{}", map),
+    }
+    0
 }
 
 /// Run a headless merge. Returns process exit code.

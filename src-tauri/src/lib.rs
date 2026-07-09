@@ -2,11 +2,12 @@ mod commands;
 pub mod compress;
 pub mod config;
 pub mod merger;
+pub mod repomap;
 pub mod scanner;
 pub mod security;
 pub mod tokens;
 
-pub use commands::{run_cli, CliArgs};
+pub use commands::{run_cli, run_map_cli, CliArgs, MapArgs};
 
 use std::sync::Mutex;
 
@@ -18,6 +19,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::merge_folder,
             commands::scan_folder,
+            commands::repo_map,
             commands::cancel_merge,
             commands::reset_cancel,
             commands::get_downloads_path,

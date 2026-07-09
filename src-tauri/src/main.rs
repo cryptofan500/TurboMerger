@@ -14,5 +14,8 @@ fn main() {
         // output file(s) and the process exit code are the authoritative result.
         std::process::exit(turbomerger::run_cli(args));
     }
+    if let Some(args) = turbomerger::MapArgs::parse(&argv) {
+        std::process::exit(turbomerger::run_map_cli(args));
+    }
     turbomerger::run();
 }
