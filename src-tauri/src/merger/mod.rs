@@ -270,31 +270,17 @@ fn process_file(
         return Err((relative, "unreadable".into()));
     }
 
-    if !buffer.is_empty() {
+    // A UTF-16 BOM legitimizes the null bytes that the binary sniff would
+    // otherwise reject, so BOM detection must run first.
+    let bom = encoding_rs::Encoding::for_bom(&buffer);
+    if bom.is_none() && !buffer.is_empty() {
         let check = 8192.min(buffer.len());
         if crate::security::is_binary_content(&buffer[..check]) {
             return Err((relative, "binary content".into()));
         }
     }
-    if buffer.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        buffer.drain(..3);
-    }
 
-    let (mut content, utf8_note) = match String::from_utf8(buffer) {
-        Ok(s) => (s, None),
-        Err(e) => {
-            let bytes = e.into_bytes();
-            let s = String::from_utf8_lossy(&bytes).into_owned();
-            let n = s.matches('\u{FFFD}').count();
-            (
-                s,
-                Some(format!(
-                    "not valid UTF-8 — {} byte(s) replaced with U+FFFD (consider re-saving as UTF-8)",
-                    n
-                )),
-            )
-        }
-    };
+    let (mut content, utf8_note) = decode_text(buffer, bom);
 
     // Whole-file exclusion for credential-dense content (inline login tables,
     // Google app-passwords, key blocks) that per-line redaction can't fully
@@ -349,6 +335,64 @@ fn process_file(
         utf8_note,
         redactions,
     })
+}
+
+/// Decode raw file bytes to a String: BOM → strict UTF-8 → chardetng-guessed
+/// legacy encoding → lossy UTF-8. Returns the text plus an optional note for
+/// the Merge Report's "Decoding notes".
+fn decode_text(
+    buffer: Vec<u8>,
+    bom: Option<(&'static encoding_rs::Encoding, usize)>,
+) -> (String, Option<String>) {
+    if let Some((enc, bom_len)) = bom {
+        if enc == encoding_rs::UTF_8 {
+            // Strip the BOM, then take the normal UTF-8 path below.
+        } else {
+            let (text, had_errors) = enc.decode_without_bom_handling(&buffer[bom_len..]);
+            let note = if had_errors {
+                format!("decoded from {} (BOM) with replacement characters", enc.name())
+            } else {
+                format!("decoded from {} (BOM)", enc.name())
+            };
+            return (text.into_owned(), Some(note));
+        }
+    }
+    let start = bom.map(|(_, len)| len).unwrap_or(0);
+    let body = &buffer[start..];
+
+    match std::str::from_utf8(body) {
+        Ok(s) => (s.to_string(), None),
+        Err(_) => {
+            // Strict UTF-8 already failed, so deny UTF-8 as a guess; a legacy
+            // single-byte decode (windows-1252 default) never errors, matching
+            // what editors do on auto-detect.
+            let mut det = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
+            det.feed(body, true);
+            let enc = det.guess(None, chardetng::Utf8Detection::Deny);
+            if enc != encoding_rs::UTF_8 {
+                let (text, had_errors) = enc.decode_without_bom_handling(body);
+                let note = if had_errors {
+                    format!(
+                        "not UTF-8 — decoded as {} (detected) with replacement characters",
+                        enc.name()
+                    )
+                } else {
+                    format!("not UTF-8 — decoded as {} (detected)", enc.name())
+                };
+                (text.into_owned(), Some(note))
+            } else {
+                let s = String::from_utf8_lossy(body).into_owned();
+                let n = s.matches('\u{FFFD}').count();
+                (
+                    s,
+                    Some(format!(
+                        "not valid UTF-8 — {} byte(s) replaced with U+FFFD (consider re-saving as UTF-8)",
+                        n
+                    )),
+                )
+            }
+        }
+    }
 }
 
 // ============================================================================

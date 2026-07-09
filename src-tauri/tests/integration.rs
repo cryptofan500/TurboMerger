@@ -219,7 +219,7 @@ fn merge_redacts_secrets_and_keeps_fences_safe() {
 }
 
 #[test]
-fn bom_stripped_and_lossy_decode_noted() {
+fn bom_stripped_and_legacy_encodings_decoded() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("enc_repo");
     fs::create_dir_all(&root).unwrap();
@@ -227,8 +227,14 @@ fn bom_stripped_and_lossy_decode_noted() {
     let mut bom = vec![0xEF, 0xBB, 0xBF];
     bom.extend_from_slice(b"hello bom\n");
     fs::write(root.join("bom.txt"), &bom).unwrap();
-    // windows-1252-ish byte (0xE9 = é) — invalid as UTF-8
+    // windows-1252 byte (0xE9 = é) — invalid as UTF-8, must be DETECTED not mangled
     fs::write(root.join("latin.txt"), b"caf\xE9 latte\n").unwrap();
+    // UTF-16LE with BOM — null bytes must not trip the binary check
+    let mut utf16 = vec![0xFF, 0xFE];
+    for u in "hi utf sixteen\n".encode_utf16() {
+        utf16.extend_from_slice(&u.to_le_bytes());
+    }
+    fs::write(root.join("wide.txt"), &utf16).unwrap();
 
     let scan = scan_text_files(&root, &ScanOptions::default()).unwrap();
     let out = tmp.path().join("enc_out.md");
@@ -243,10 +249,19 @@ fn bom_stripped_and_lossy_decode_noted() {
     assert!(!text.contains('\u{FEFF}'), "BOM must be stripped");
     assert!(text.contains("hello bom"));
     assert!(
+        text.contains("café latte"),
+        "windows-1252 é must survive via chardetng detection"
+    );
+    assert!(
+        text.contains("hi utf sixteen"),
+        "UTF-16LE BOM file must decode"
+    );
+    assert!(
         text.contains("Decoding notes"),
-        "lossy decode must be reported"
+        "non-UTF-8 decodes must be reported"
     );
     assert!(text.contains("latin.txt"));
+    assert!(text.contains("UTF-16LE"), "UTF-16 note must name the encoding");
 }
 
 #[test]
