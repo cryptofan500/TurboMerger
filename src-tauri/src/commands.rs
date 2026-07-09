@@ -105,14 +105,14 @@ pub struct MergeOptions {
 }
 
 /// Everything needed to run a merge, resolved from UI options + config file.
-struct ResolvedJob {
-    root: PathBuf,
-    output_path: PathBuf,
-    scan_options: ScanOptions,
-    merge_config: MergeConfig,
+pub(crate) struct ResolvedJob {
+    pub(crate) root: PathBuf,
+    pub(crate) output_path: PathBuf,
+    pub(crate) scan_options: ScanOptions,
+    pub(crate) merge_config: MergeConfig,
 }
 
-fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
+pub(crate) fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
     let root = security::validate_and_canonicalize(&options.folder_path)
         .map_err(|e| format!("Security error: {}", e))?;
     if !root.exists() || !root.is_dir() {
@@ -888,7 +888,9 @@ pub fn run_map_cli(a: MapArgs) -> i32 {
 /// Resolve a CLI source: an existing local path passes through; otherwise a
 /// remote-looking ref is shallow-cloned (PAT via TURBOMERGER_PAT env, never
 /// argv). Returns (root_path, checkout guard to keep alive).
-fn resolve_cli_source(src: &str) -> Result<(String, Option<crate::remote::RemoteCheckout>), String> {
+pub(crate) fn resolve_cli_source(
+    src: &str,
+) -> Result<(String, Option<crate::remote::RemoteCheckout>), String> {
     if std::path::Path::new(src).exists() {
         return Ok((src.to_string(), None));
     }

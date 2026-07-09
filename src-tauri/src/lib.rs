@@ -1,6 +1,7 @@
 mod commands;
 pub mod compress;
 pub mod config;
+pub mod mcp;
 pub mod merger;
 pub mod remote;
 pub mod repomap;
@@ -9,6 +10,7 @@ pub mod security;
 pub mod tokens;
 
 pub use commands::{run_cli, run_map_cli, CliArgs, MapArgs};
+pub use mcp::run_mcp;
 
 use std::sync::Mutex;
 
