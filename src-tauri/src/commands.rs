@@ -41,6 +41,7 @@ pub struct MergeResult {
     pub secrets_redacted: usize,
     pub tokens_o200k: usize,
     pub tokens_claude_est: usize,
+    pub skill_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -94,6 +95,9 @@ pub struct MergeOptions {
     /// Append `git log -n N` as a final section; 0 = off (T2-5).
     #[serde(default)]
     pub git_log_count: usize,
+    /// Write `.claude/skills/<repo>/SKILL.md` into the scanned repo (T3-4).
+    #[serde(default)]
+    pub emit_skill: bool,
     /// Exact relative paths to merge (curated in the file tree). None = all.
     #[serde(default)]
     pub selected_paths: Option<Vec<String>>,
@@ -179,6 +183,7 @@ pub(crate) fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String>
         strip_comments: options.strip_comments,
         git_diff: options.git_diff,
         git_log: options.git_log_count,
+        emit_skill: options.emit_skill,
     };
 
     Ok(ResolvedJob {
@@ -480,6 +485,10 @@ fn do_merge(
         secrets_redacted: outcome.secrets_redacted,
         tokens_o200k: outcome.tokens_o200k,
         tokens_claude_est: crate::tokens::claude_estimate(outcome.tokens_o200k),
+        skill_path: outcome
+            .skill
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
     })
 }
 
@@ -560,6 +569,10 @@ fn run_watch_merge(options: &MergeOptions, output: &std::path::Path) -> Result<M
         secrets_redacted: outcome.secrets_redacted,
         tokens_o200k: outcome.tokens_o200k,
         tokens_claude_est: crate::tokens::claude_estimate(outcome.tokens_o200k),
+        skill_path: outcome
+            .skill
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
     })
 }
 
@@ -684,6 +697,7 @@ pub struct CliArgs {
     pub strip_comments: bool,
     pub git_diff: bool,
     pub git_log: usize,
+    pub emit_skill: bool,
     pub include_globs: Vec<String>,
     pub exclude_globs: Vec<String>,
     pub quiet: bool,
@@ -712,6 +726,7 @@ impl CliArgs {
             strip_comments: false,
             git_diff: false,
             git_log: 0,
+            emit_skill: false,
             include_globs: Vec::new(),
             exclude_globs: Vec::new(),
             quiet: false,
@@ -742,12 +757,13 @@ impl CliArgs {
                 "--strip-comments" => a.strip_comments = true,
                 "--git-diff" => a.git_diff = true,
                 "--git-log" => a.git_log = it.next().and_then(|s| s.parse().ok()).unwrap_or(10),
+                "--emit-skill" => a.emit_skill = true,
                 "--quiet" | "-q" => a.quiet = true,
                 other => positionals.push(other.to_string()),
             }
         }
         if positionals.is_empty() {
-            eprintln!("usage: turbomerger merge <src_dir> [out] [--format md|xml|cxml|json|plain] [--ordering path|entry-first|important-last] [--max-tokens N] [--include GLOB] [--exclude GLOB] [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--remove-empty-lines] [--truncate-base64] [--compress] [--strip-comments] [--git-diff] [--git-log N]");
+            eprintln!("usage: turbomerger merge <src_dir> [out] [--format md|xml|cxml|json|plain] [--ordering path|entry-first|important-last] [--max-tokens N] [--include GLOB] [--exclude GLOB] [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--remove-empty-lines] [--truncate-base64] [--compress] [--strip-comments] [--git-diff] [--git-log N] [--emit-skill]");
             return Some(a); // src empty -> run_cli reports error
         }
         a.src = positionals[0].clone();
@@ -854,6 +870,7 @@ pub fn run_map_cli(a: MapArgs) -> i32 {
         strip_comments: false,
         git_diff: false,
         git_log_count: 0,
+        emit_skill: false,
         selected_paths: None,
         force_include: Vec::new(),
     };
@@ -936,6 +953,7 @@ pub fn run_cli(a: CliArgs) -> i32 {
         strip_comments: a.strip_comments,
         git_diff: a.git_diff,
         git_log_count: a.git_log,
+        emit_skill: a.emit_skill,
         selected_paths: None,
         force_include: Vec::new(),
     };
@@ -984,6 +1002,9 @@ pub fn run_cli(a: CliArgs) -> i32 {
                 );
                 for p in &o.outputs {
                     println!("out={}", p.display());
+                }
+                if let Some(s) = &o.skill {
+                    println!("skill={}", s.display());
                 }
             }
             0

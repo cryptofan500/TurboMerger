@@ -465,6 +465,61 @@ fn git_context_blocks_append_redact_and_degrade() {
 }
 
 #[test]
+fn skill_generation_writes_skill_md_only_when_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("My Repo");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn thing() {}\n").unwrap();
+
+    let scan = scan_text_files(&root, &ScanOptions::default()).unwrap();
+    let cancel = AtomicBool::new(false);
+
+    // Default: no skill emitted, no .claude dir appears.
+    let out1 = tmp.path().join("no_skill.md");
+    let outcome = merge_files_with_progress(
+        &root,
+        &scan.files,
+        &out1,
+        &md_cfg(),
+        &cancel,
+        |_, _, _| {},
+        &[],
+    )
+    .unwrap();
+    assert!(outcome.skill.is_none());
+    assert!(!root.join(".claude").exists());
+
+    // Opt-in: SKILL.md lands in the repo with frontmatter, tree, output path.
+    let out2 = tmp.path().join("with_skill.md");
+    let cfg = MergeConfig {
+        emit_skill: true,
+        ..MergeConfig::default()
+    };
+    let outcome = merge_files_with_progress(
+        &root,
+        &scan.files,
+        &out2,
+        &cfg,
+        &cancel,
+        |_, _, _| {},
+        &[],
+    )
+    .unwrap();
+    let skill_path = outcome.skill.expect("skill written");
+    assert!(skill_path.ends_with("SKILL.md"));
+    assert!(skill_path.starts_with(root.join(".claude").join("skills")));
+    let text = fs::read_to_string(&skill_path).unwrap();
+    assert!(text.starts_with("---\nname: my-repo\n"), "frontmatter: {}", text);
+    assert!(text.contains("description: Repo context for My Repo"));
+    assert!(text.contains("src/") && text.contains("lib.rs"), "tree missing");
+    assert!(
+        text.contains(&out2.display().to_string()),
+        "must point at the merged output"
+    );
+    assert!(text.contains("turbomerger map"));
+}
+
+#[test]
 fn compress_elides_bodies_and_strip_removes_comments() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("cmp_repo");

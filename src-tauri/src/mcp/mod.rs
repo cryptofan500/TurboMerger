@@ -132,6 +132,7 @@ fn tool_definitions() -> Value {
                     "strip_comments": { "type": "boolean" },
                     "git_diff": { "type": "boolean", "description": "Append git diff HEAD section" },
                     "git_log": { "type": "integer", "description": "Append git log of last N commits" },
+                    "emit_skill": { "type": "boolean", "description": "Write .claude/skills/<repo>/SKILL.md into the repo" },
                     "include_hidden": { "type": "boolean" },
                     "no_gitignore": { "type": "boolean", "description": "Ignore .gitignore rules (default false)" }
                 },
@@ -213,6 +214,7 @@ fn tool_pack_directory(args: &Value) -> Result<String, String> {
         strip_comments: arg_bool(args, "strip_comments"),
         git_diff: arg_bool(args, "git_diff"),
         git_log_count: arg_usize(args, "git_log").unwrap_or(0),
+        emit_skill: arg_bool(args, "emit_skill"),
         selected_paths: None,
         force_include: Vec::new(),
     };
@@ -272,6 +274,7 @@ fn tool_repo_map(args: &Value) -> Result<String, String> {
         strip_comments: false,
         git_diff: false,
         git_log_count: 0,
+        emit_skill: false,
         selected_paths: None,
         force_include: Vec::new(),
     };

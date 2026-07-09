@@ -86,6 +86,8 @@ pub struct MergeConfig {
     pub git_diff: bool,
     /// Append `git log -n N` as a final section; 0 = off (T2-5).
     pub git_log: usize,
+    /// Write `.claude/skills/<repo>/SKILL.md` into the scanned repo (T3-4).
+    pub emit_skill: bool,
 }
 
 impl Default for MergeConfig {
@@ -102,6 +104,7 @@ impl Default for MergeConfig {
             strip_comments: false,
             git_diff: false,
             git_log: 0,
+            emit_skill: false,
         }
     }
 }
@@ -115,6 +118,8 @@ pub struct MergeOutcome {
     pub files_compressed: usize,
     pub tokens_o200k: usize,
     pub outputs: Vec<PathBuf>,
+    /// Path of the generated SKILL.md, when `emit_skill` was on and it wrote.
+    pub skill: Option<PathBuf>,
 }
 
 struct Block {
@@ -236,7 +241,68 @@ where
         outcome.outputs.push(path);
     }
 
+    // Claude-skill emission (T3-4): best-effort, into the scanned repo.
+    if cfg.emit_skill && !cancel_flag.load(AtomicOrd::Relaxed) {
+        match write_skill(root, &blocks, &outcome) {
+            Ok(p) => outcome.skill = Some(p),
+            Err(e) => eprintln!("skill generation failed: {}", e),
+        }
+    }
+
     Ok(outcome)
+}
+
+/// Write `.claude/skills/<repo>/SKILL.md` describing the merged snapshot and
+/// how to regenerate it. Overwrites on re-merge (watch mode included).
+fn write_skill(root: &Path, blocks: &[Block], outcome: &MergeOutcome) -> Result<PathBuf> {
+    let repo = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project");
+    let slug: String = repo
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let slug = if slug.is_empty() { "project".into() } else { slug };
+
+    let dir = root
+        .join(".claude")
+        .join("skills")
+        .join(crate::security::sanitize_filename(repo));
+    std::fs::create_dir_all(&dir)?;
+
+    let refs: Vec<&Block> = blocks.iter().collect();
+    let tree = generate_tree(root, &refs);
+    let outputs = outcome
+        .outputs
+        .iter()
+        .map(|p| format!("- `{}`", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let content = format!(
+        "---\nname: {slug}\ndescription: Repo context for {repo}. Use when working on {repo} code — points at the TurboMerger merged snapshot and how to regenerate or map it.\n---\n\n\
+# {repo} — TurboMerger context\n\n\
+Merged snapshot ({files} files, ~{tokens} o200k tokens, generated {when} by TurboMerger v{version}):\n\n{outputs}\n\n\
+Regenerate: `turbomerger merge \"{root}\"` (flags: `--compress` for signatures-only, `--git-diff` for the working-tree diff).\n\
+Structural overview instead of full content: `turbomerger map \"{root}\" --tokens 1024`.\n\n\
+## Project structure\n\n```\n{tree}```\n",
+        slug = slug,
+        repo = repo,
+        files = outcome.files_processed,
+        tokens = outcome.tokens_o200k,
+        when = chrono::Utc::now().format("%Y-%m-%dT%H:%MZ"),
+        version = env!("CARGO_PKG_VERSION"),
+        outputs = outputs,
+        root = root.display(),
+        tree = tree,
+    );
+    let path = dir.join("SKILL.md");
+    std::fs::write(&path, content)?;
+    Ok(path)
 }
 
 /// Greedy bin-packing of block indices into parts under `max_tokens`.
