@@ -1,6 +1,6 @@
 {
   "name": "turbomerger",
-  "version": "7.1.0",
+  "version": "7.2.0",
   "description": "One-click codebase merger",
   "private": true,
   "type": "module",
@@ -18,7 +18,6 @@
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
-    "@tauri-apps/plugin-fs": "^2.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

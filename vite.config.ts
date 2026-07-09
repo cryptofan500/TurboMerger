@@ -26,12 +26,12 @@ export default defineConfig(async () => ({
   // https://tauri.app/v1/api/config#buildconfig.beforedevcommand
   envPrefix: ["VITE_", "TAURI_"],
   build: {
-    // Tauri supports es2021
-    target: process.env.TAURI_PLATFORM === "windows" ? "chrome105" : "safari13",
-    // don't minify for debug builds
-    minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
-    // produce sourcemaps for debug builds
-    sourcemap: !!process.env.TAURI_DEBUG,
+    // Windows-only app rendering in WebView2 (Chromium) — Tauri 2 renamed the
+    // v1 TAURI_PLATFORM/TAURI_DEBUG env vars to TAURI_ENV_*, so the old
+    // conditional silently always chose the safari13 fallback.
+    target: "chrome105",
+    minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
+    sourcemap: !!process.env.TAURI_ENV_DEBUG,
   },
   // Use relative paths for Tauri custom protocol
   base: "./",

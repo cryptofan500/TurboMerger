@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "TurboMerger",
-  "version": "7.1.0",
+  "version": "7.2.0",
   "identifier": "com.turbomerger.app",
   "build": {
     "beforeBuildCommand": "npm run build",
@@ -13,7 +13,7 @@
     "withGlobalTauri": false,
     "windows": [
       {
-        "title": "TurboMerger v7.1",
+        "title": "TurboMerger",
         "width": 640,
         "height": 780,
         "minWidth": 500,
@@ -51,9 +51,9 @@
       }
     },
     "shortDescription": "One-click codebase merger",
-    "longDescription": "TurboMerger transforms any codebase into a single, LLM-ready markdown file. Enterprise-grade performance with streaming I/O and parallel processing.",
+    "longDescription": "TurboMerger merges a codebase into a single LLM-ready markdown file: gitignore-aware scanning, secret redaction, parallel processing, and a per-file merge report.",
     "category": "DeveloperTool",
     "publisher": "TurboMerger",
-    "copyright": "Copyright 2024 TurboMerger Contributors"
+    "copyright": "Copyright 2026 TurboMerger Contributors"
   }
 }

@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import "./styles/global.css";
 
 interface MergeResult {
@@ -13,6 +14,9 @@ interface MergeResult {
   files_by_extension: number;
   files_by_content: number;
   files_skipped_binary: number;
+  files_unreadable: number;
+  secrets_redacted: number;
+  token_estimate: number;
 }
 
 interface ProgressUpdate {
@@ -28,24 +32,33 @@ interface MergeOptions {
   include_venv: boolean;
   include_tree: boolean;
   content_detection: boolean;
+  respect_gitignore: boolean;
+  include_hidden: boolean;
+  redact_secrets: boolean;
 }
 
 type Status = "ready" | "scanning" | "merging" | "done" | "error" | "cancelled";
 
 function App() {
   const [status, setStatus] = useState<Status>("ready");
+  const [version, setVersion] = useState<string>("");
   const [sourcePath, setSourcePath] = useState<string>("");
   const [outputPath, setOutputPath] = useState<string>("");
   const [includeVenv, setIncludeVenv] = useState<boolean>(false);
   const [includeTree, setIncludeTree] = useState<boolean>(true);
   const [contentDetection, setContentDetection] = useState<boolean>(true);
+  const [respectGitignore, setRespectGitignore] = useState<boolean>(true);
+  const [includeHidden, setIncludeHidden] = useState<boolean>(false);
+  const [redactSecrets, setRedactSecrets] = useState<boolean>(true);
   const [result, setResult] = useState<MergeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressUpdate | null>(null);
 
-  // Initialize default output path
+  // Default output = Downloads folder; the backend generates the timestamped
+  // filename at merge time (naming lives in exactly one place).
   useEffect(() => {
     invoke<string>("get_downloads_path").then(setOutputPath).catch(console.error);
+    getVersion().then(setVersion).catch(console.error);
   }, []);
 
   // Listen for progress updates
@@ -67,11 +80,6 @@ function App() {
     });
     if (selected && typeof selected === "string") {
       setSourcePath(selected);
-      // Auto-generate output name based on source
-      const folderName = selected.split(/[/\\]/).pop() || "merged";
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const defaultOutput = await invoke<string>("get_downloads_path");
-      setOutputPath(`${defaultOutput}\\${folderName}_${timestamp}_merged.md`);
     }
   };
 
@@ -108,6 +116,9 @@ function App() {
         include_venv: includeVenv,
         include_tree: includeTree,
         content_detection: contentDetection,
+        respect_gitignore: respectGitignore,
+        include_hidden: includeHidden,
+        redact_secrets: redactSecrets,
       };
 
       const mergeResult = await invoke<MergeResult>("merge_folder", { options });
@@ -149,6 +160,19 @@ function App() {
     return `${(ms / 60000).toFixed(1)}m`;
   };
 
+  const formatTokens = (n: number): string => {
+    if (n < 1000) return `${n}`;
+    if (n < 1_000_000) return `${(n / 1000).toFixed(0)}k`;
+    return `${(n / 1_000_000).toFixed(2)}M`;
+  };
+
+  const tokenFitHint = (n: number): string => {
+    if (n <= 120_000) return "fits GPT (128k) and Claude (200k) contexts";
+    if (n <= 180_000) return "fits Claude (200k); tight for GPT (128k)";
+    if (n <= 900_000) return "exceeds Claude 200k — consider splitting; fits Gemini (1M)";
+    return "exceeds 1M tokens — splitting required for any chat";
+  };
+
   const isWorking = status === "scanning" || status === "merging";
 
   return (
@@ -156,7 +180,7 @@ function App() {
       <div className="container">
         <header className="header">
           <h1 className="title">TurboMerger</h1>
-          <span className="version">v7.1</span>
+          <span className="version">{version ? `v${version}` : ""}</span>
         </header>
 
         {/* Source Selection */}
@@ -185,12 +209,15 @@ function App() {
               className="input"
               value={outputPath}
               readOnly
-              placeholder="Output path..."
+              placeholder="Output folder or file..."
             />
             <button className="btn btn-secondary" onClick={selectOutput} disabled={isWorking}>
               Change
             </button>
           </div>
+          <p className="checkbox-hint">
+            Folder = auto-named &lt;source&gt;_&lt;timestamp&gt;_merged.md inside it
+          </p>
         </section>
 
         {/* Configuration */}
@@ -200,13 +227,26 @@ function App() {
             <label className="checkbox-label">
               <input
                 type="checkbox"
-                checked={includeVenv}
-                onChange={(e) => setIncludeVenv(e.target.checked)}
+                checked={respectGitignore}
+                onChange={(e) => setRespectGitignore(e.target.checked)}
                 disabled={isWorking}
               />
-              <span>Include virtual environments (venv, node_modules)</span>
+              <span>Respect .gitignore / .turbomergerignore</span>
             </label>
-            <p className="checkbox-hint">Warning: Can slow down scanning significantly</p>
+            <p className="checkbox-hint">
+              Skips whatever the repo itself ignores (build output, browser profiles, data dumps)
+            </p>
+          </div>
+          <div className="checkbox-group">
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={redactSecrets}
+                onChange={(e) => setRedactSecrets(e.target.checked)}
+                disabled={isWorking}
+              />
+              <span>Redact secrets (API keys, tokens, private keys)</span>
+            </label>
           </div>
           <div className="checkbox-group">
             <label className="checkbox-label">
@@ -216,7 +256,7 @@ function App() {
                 onChange={(e) => setIncludeTree(e.target.checked)}
                 disabled={isWorking}
               />
-              <span>Generate directory tree</span>
+              <span>Directory tree + table of contents</span>
             </label>
           </div>
           <div className="checkbox-group">
@@ -229,9 +269,28 @@ function App() {
               />
               <span>Include all text files (content-based detection)</span>
             </label>
-            <p className="checkbox-hint" style={{ color: 'var(--text-muted)' }}>
-              Detects text files by reading content, not just file extension
-            </p>
+          </div>
+          <div className="checkbox-group">
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={includeHidden}
+                onChange={(e) => setIncludeHidden(e.target.checked)}
+                disabled={isWorking}
+              />
+              <span>Include hidden dotfiles (beyond the standard config set)</span>
+            </label>
+          </div>
+          <div className="checkbox-group">
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={includeVenv}
+                onChange={(e) => setIncludeVenv(e.target.checked)}
+                disabled={isWorking}
+              />
+              <span>Include virtual environments (venv, node_modules)</span>
+            </label>
           </div>
         </section>
 
@@ -292,19 +351,32 @@ function App() {
                 <span className="stat-label">skipped</span>
               </div>
               <div className="stat">
-                <span className="stat-value">{formatBytes(result.total_bytes)}</span>
-                <span className="stat-label">size</span>
+                <span className="stat-value">~{formatTokens(result.token_estimate)}</span>
+                <span className="stat-label">tokens (est.)</span>
               </div>
               <div className="stat">
                 <span className="stat-value">{formatDuration(result.duration_ms)}</span>
                 <span className="stat-label">time</span>
               </div>
             </div>
-            {(result.files_by_extension > 0 || result.files_by_content > 0) && (
+            <p className="detection-breakdown">
+              {formatBytes(result.total_bytes)} — {tokenFitHint(result.token_estimate)}
+            </p>
+            <p className="detection-breakdown">
+              {result.files_by_extension.toLocaleString()} by extension
+              {result.files_by_content > 0 && `, ${result.files_by_content.toLocaleString()} by content`}
+              {result.files_skipped_binary > 0 && `, ${result.files_skipped_binary.toLocaleString()} binary skipped`}
+              {result.files_unreadable > 0 && `, ${result.files_unreadable.toLocaleString()} unreadable`}
+            </p>
+            {result.secrets_redacted > 0 && (
+              <p className="detection-breakdown" style={{ color: "var(--warning)" }}>
+                ⚠ {result.secrets_redacted.toLocaleString()} secret{result.secrets_redacted === 1 ? "" : "s"} redacted
+                — details in the Merge Report at the end of the output
+              </p>
+            )}
+            {result.files_skipped > 0 && (
               <p className="detection-breakdown">
-                {result.files_by_extension.toLocaleString()} by extension
-                {result.files_by_content > 0 && `, ${result.files_by_content.toLocaleString()} by content detection`}
-                {result.files_skipped_binary > 0 && `, ${result.files_skipped_binary.toLocaleString()} binary skipped`}
+                Skipped-file reasons are listed in the Merge Report inside the output file
               </p>
             )}
             <div className="action-buttons">
@@ -312,7 +384,7 @@ function App() {
                 Open File
               </button>
               <button className="btn btn-secondary" onClick={handleOpenFolder}>
-                Open Folder
+                Show in Folder
               </button>
             </div>
             <p className="output-path">{result.output_path}</p>
@@ -335,7 +407,7 @@ function App() {
       </div>
 
       <footer className="footer">
-        <span>TurboMerger v7.1.0</span>
+        <span>TurboMerger {version ? `v${version}` : ""}</span>
       </footer>
     </div>
   );
