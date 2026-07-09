@@ -30,6 +30,26 @@ Gemini.
 - **Include/exclude globs** — UI + `turbomerger.toml [filter]`; plus content slimming
   (remove empty lines, truncate long base64 blobs). **Presets**: LLM-review-lean,
   Claude-cxml, Full archive, Docs only.
+- **Compress to signatures** — tree-sitter elides function bodies (`{ ... }` / `...`)
+  across rs/js/jsx/ts/tsx/py/go/java/c/cpp, keeping signatures, types, imports, and class
+  structure (~60–80% token cut); separate strip-comments toggle. Unparseable files pass
+  through unchanged.
+- **Repo map** — `turbomerger map <src>` builds an aider-style ranked signature map
+  (tree-sitter def/ref tags → PageRank → token budget) for repos that won't fit whole.
+- **Curate before merging** — **Scan & curate** opens a tri-state checkbox file tree with
+  per-file token counts and a selected-vs-budget bar, a click-to-exclude token **treemap**,
+  and a skip-report drill-in with per-file "include anyway" rescue. Selection persists per
+  project.
+- **Watch mode** — re-merges (debounced) into a stable `<repo>_watch_merged.*` file on
+  every change; `.git` churn and own outputs ignored.
+- **Git context** — optionally append the working-tree diff (`--git-diff`) and recent
+  commits (`--git-log N`) as final, redacted sections.
+- **Remote repos** — paste `owner/repo` or a GitHub/GitLab URL: shallow clone to a
+  self-cleaning temp dir → normal pipeline; PAT held in memory only.
+- **MCP server** — `turbomerger mcp` serves `pack_directory` / `repo_map` / `read_output` /
+  `grep_output` to Claude Desktop/Code over stdio (redaction forced on).
+- **Claude skill** — optional `.claude/skills/<repo>/SKILL.md` emission describing the
+  snapshot and how to regenerate it.
 - **Secret redaction** — API keys, tokens, private keys, and DB connection strings
   (AWS, GitHub, GitLab, OpenAI, Anthropic, Google, Stripe, Slack, JWTs, …) are replaced
   with `[REDACTED]` before writing (entropy gate + placeholder stopwords). Credential
@@ -76,12 +96,40 @@ npm run tauri:build   # exe + NSIS/MSI installers under src-tauri/target/release
 ## Usage
 
 1. Launch TurboMerger.
-2. **Browse** to a source folder.
-3. Adjust options (respect gitignore, redact secrets, tree/TOC, content detection, hidden
-   files, virtual environments).
-4. Optionally **Change** the output path (a folder auto-names the file; a file path is used
+2. **Browse** to a source folder — or type `owner/repo` / a GitHub URL to pack a remote
+   repo (optional PAT field appears; it stays in memory only).
+3. Adjust options (respect gitignore, redact secrets, tree/TOC, formats, compression,
+   git context, hidden files, virtual environments).
+4. Optionally **Scan & curate** first: untick files/folders in the tree, click tiles in
+   the token treemap, or rescue skipped files ("include anyway"). The Merge button then
+   merges the selection.
+5. Optionally **Change** the output path (a folder auto-names the file; a file path is used
    verbatim).
-5. **Merge**, then **Open File** or **Show in Folder**.
+6. **Merge** (or toggle **Watch** to re-merge on every change), then **Open File** or
+   **Show in Folder**.
+
+### CLI
+
+```text
+turbomerger merge <src|owner/repo|URL> [out]
+    [--format md|xml|cxml|json|plain] [--ordering path|entry-first|important-last]
+    [--max-tokens N] [--include GLOB] [--exclude GLOB]
+    [--compress] [--strip-comments] [--git-diff] [--git-log N] [--emit-skill]
+    [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--quiet]
+turbomerger map <src|owner/repo|URL> [out] [--tokens N]
+turbomerger mcp     # stdio MCP server
+```
+
+Remote refs shallow-clone to a temp dir (private repos: set `TURBOMERGER_PAT`).
+
+### MCP (Claude Desktop / Claude Code)
+
+```json
+{ "mcpServers": { "turbomerger": { "command": "C:/path/to/turbomerger.exe", "args": ["mcp"] } } }
+```
+
+Tools: `pack_directory` (merge → file, summary returned), `repo_map` (map text inline),
+`read_output` / `grep_output` (sliced access to `*_merged.*` outputs only).
 
 ## Configuration — `turbomerger.toml` (optional)
 
@@ -145,14 +193,19 @@ cargo test --manifest-path src-tauri/Cargo.toml   # Rust unit + integration test
 ## Architecture
 
 ```
-src/                     React/TypeScript UI (App.tsx + styles)
+src/                     React/TypeScript UI (App.tsx + components/CuratePanel.tsx)
 src-tauri/src/
   lib.rs                 Tauri entry point + command registration
-  commands.rs            IPC handlers (merge_folder, cancel, open, …)
+  main.rs                CLI dispatch (merge / map / mcp) before the GUI starts
+  commands.rs            IPC handlers (merge, scan, watch, remote, repo-map) + CLI
   config.rs              turbomerger.toml loader
   scanner/mod.rs         gitignore-aware walk + text/binary classification
   security/mod.rs        path validation, binary detection, secret redaction
-  merger/mod.rs          parallel read/redact + markdown writer + merge report
+  merger/mod.rs          parallel read/decode/redact + multi-format writer + report
+  compress/mod.rs        tree-sitter signatures-only compression + comment strip
+  repomap/mod.rs         def/ref tags → PageRank → budgeted signature map
+  remote/mod.rs          owner/repo & URL parsing + shallow clone (temp, self-cleaning)
+  mcp/mod.rs             stdio MCP server (pack/map/read/grep tools)
 src-tauri/tests/         end-to-end fixture-tree tests
 ```
 

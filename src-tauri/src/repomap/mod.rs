@@ -274,7 +274,8 @@ pub fn build_repo_map(root: &Path, files: &[PathBuf], token_budget: usize) -> St
     let mut out = header;
     let mut used = tokens::count(&out);
     let mut rendered = 0usize;
-    for (position, &i) in order.iter().enumerate() {
+    let mut over_budget = 0usize;
+    for &i in order.iter() {
         let (rel, tags) = &tagged[i];
         if tags.defs.is_empty() {
             continue;
@@ -286,17 +287,21 @@ pub fn build_repo_map(root: &Path, files: &[PathBuf], token_budget: usize) -> St
             chunk.push('\n');
         }
         let chunk_tokens = tokens::count(&chunk);
+        // Greedy best-first packing: an oversized file is skipped, not a
+        // stopping point — smaller lower-ranked files still fit around it.
         if used + chunk_tokens > budget {
-            let remaining = order[position..]
-                .iter()
-                .filter(|&&k| !tagged[k].0.is_empty() && !tagged[k].1.defs.is_empty())
-                .count();
-            out.push_str(&format!("\n… {} more files beyond the token budget.\n", remaining));
-            break;
+            over_budget += 1;
+            continue;
         }
         out.push_str(&chunk);
         used += chunk_tokens;
         rendered += 1;
+    }
+    if over_budget > 0 {
+        out.push_str(&format!(
+            "\n… {} more files beyond the token budget.\n",
+            over_budget
+        ));
     }
     if rendered == 0 {
         // Budget too small for any signatures: fall back to ranked paths.

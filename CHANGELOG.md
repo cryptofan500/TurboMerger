@@ -2,6 +2,49 @@
 
 All notable changes to TurboMerger will be documented in this file.
 
+## [7.4.0] - 2026-07-09
+
+Agent + curation release — tree-sitter compression, repo map, a curate GUI,
+watch mode, remote packing, an MCP server, and Claude-skill generation.
+
+### Added
+- **Compress to signatures** (`--compress` / Advanced toggle): tree-sitter elides
+  function bodies (`{ ... }` / `...`) across rs/js/jsx/ts/tsx/py/go/java/c/cpp —
+  signatures, types, imports, and class structure survive (~60–80% token cut).
+  Independent **strip comments** toggle (`--strip-comments`). Both fail-safe: an
+  unparseable file passes through unchanged (comment strip runs before compression —
+  elided bodies aren't re-parseable source).
+- **Repo map** (`turbomerger map <src> [out] [--tokens N]` + a `repo_map` app command):
+  aider-style def/ref tags → file reference graph → PageRank → ranked signature map
+  rendered to a token budget. The answer to "the whole repo won't fit".
+- **Curate GUI** (Scan & curate): tri-state checkbox file tree with per-file token
+  counts and a selected-vs-budget bar; a click-to-exclude token **treemap** (zoom into
+  folders, hover for details); and a **skip-report drill-in** grouped by reason with
+  per-file "include anyway" rescue (merge-level safety still applies to rescued files).
+  Selection persists per project.
+- **Watch mode**: re-merge (debounced 300 ms) on file changes into a stable
+  `<repo>_watch_merged.<ext>` output; `.git` churn and own outputs are ignored.
+- **Git context blocks** (`--git-diff`, `--git-log N`): working-tree diff (512 KB cap)
+  and recent commits appended as final sections — secret-redacted like all content;
+  "not a repo" becomes a report note, never an error.
+- **Remote repo packing**: paste `owner/repo` or a GitHub/GitLab URL (GUI source field
+  or CLI positional) — shallow clone into a self-cleaning temp dir, normal pipeline,
+  PAT held in memory only (CLI reads `TURBOMERGER_PAT` env) and scrubbed from errors.
+- **MCP server** (`turbomerger mcp`): stdio JSON-RPC 2.0 for Claude Desktop/Code —
+  tools `pack_directory`, `repo_map`, `read_output`, `grep_output`. The read/grep tools
+  only touch `*_merged.*` outputs, and MCP-driven merges force redaction on.
+- **Claude-skill generation** (`--emit-skill` / Advanced toggle): writes
+  `.claude/skills/<repo>/SKILL.md` (frontmatter, snapshot stats + output pointers,
+  regenerate/map commands, project tree) into the scanned repo.
+- **Full encoding pipeline** (completes D-2): UTF-16/BOM decode + chardetng legacy
+  detection (windows-1252 …) with per-file decoding notes in the report.
+
+### Changed
+- Self-output exclusion now covers xml/json/txt outputs and split parts (was .md only),
+  closing the non-markdown re-merge snowball.
+- Deps: tauri 2.9.5 → 2.11.x (closes the advisory tracked as A-6), tiktoken-rs 0.12,
+  tree-sitter 0.26 + 8 grammars, notify 8.2; frontend: ESLint 9 (flat config), Vite 7.
+
 ## [7.3.0] - 2026-07-09
 
 Feature release — token awareness, output formats, and curation controls.
