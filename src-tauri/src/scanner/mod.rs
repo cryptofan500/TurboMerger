@@ -252,6 +252,10 @@ pub struct ScanOptions {
     pub extra_text_exts: Vec<String>,
     pub extra_skip_exts: Vec<String>,
     pub extra_binary_exts: Vec<String>,
+    /// Whitelist globs — if non-empty, ONLY matching files are kept.
+    pub include_globs: Vec<String>,
+    /// Blacklist globs — matching files are dropped.
+    pub exclude_globs: Vec<String>,
 }
 
 impl Default for ScanOptions {
@@ -265,6 +269,8 @@ impl Default for ScanOptions {
             extra_text_exts: Vec::new(),
             extra_skip_exts: Vec::new(),
             extra_binary_exts: Vec::new(),
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
         }
     }
 }
@@ -603,6 +609,29 @@ pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult>
         .parents(options.respect_gitignore)
         .git_global(false); // deterministic: user-global excludes don't apply
     builder.add_custom_ignore_filename(".turbomergerignore");
+
+    // User include/exclude globs via ripgrep's override layer. A non-empty
+    // whitelist means only matching files survive; `!glob` entries are excludes.
+    if !options.include_globs.is_empty() || !options.exclude_globs.is_empty() {
+        let mut ob = ignore::overrides::OverrideBuilder::new(root);
+        for g in &options.include_globs {
+            ob.add(g)
+                .map_err(|e| anyhow::anyhow!("bad include glob '{}': {}", g, e))?;
+        }
+        for g in &options.exclude_globs {
+            let pat = if g.starts_with('!') {
+                g.clone()
+            } else {
+                format!("!{}", g)
+            };
+            ob.add(&pat)
+                .map_err(|e| anyhow::anyhow!("bad exclude glob '{}': {}", g, e))?;
+        }
+        let overrides = ob
+            .build()
+            .map_err(|e| anyhow::anyhow!("glob build failed: {}", e))?;
+        builder.overrides(overrides);
+    }
 
     let include_venv = options.include_venv;
     let include_hidden = options.include_hidden;

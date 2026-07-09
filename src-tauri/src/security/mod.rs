@@ -247,6 +247,8 @@ pub fn sensitive_reason(path: &Path) -> Option<&'static str> {
         name.as_str(),
         "credentials.json"
             | "secrets.json"
+            | "secrets.yaml"
+            | "secrets.yml"
             | "service-account.json"
             | ".netrc"
             | "_netrc"
@@ -256,6 +258,39 @@ pub fn sensitive_reason(path: &Path) -> Option<&'static str> {
             | ".npmrc"
     ) {
         return Some("credential store");
+    }
+
+    // Credential/secret/password DATA files (e.g. the `<NAME>_CREDENTIALS_<UTC>.md`
+    // convention, `vault.txt`, `passwords.csv`). Only DATA/DOC extensions match, so
+    // ordinary SOURCE files (`password_reset.py`, `useApiKey.ts`, `credentials_form.tsx`)
+    // are NOT swept up. This is the primary defense when merging credential-heavy trees:
+    // the whole file is excluded (and reported), never partially redacted. For DATA
+    // files a plain substring match is used deliberately — a false positive (a doc
+    // excluded but listed in the report, includable-anyway) is far cheaper than a
+    // false negative that leaks a credential dump to a web LLM.
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) => (s, e),
+        None => (name.as_str(), ""),
+    };
+    const DATA_EXTS: &[&str] = &[
+        "md", "markdown", "txt", "text", "csv", "tsv", "json", "yaml", "yml", "toml", "ini",
+        "conf", "cfg", "env", "log", "xlsx", "rtf",
+    ];
+    if DATA_EXTS.contains(&ext) {
+        for marker in [
+            "credential",
+            "password",
+            "passwd",
+            "secret",
+            "vault",
+            "apikey",
+            "api_key",
+            "api-key",
+        ] {
+            if stem.contains(marker) {
+                return Some("credential/secret data file");
+            }
+        }
     }
 
     None
@@ -575,8 +610,34 @@ mod tests {
             "deployment.envoy.yaml",
             "app.key.ts",
             ".env.example",
-            "secret_santa.md",
         ] {
+            assert!(
+                sensitive_reason(Path::new(name)).is_none(),
+                "{} should NOT be sensitive",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_blocks_credential_data_files() {
+        // The user's `<NAME>_CREDENTIALS_<UTC>.md` convention + common dumps
+        for name in [
+            "SSM_CREDENTIALS_2026-06-29T1200Z.md",
+            "passwords.csv",
+            "vault.txt",
+            "prod.secrets.yaml",
+            "api_keys.json",
+            "MyPasswords.txt",
+        ] {
+            assert!(
+                sensitive_reason(Path::new(name)).is_some(),
+                "{} should be sensitive (credential data file)",
+                name
+            );
+        }
+        // …but a source file that merely mentions the word is fine
+        for name in ["credentialize.rs", "password_strength.ts", "secretsanta.py"] {
             assert!(
                 sensitive_reason(Path::new(name)).is_none(),
                 "{} should NOT be sensitive",

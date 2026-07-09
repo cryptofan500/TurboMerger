@@ -2,6 +2,34 @@
 
 All notable changes to TurboMerger will be documented in this file.
 
+## [7.3.0] - 2026-07-09
+
+Feature release — token awareness, output formats, and curation controls.
+
+### Added
+- **Real token counting** (tiktoken `o200k_base`) per file and per merge, with a
+  Claude estimate (o200k × 1.18) and a context-fit hint (GPT 128k / Claude 200k / Gemini 1M).
+- **Output formats**: Markdown (default), **Claude XML (cxml)**, XML, JSON, and Plain text —
+  chosen in the UI or via `--format`. XML escapes content; cxml uses Anthropic's
+  `<documents>` convention; JSON emits a structured `{files:[…], skipped:[…], tokens…}`.
+- **Token-budget splitting**: set a max-tokens value and the output is split at file
+  boundaries into `…part1-of-N` files, each headed "Part N/M — wait for all parts".
+- **File ordering**: alphabetical, entry-points-first, or important-last (README/entry
+  files at the end, where LLMs weight context most).
+- **Include/exclude globs** (UI + `turbomerger.toml [filter]`) via ripgrep's override layer;
+  content slimming (remove empty lines, truncate long base64 blobs).
+- **Presets**: "LLM review (lean)", "Claude (cxml)", "Full archive", "Docs only".
+- **Headless CLI**: `turbomerger merge <src> [out] [--format … --max-tokens … --exclude …]`
+  for scripting and CI.
+- **Quality-of-life**: drag-and-drop a folder onto the window; settings persist between
+  runs; open-in-chat links (claude.ai / chatgpt.com / gemini); multi-part output list.
+
+### Hardened
+- **Credential data files** (the `<NAME>_CREDENTIALS_<UTC>.md` convention, `passwords.csv`,
+  `vault.txt`, `*.secrets.yaml`, …) are now excluded wholesale and listed in the report,
+  rather than relying on per-line redaction. Source files that merely mention the words
+  (`password_reset.py`, `useApiKey.ts`) are unaffected.
+
 ## [7.2.0] - 2026-07-09
 
 Correctness, safety, and honesty release — plus a leaner codebase.

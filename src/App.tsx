@@ -3,10 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import "./styles/global.css";
 
 interface MergeResult {
   output_path: string;
+  output_paths: string[];
   files_processed: number;
   files_skipped: number;
   total_bytes: number;
@@ -16,7 +18,8 @@ interface MergeResult {
   files_skipped_binary: number;
   files_unreadable: number;
   secrets_redacted: number;
-  token_estimate: number;
+  tokens_o200k: number;
+  tokens_claude_est: number;
 }
 
 interface ProgressUpdate {
@@ -26,72 +29,126 @@ interface ProgressUpdate {
   percentage: number;
 }
 
-interface MergeOptions {
-  folder_path: string;
-  output_path: string | null;
-  include_venv: boolean;
-  include_tree: boolean;
-  content_detection: boolean;
-  respect_gitignore: boolean;
-  include_hidden: boolean;
-  redact_secrets: boolean;
-}
-
 type Status = "ready" | "scanning" | "merging" | "done" | "error" | "cancelled";
+type Preset = "custom" | "lean" | "archive" | "docs" | "claude";
+
+const SETTINGS_KEY = "turbomerger.settings.v1";
 
 function App() {
   const [status, setStatus] = useState<Status>("ready");
   const [version, setVersion] = useState<string>("");
   const [sourcePath, setSourcePath] = useState<string>("");
   const [outputPath, setOutputPath] = useState<string>("");
-  const [includeVenv, setIncludeVenv] = useState<boolean>(false);
-  const [includeTree, setIncludeTree] = useState<boolean>(true);
-  const [contentDetection, setContentDetection] = useState<boolean>(true);
-  const [respectGitignore, setRespectGitignore] = useState<boolean>(true);
-  const [includeHidden, setIncludeHidden] = useState<boolean>(false);
-  const [redactSecrets, setRedactSecrets] = useState<boolean>(true);
+
+  const [includeVenv, setIncludeVenv] = useState(false);
+  const [includeTree, setIncludeTree] = useState(true);
+  const [contentDetection, setContentDetection] = useState(true);
+  const [respectGitignore, setRespectGitignore] = useState(true);
+  const [includeHidden, setIncludeHidden] = useState(false);
+  const [redactSecrets, setRedactSecrets] = useState(true);
+  const [format, setFormat] = useState<string>("markdown");
+  const [ordering, setOrdering] = useState<string>("path");
+  const [maxTokens, setMaxTokens] = useState<string>("");
+  const [includeGlobs, setIncludeGlobs] = useState<string>("");
+  const [excludeGlobs, setExcludeGlobs] = useState<string>("");
+  const [removeEmptyLines, setRemoveEmptyLines] = useState(false);
+  const [truncateBase64, setTruncateBase64] = useState(false);
+  const [preset, setPreset] = useState<Preset>("custom");
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
   const [result, setResult] = useState<MergeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressUpdate | null>(null);
 
-  // Default output = Downloads folder; the backend generates the timestamped
-  // filename at merge time (naming lives in exactly one place).
+  // Load persisted settings + version on mount.
   useEffect(() => {
     invoke<string>("get_downloads_path").then(setOutputPath).catch(console.error);
     getVersion().then(setVersion).catch(console.error);
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      if (raw) {
+        const s = JSON.parse(raw);
+        if (typeof s.includeVenv === "boolean") setIncludeVenv(s.includeVenv);
+        if (typeof s.includeTree === "boolean") setIncludeTree(s.includeTree);
+        if (typeof s.contentDetection === "boolean") setContentDetection(s.contentDetection);
+        if (typeof s.respectGitignore === "boolean") setRespectGitignore(s.respectGitignore);
+        if (typeof s.includeHidden === "boolean") setIncludeHidden(s.includeHidden);
+        if (typeof s.redactSecrets === "boolean") setRedactSecrets(s.redactSecrets);
+        if (typeof s.format === "string") setFormat(s.format);
+        if (typeof s.ordering === "string") setOrdering(s.ordering);
+        if (typeof s.maxTokens === "string") setMaxTokens(s.maxTokens);
+        if (typeof s.includeGlobs === "string") setIncludeGlobs(s.includeGlobs);
+        if (typeof s.excludeGlobs === "string") setExcludeGlobs(s.excludeGlobs);
+        if (typeof s.removeEmptyLines === "boolean") setRemoveEmptyLines(s.removeEmptyLines);
+        if (typeof s.truncateBase64 === "boolean") setTruncateBase64(s.truncateBase64);
+        if (typeof s.sourcePath === "string") setSourcePath(s.sourcePath);
+      }
+    } catch { /* ignore corrupt settings */ }
   }, []);
 
-  // Listen for progress updates
+  // Persist settings on change.
+  useEffect(() => {
+    const s = {
+      includeVenv, includeTree, contentDetection, respectGitignore, includeHidden,
+      redactSecrets, format, ordering, maxTokens, includeGlobs, excludeGlobs,
+      removeEmptyLines, truncateBase64, sourcePath,
+    };
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch { /* quota */ }
+  }, [includeVenv, includeTree, contentDetection, respectGitignore, includeHidden,
+      redactSecrets, format, ordering, maxTokens, includeGlobs, excludeGlobs,
+      removeEmptyLines, truncateBase64, sourcePath]);
+
+  // Progress listener.
   useEffect(() => {
     const unlisten = listen<ProgressUpdate>("merge-progress", (event) => {
       setProgress(event.payload);
-      if (event.payload.total > 0) {
-        setStatus("merging");
-      }
+      if (event.payload.total > 0) setStatus("merging");
     });
-    return () => { unlisten.then(f => f()); };
+    return () => { unlisten.then((f) => f()); };
   }, []);
 
-  const selectSource = async () => {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      title: "Select Codebase to Merge",
+  // Drag-and-drop a folder onto the window.
+  useEffect(() => {
+    const p = getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === "drop" && event.payload.paths.length > 0) {
+        setSourcePath(event.payload.paths[0]);
+      }
     });
-    if (selected && typeof selected === "string") {
-      setSourcePath(selected);
+    return () => { p.then((f) => f()); };
+  }, []);
+
+  const applyPreset = (p: Preset) => {
+    setPreset(p);
+    if (p === "lean") {
+      setRespectGitignore(true); setRedactSecrets(true); setIncludeTree(true);
+      setFormat("markdown"); setOrdering("entry-first"); setMaxTokens("180000");
+      setExcludeGlobs("**/*.lock,**/*.min.*"); setRemoveEmptyLines(false); setTruncateBase64(true);
+    } else if (p === "claude") {
+      setRespectGitignore(true); setRedactSecrets(true); setIncludeTree(true);
+      setFormat("cxml"); setOrdering("important-last"); setMaxTokens("180000");
+      setTruncateBase64(true);
+    } else if (p === "archive") {
+      setRespectGitignore(false); setRedactSecrets(true); setIncludeTree(true);
+      setIncludeHidden(true); setIncludeVenv(false); setFormat("markdown");
+      setOrdering("path"); setMaxTokens(""); setExcludeGlobs(""); setIncludeGlobs("");
+    } else if (p === "docs") {
+      setRespectGitignore(true); setFormat("markdown"); setOrdering("path");
+      setIncludeGlobs("**/*.md,**/*.mdx,**/*.rst,**/*.txt"); setExcludeGlobs("");
     }
+  };
+
+  const selectSource = async () => {
+    const selected = await open({ directory: true, multiple: false, title: "Select Codebase to Merge" });
+    if (selected && typeof selected === "string") setSourcePath(selected);
   };
 
   const selectOutput = async () => {
     const selected = await save({
       defaultPath: outputPath,
-      filters: [{ name: "Markdown", extensions: ["md"] }],
+      filters: [{ name: "Output", extensions: ["md", "xml", "json", "txt"] }],
       title: "Save Merged Output As",
     });
-    if (selected) {
-      setOutputPath(selected);
-    }
+    if (selected) setOutputPath(selected);
   };
 
   const handleCancel = async () => {
@@ -102,7 +159,6 @@ function App() {
 
   const handleMerge = async () => {
     if (!sourcePath) return;
-
     try {
       await invoke("reset_cancel");
       setStatus("scanning");
@@ -110,7 +166,8 @@ function App() {
       setResult(null);
       setProgress(null);
 
-      const options: MergeOptions = {
+      const toList = (s: string) => s.split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
+      const options = {
         folder_path: sourcePath,
         output_path: outputPath || null,
         include_venv: includeVenv,
@@ -119,59 +176,39 @@ function App() {
         respect_gitignore: respectGitignore,
         include_hidden: includeHidden,
         redact_secrets: redactSecrets,
+        format,
+        ordering,
+        max_tokens: maxTokens ? parseInt(maxTokens, 10) || 0 : 0,
+        include_globs: toList(includeGlobs),
+        exclude_globs: toList(excludeGlobs),
+        remove_empty_lines: removeEmptyLines,
+        truncate_base64: truncateBase64,
       };
 
       const mergeResult = await invoke<MergeResult>("merge_folder", { options });
-
       setResult(mergeResult);
       setStatus("done");
     } catch (err) {
-      const errorMsg = String(err);
-      if (errorMsg.includes("cancelled")) {
-        setStatus("cancelled");
-      } else {
-        setError(errorMsg);
-        setStatus("error");
-      }
+      const msg = String(err);
+      if (msg.includes("cancelled")) setStatus("cancelled");
+      else { setError(msg); setStatus("error"); }
     }
   };
 
-  const handleOpenFile = async () => {
-    if (result?.output_path) {
-      await invoke("open_file", { path: result.output_path });
-    }
-  };
+  const openThing = (path: string) => invoke("open_file", { path }).catch(console.error);
+  const openFolder = (path: string) => invoke("open_folder", { path }).catch(console.error);
 
-  const handleOpenFolder = async () => {
-    if (result?.output_path) {
-      await invoke("open_folder", { path: result.output_path });
-    }
-  };
-
-  const formatBytes = (bytes: number): string => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  };
-
-  const formatDuration = (ms: number): string => {
-    if (ms < 1000) return `${ms}ms`;
-    if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-    return `${(ms / 60000).toFixed(1)}m`;
-  };
-
-  const formatTokens = (n: number): string => {
-    if (n < 1000) return `${n}`;
-    if (n < 1_000_000) return `${(n / 1000).toFixed(0)}k`;
-    return `${(n / 1_000_000).toFixed(2)}M`;
-  };
-
-  const tokenFitHint = (n: number): string => {
-    if (n <= 120_000) return "fits GPT (128k) and Claude (200k) contexts";
-    if (n <= 180_000) return "fits Claude (200k); tight for GPT (128k)";
-    if (n <= 900_000) return "exceeds Claude 200k — consider splitting; fits Gemini (1M)";
-    return "exceeds 1M tokens — splitting required for any chat";
-  };
+  const formatBytes = (b: number) =>
+    b < 1024 ? `${b} B` : b < 1048576 ? `${(b / 1024).toFixed(1)} KB` : `${(b / 1048576).toFixed(1)} MB`;
+  const formatDuration = (ms: number) =>
+    ms < 1000 ? `${ms}ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)}s` : `${(ms / 60000).toFixed(1)}m`;
+  const formatTokens = (n: number) =>
+    n < 1000 ? `${n}` : n < 1e6 ? `${(n / 1000).toFixed(0)}k` : `${(n / 1e6).toFixed(2)}M`;
+  const fitHint = (claude: number) =>
+    claude <= 128000 ? "fits GPT 128k & Claude 200k"
+    : claude <= 200000 ? "fits Claude 200k; over GPT 128k"
+    : claude <= 1000000 ? "over Claude 200k — split or use Gemini 1M"
+    : "over 1M — splitting required";
 
   const isWorking = status === "scanning" || status === "merging";
 
@@ -183,232 +220,182 @@ function App() {
           <span className="version">{version ? `v${version}` : ""}</span>
         </header>
 
-        {/* Source Selection */}
         <section className="section">
           <label className="label">SOURCE CODEBASE</label>
           <div className="input-row">
-            <input
-              type="text"
-              className="input"
-              value={sourcePath}
-              readOnly
-              placeholder="Select a folder to merge..."
-            />
-            <button className="btn btn-secondary" onClick={selectSource} disabled={isWorking}>
-              Browse
-            </button>
+            <input type="text" className="input" value={sourcePath} readOnly placeholder="Select or drag a folder here..." />
+            <button className="btn btn-secondary" onClick={selectSource} disabled={isWorking}>Browse</button>
           </div>
         </section>
 
-        {/* Output Selection */}
         <section className="section">
           <label className="label">OUTPUT DESTINATION</label>
           <div className="input-row">
-            <input
-              type="text"
-              className="input"
-              value={outputPath}
-              readOnly
-              placeholder="Output folder or file..."
-            />
-            <button className="btn btn-secondary" onClick={selectOutput} disabled={isWorking}>
-              Change
-            </button>
+            <input type="text" className="input" value={outputPath} readOnly placeholder="Output folder or file..." />
+            <button className="btn btn-secondary" onClick={selectOutput} disabled={isWorking}>Change</button>
           </div>
-          <p className="checkbox-hint">
-            Folder = auto-named &lt;source&gt;_&lt;timestamp&gt;_merged.md inside it
-          </p>
+          <p className="hint">A folder auto-names &lt;source&gt;_&lt;timestamp&gt;_merged.&lt;ext&gt; inside it</p>
         </section>
 
-        {/* Configuration */}
+        <section className="section">
+          <label className="label">PRESET</label>
+          <select className="input select" value={preset} onChange={(e) => applyPreset(e.target.value as Preset)} disabled={isWorking}>
+            <option value="custom">Custom</option>
+            <option value="lean">LLM review (lean) — gitignore, redact, entry-first, 180k split</option>
+            <option value="claude">Claude (cxml, important-last, 180k)</option>
+            <option value="archive">Full archive (everything, no split)</option>
+            <option value="docs">Docs only (*.md / *.rst / *.txt)</option>
+          </select>
+        </section>
+
+        <section className="section">
+          <label className="label">FORMAT &amp; SIZE</label>
+          <div className="grid2">
+            <div>
+              <span className="field-label">Output format</span>
+              <select className="input select" value={format} onChange={(e) => { setFormat(e.target.value); setPreset("custom"); }} disabled={isWorking}>
+                <option value="markdown">Markdown</option>
+                <option value="cxml">Claude XML (cxml)</option>
+                <option value="xml">XML</option>
+                <option value="json">JSON</option>
+                <option value="plain">Plain text</option>
+              </select>
+            </div>
+            <div>
+              <span className="field-label">Ordering</span>
+              <select className="input select" value={ordering} onChange={(e) => { setOrdering(e.target.value); setPreset("custom"); }} disabled={isWorking}>
+                <option value="path">Alphabetical</option>
+                <option value="entry-first">Entry points first</option>
+                <option value="important-last">Important last</option>
+              </select>
+            </div>
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <span className="field-label">Max tokens per file (split if exceeded; blank = no split)</span>
+            <input type="number" className="input" value={maxTokens} placeholder="e.g. 180000" min="0"
+              onChange={(e) => { setMaxTokens(e.target.value); setPreset("custom"); }} disabled={isWorking} />
+          </div>
+        </section>
+
         <section className="section">
           <label className="label">OPTIONS</label>
-          <div className="checkbox-group">
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={respectGitignore}
-                onChange={(e) => setRespectGitignore(e.target.checked)}
-                disabled={isWorking}
-              />
-              <span>Respect .gitignore / .turbomergerignore</span>
-            </label>
-            <p className="checkbox-hint">
-              Skips whatever the repo itself ignores (build output, browser profiles, data dumps)
-            </p>
-          </div>
-          <div className="checkbox-group">
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={redactSecrets}
-                onChange={(e) => setRedactSecrets(e.target.checked)}
-                disabled={isWorking}
-              />
-              <span>Redact secrets (API keys, tokens, private keys)</span>
-            </label>
-          </div>
-          <div className="checkbox-group">
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={includeTree}
-                onChange={(e) => setIncludeTree(e.target.checked)}
-                disabled={isWorking}
-              />
-              <span>Directory tree + table of contents</span>
-            </label>
-          </div>
-          <div className="checkbox-group">
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={contentDetection}
-                onChange={(e) => setContentDetection(e.target.checked)}
-                disabled={isWorking}
-              />
-              <span>Include all text files (content-based detection)</span>
-            </label>
-          </div>
-          <div className="checkbox-group">
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={includeHidden}
-                onChange={(e) => setIncludeHidden(e.target.checked)}
-                disabled={isWorking}
-              />
-              <span>Include hidden dotfiles (beyond the standard config set)</span>
-            </label>
-          </div>
-          <div className="checkbox-group">
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={includeVenv}
-                onChange={(e) => setIncludeVenv(e.target.checked)}
-                disabled={isWorking}
-              />
-              <span>Include virtual environments (venv, node_modules)</span>
-            </label>
-          </div>
+          {([
+            [respectGitignore, setRespectGitignore, "Respect .gitignore / .turbomergerignore"],
+            [redactSecrets, setRedactSecrets, "Redact secrets (API keys, tokens, private keys)"],
+            [includeTree, setIncludeTree, "Directory tree + table of contents"],
+            [contentDetection, setContentDetection, "Include all text files (content-based detection)"],
+            [includeHidden, setIncludeHidden, "Include hidden dotfiles (beyond standard config set)"],
+            [includeVenv, setIncludeVenv, "Include virtual environments (venv, node_modules)"],
+          ] as [boolean, (b: boolean) => void, string][]).map(([val, setter, label], i) => (
+            <div className="checkbox-group" key={i}>
+              <label className="checkbox-label">
+                <input type="checkbox" checked={val} disabled={isWorking}
+                  onChange={(e) => { setter(e.target.checked); setPreset("custom"); }} />
+                <span>{label}</span>
+              </label>
+            </div>
+          ))}
         </section>
 
-        {/* Action Buttons */}
+        <section className="section">
+          <button className="link-btn" onClick={() => setShowAdvanced(!showAdvanced)}>
+            {showAdvanced ? "▾" : "▸"} Advanced filters
+          </button>
+          {showAdvanced && (
+            <div className="advanced">
+              <span className="field-label">Include globs (comma-separated; only these if set)</span>
+              <input type="text" className="input" value={includeGlobs} placeholder="src/**, *.md"
+                onChange={(e) => { setIncludeGlobs(e.target.value); setPreset("custom"); }} disabled={isWorking} />
+              <span className="field-label" style={{ marginTop: 8 }}>Exclude globs (comma-separated)</span>
+              <input type="text" className="input" value={excludeGlobs} placeholder="**/*.lock, docs/**"
+                onChange={(e) => { setExcludeGlobs(e.target.value); setPreset("custom"); }} disabled={isWorking} />
+              <div className="checkbox-group" style={{ marginTop: 10 }}>
+                <label className="checkbox-label">
+                  <input type="checkbox" checked={removeEmptyLines} disabled={isWorking}
+                    onChange={(e) => { setRemoveEmptyLines(e.target.checked); setPreset("custom"); }} />
+                  <span>Remove empty lines (token saving)</span>
+                </label>
+              </div>
+              <div className="checkbox-group">
+                <label className="checkbox-label">
+                  <input type="checkbox" checked={truncateBase64} disabled={isWorking}
+                    onChange={(e) => { setTruncateBase64(e.target.checked); setPreset("custom"); }} />
+                  <span>Truncate long base64/data blobs</span>
+                </label>
+              </div>
+            </div>
+          )}
+        </section>
+
         <section className="section">
           {isWorking ? (
-            <button className="btn btn-danger btn-full" onClick={handleCancel}>
-              CANCEL
-            </button>
+            <button className="btn btn-danger btn-full" onClick={handleCancel}>CANCEL</button>
           ) : (
-            <button
-              className="btn btn-primary btn-full"
-              onClick={handleMerge}
-              disabled={!sourcePath}
-            >
-              {status === "ready" && "MERGE"}
-              {status === "done" && "MERGE AGAIN"}
-              {status === "error" && "RETRY"}
-              {status === "cancelled" && "MERGE"}
+            <button className="btn btn-primary btn-full" onClick={handleMerge} disabled={!sourcePath}>
+              {status === "done" ? "MERGE AGAIN" : status === "error" ? "RETRY" : "MERGE"}
             </button>
           )}
         </section>
 
-        {/* Progress Bar */}
         {isWorking && (
           <section className="section">
             <div className="progress-container">
-              <div
-                className="progress-bar"
-                style={{ width: `${progress?.percentage || 0}%` }}
-              />
+              <div className="progress-bar" style={{ width: `${progress?.percentage || 0}%` }} />
             </div>
             <p className="status-text">
-              {status === "scanning" && "Scanning directory..."}
-              {status === "merging" && progress && (
-                <>{progress.current_file}</>
-              )}
+              {status === "scanning" ? "Scanning directory..." : progress?.current_file}
             </p>
             {progress && progress.total > 0 && (
               <p className="progress-text">
-                {progress.current.toLocaleString()} / {progress.total.toLocaleString()} files
-                ({progress.percentage.toFixed(1)}%)
+                {progress.current.toLocaleString()} / {progress.total.toLocaleString()} files ({progress.percentage.toFixed(1)}%)
               </p>
             )}
           </section>
         )}
 
-        {/* Results */}
         {result && status === "done" && (
           <section className="section result-section">
             <div className="stats-grid">
-              <div className="stat">
-                <span className="stat-value">{result.files_processed.toLocaleString()}</span>
-                <span className="stat-label">merged</span>
-              </div>
-              <div className="stat">
-                <span className="stat-value">{result.files_skipped.toLocaleString()}</span>
-                <span className="stat-label">skipped</span>
-              </div>
-              <div className="stat">
-                <span className="stat-value">~{formatTokens(result.token_estimate)}</span>
-                <span className="stat-label">tokens (est.)</span>
-              </div>
-              <div className="stat">
-                <span className="stat-value">{formatDuration(result.duration_ms)}</span>
-                <span className="stat-label">time</span>
-              </div>
+              <div className="stat"><span className="stat-value">{result.files_processed.toLocaleString()}</span><span className="stat-label">merged</span></div>
+              <div className="stat"><span className="stat-value">{result.files_skipped.toLocaleString()}</span><span className="stat-label">skipped</span></div>
+              <div className="stat"><span className="stat-value">~{formatTokens(result.tokens_o200k)}</span><span className="stat-label">tokens</span></div>
+              <div className="stat"><span className="stat-value">{formatDuration(result.duration_ms)}</span><span className="stat-label">time</span></div>
             </div>
             <p className="detection-breakdown">
-              {formatBytes(result.total_bytes)} — {tokenFitHint(result.token_estimate)}
+              {formatBytes(result.total_bytes)} · ~{formatTokens(result.tokens_o200k)} o200k / ~{formatTokens(result.tokens_claude_est)} Claude — {fitHint(result.tokens_claude_est)}
             </p>
             <p className="detection-breakdown">
               {result.files_by_extension.toLocaleString()} by extension
               {result.files_by_content > 0 && `, ${result.files_by_content.toLocaleString()} by content`}
-              {result.files_skipped_binary > 0 && `, ${result.files_skipped_binary.toLocaleString()} binary skipped`}
+              {result.files_skipped_binary > 0 && `, ${result.files_skipped_binary.toLocaleString()} binary`}
               {result.files_unreadable > 0 && `, ${result.files_unreadable.toLocaleString()} unreadable`}
             </p>
             {result.secrets_redacted > 0 && (
               <p className="detection-breakdown" style={{ color: "var(--warning)" }}>
-                ⚠ {result.secrets_redacted.toLocaleString()} secret{result.secrets_redacted === 1 ? "" : "s"} redacted
-                — details in the Merge Report at the end of the output
+                ⚠ {result.secrets_redacted.toLocaleString()} secret{result.secrets_redacted === 1 ? "" : "s"} redacted — see Merge Report in the output
               </p>
             )}
-            {result.files_skipped > 0 && (
-              <p className="detection-breakdown">
-                Skipped-file reasons are listed in the Merge Report inside the output file
-              </p>
+            {result.output_paths.length > 1 && (
+              <p className="detection-breakdown">Split into {result.output_paths.length} parts</p>
             )}
             <div className="action-buttons">
-              <button className="btn btn-success" onClick={handleOpenFile}>
-                Open File
-              </button>
-              <button className="btn btn-secondary" onClick={handleOpenFolder}>
-                Show in Folder
-              </button>
+              <button className="btn btn-success" onClick={() => openThing(result.output_path)}>Open File</button>
+              <button className="btn btn-secondary" onClick={() => openFolder(result.output_path)}>Show in Folder</button>
             </div>
-            <p className="output-path">{result.output_path}</p>
+            <div className="action-buttons">
+              <button className="btn btn-secondary" onClick={() => openThing("https://claude.ai/new")}>claude.ai</button>
+              <button className="btn btn-secondary" onClick={() => openThing("https://chatgpt.com")}>chatgpt.com</button>
+              <button className="btn btn-secondary" onClick={() => openThing("https://gemini.google.com/app")}>gemini</button>
+            </div>
+            {result.output_paths.map((p) => <p className="output-path" key={p}>{p}</p>)}
           </section>
         )}
 
-        {/* Error Display */}
-        {error && (
-          <section className="section error-section">
-            <p className="error-text">{error}</p>
-          </section>
-        )}
-
-        {/* Cancelled Display */}
-        {status === "cancelled" && (
-          <section className="section cancelled-section">
-            <p className="cancelled-text">Operation cancelled</p>
-          </section>
-        )}
+        {error && <section className="section error-section"><p className="error-text">{error}</p></section>}
+        {status === "cancelled" && <section className="section cancelled-section"><p className="cancelled-text">Operation cancelled</p></section>}
       </div>
 
-      <footer className="footer">
-        <span>TurboMerger {version ? `v${version}` : ""}</span>
-      </footer>
+      <footer className="footer"><span>TurboMerger {version ? `v${version}` : ""}</span></footer>
     </div>
   );
 }

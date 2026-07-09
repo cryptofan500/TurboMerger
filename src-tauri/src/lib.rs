@@ -3,6 +3,9 @@ pub mod config;
 pub mod merger;
 pub mod scanner;
 pub mod security;
+pub mod tokens;
+
+pub use commands::{run_cli, CliArgs};
 
 use std::sync::Mutex;
 

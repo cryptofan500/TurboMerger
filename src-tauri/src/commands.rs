@@ -1,4 +1,4 @@
-//! Tauri command handlers with progress reporting and cancellation
+//! Tauri command handlers + a headless CLI path (shared merge core).
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -9,7 +9,8 @@ use std::sync::Mutex;
 use chrono::Local;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::scanner;
+use crate::merger::{MergeConfig, Ordering as MergeOrdering, OutputFormat};
+use crate::scanner::{self, ScanOptions};
 use crate::security;
 
 /// Application state for cancellation
@@ -28,6 +29,7 @@ impl Default for AppState {
 #[derive(Debug, Serialize)]
 pub struct MergeResult {
     pub output_path: String,
+    pub output_paths: Vec<String>,
     pub files_processed: usize,
     pub files_skipped: usize,
     pub total_bytes: usize,
@@ -37,7 +39,8 @@ pub struct MergeResult {
     pub files_skipped_binary: usize,
     pub files_unreadable: usize,
     pub secrets_redacted: usize,
-    pub token_estimate: usize,
+    pub tokens_o200k: usize,
+    pub tokens_claude_est: usize,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -65,61 +68,55 @@ pub struct MergeOptions {
     pub include_hidden: bool,
     #[serde(default = "default_true")]
     pub redact_secrets: bool,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub ordering: Option<String>,
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    #[serde(default)]
+    pub include_globs: Vec<String>,
+    #[serde(default)]
+    pub exclude_globs: Vec<String>,
+    #[serde(default)]
+    pub remove_empty_lines: bool,
+    #[serde(default)]
+    pub truncate_base64: bool,
 }
 
-/// Get the default Downloads folder path
-#[tauri::command]
-pub fn get_downloads_path() -> Result<String, String> {
-    dirs::download_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .ok_or_else(|| "Could not find Downloads folder".to_string())
+/// Everything needed to run a merge, resolved from UI options + config file.
+struct ResolvedJob {
+    root: PathBuf,
+    output_path: PathBuf,
+    scan_options: ScanOptions,
+    merge_config: MergeConfig,
 }
 
-/// Cancel the current merge operation
-#[tauri::command]
-pub fn cancel_merge(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
-    let state = state.lock().map_err(|e| e.to_string())?;
-    state.cancel_flag.store(true, Ordering::Relaxed);
-    Ok(())
-}
-
-/// Reset cancellation flag
-#[tauri::command]
-pub fn reset_cancel(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
-    let state = state.lock().map_err(|e| e.to_string())?;
-    state.cancel_flag.store(false, Ordering::Relaxed);
-    Ok(())
-}
-
-/// Main merge operation with progress reporting
-#[tauri::command]
-pub async fn merge_folder(
-    app: AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    options: MergeOptions,
-) -> Result<MergeResult, String> {
-    let start = std::time::Instant::now();
-
-    // Validate input path
+fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
     let root = security::validate_and_canonicalize(&options.folder_path)
         .map_err(|e| format!("Security error: {}", e))?;
-
     if !root.exists() || !root.is_dir() {
         return Err("Invalid folder path".to_string());
     }
 
-    // Output naming happens in ONE place, at merge time. If the caller passes a
-    // directory (or nothing), a timestamped name is generated inside it.
+    let config = crate::config::load_from_dir(&root);
+    let format = OutputFormat::from_str_lenient(options.format.as_deref().unwrap_or("markdown"));
+
+    // Output naming in one place, at merge time.
     let folder_name = root
         .file_name()
         .and_then(|n| n.to_str())
         .map(security::sanitize_filename)
         .unwrap_or_else(|| "merged".to_string());
     let timestamp = Local::now().format("%Y-%m-%dT%H-%M-%S");
-    let output_name = format!("{}_{}_merged.md", folder_name, timestamp);
-
-    let output_path = match options.output_path {
-        Some(ref p) if !p.is_empty() => {
+    let output_name = format!(
+        "{}_{}_merged.{}",
+        folder_name,
+        timestamp,
+        format.extension()
+    );
+    let output_path = match &options.output_path {
+        Some(p) if !p.is_empty() => {
             let pb = PathBuf::from(p);
             if pb.is_dir() {
                 pb.join(&output_name)
@@ -132,7 +129,78 @@ pub async fn merge_folder(
             .join(&output_name),
     };
 
-    // Get + reset cancel flag
+    let mut include_globs = options.include_globs.clone();
+    include_globs.extend(config.filter.include.clone());
+    let mut exclude_globs = options.exclude_globs.clone();
+    exclude_globs.extend(config.filter.exclude.clone());
+
+    let scan_options = ScanOptions {
+        include_venv: options.include_venv || config.scanning.include_venvs,
+        content_sniff: options.content_detection && config.scanning.content_sniff,
+        include_hidden: options.include_hidden || config.scanning.include_hidden,
+        respect_gitignore: options.respect_gitignore,
+        max_file_size: config.scanning.max_file_size_mb * 1024 * 1024,
+        extra_text_exts: config.extensions.include,
+        extra_skip_exts: config.extensions.exclude,
+        extra_binary_exts: config.extensions.binary,
+        include_globs,
+        exclude_globs,
+    };
+
+    let merge_config = MergeConfig {
+        include_tree: options.include_tree,
+        redact: options.redact_secrets,
+        format,
+        ordering: MergeOrdering::from_str_lenient(options.ordering.as_deref().unwrap_or("path")),
+        max_tokens: options.max_tokens.filter(|&t| t > 0),
+        remove_empty_lines: options.remove_empty_lines,
+        truncate_base64: options.truncate_base64,
+    };
+
+    Ok(ResolvedJob {
+        root,
+        output_path,
+        scan_options,
+        merge_config,
+    })
+}
+
+#[tauri::command]
+pub fn get_downloads_path() -> Result<String, String> {
+    dirs::download_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| "Could not find Downloads folder".to_string())
+}
+
+#[tauri::command]
+pub fn cancel_merge(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .cancel_flag
+        .store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn reset_cancel(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .cancel_flag
+        .store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn merge_folder(
+    app: AppHandle,
+    state: State<'_, Mutex<AppState>>,
+    options: MergeOptions,
+) -> Result<MergeResult, String> {
+    let start = std::time::Instant::now();
+    let job = resolve_job(&options)?;
+
     let cancel_flag = {
         let state = state.lock().map_err(|e| e.to_string())?;
         state.cancel_flag.clone()
@@ -149,82 +217,71 @@ pub async fn merge_folder(
         },
     );
 
-    // Load per-project config (turbomerger.toml)
-    let config = crate::config::load_from_dir(&root);
-
-    // UI checkboxes win; the config file can additionally force inclusions and
-    // supplies extension overrides + the size cap.
-    let scan_options = scanner::ScanOptions {
-        include_venv: options.include_venv || config.scanning.include_venvs,
-        content_sniff: options.content_detection && config.scanning.content_sniff,
-        include_hidden: options.include_hidden || config.scanning.include_hidden,
-        respect_gitignore: options.respect_gitignore,
-        max_file_size: config.scanning.max_file_size_mb * 1024 * 1024,
-        extra_text_exts: config.extensions.include,
-        extra_skip_exts: config.extensions.exclude,
-        extra_binary_exts: config.extensions.binary,
-    };
-
-    // Scan for text files
-    let scan_result = scanner::scan_text_files(&root, &scan_options)
+    let scan = scanner::scan_text_files(&job.root, &job.scan_options)
         .map_err(|e| format!("Scan failed: {}", e))?;
-
-    let scan_stats = scan_result.stats;
-    let scan_skips = scan_result.skipped;
-    let files = scan_result.files;
-    let file_count = files.len();
-
-    if file_count == 0 {
+    let scan_stats = scan.stats;
+    let scan_skips = scan.skipped;
+    let files = scan.files;
+    if files.is_empty() {
         return Err("No text files found in directory".to_string());
     }
 
-    // Skip tree if >50k files
-    let include_tree = options.include_tree && file_count < 50_000;
+    let mut cfg = job.merge_config;
+    cfg.include_tree = cfg.include_tree && files.len() < 50_000;
 
     let outcome = crate::merger::merge_files_with_progress(
-        &root,
+        &job.root,
         &files,
-        &output_path,
-        include_tree,
-        options.redact_secrets,
+        &job.output_path,
+        &cfg,
         &cancel_flag,
         |current, total, file_name| {
-            let update = ProgressUpdate {
-                current,
-                total,
-                current_file: file_name.to_string(),
-                percentage: (current as f32 / total as f32) * 100.0,
-            };
-            let _ = app.emit("merge-progress", update);
+            let _ = app.emit(
+                "merge-progress",
+                ProgressUpdate {
+                    current,
+                    total,
+                    current_file: file_name.to_string(),
+                    percentage: (current as f32 / total as f32) * 100.0,
+                },
+            );
         },
         &scan_skips,
     )
     .map_err(|e| format!("Merge failed: {}", e))?;
 
-    // Check if cancelled
     if cancel_flag.load(Ordering::Relaxed) {
-        let _ = std::fs::remove_file(&output_path);
+        for p in &outcome.outputs {
+            let _ = std::fs::remove_file(p);
+        }
         return Err("Operation cancelled by user".to_string());
     }
 
-    let duration_ms = start.elapsed().as_millis() as u64;
-
     Ok(MergeResult {
-        output_path: output_path.to_string_lossy().to_string(),
+        output_path: outcome
+            .outputs
+            .first()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        output_paths: outcome
+            .outputs
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect(),
         files_processed: outcome.files_processed,
         files_skipped: outcome.files_skipped + scan_skips.len(),
         total_bytes: outcome.total_bytes,
-        duration_ms,
+        duration_ms: start.elapsed().as_millis() as u64,
         files_by_extension: scan_stats.by_extension,
         files_by_content: scan_stats.by_content,
         files_skipped_binary: scan_stats.skipped_binary,
         files_unreadable: scan_stats.unreadable,
         secrets_redacted: outcome.secrets_redacted,
-        token_estimate: outcome.token_estimate,
+        tokens_o200k: outcome.tokens_o200k,
+        tokens_claude_est: crate::tokens::claude_estimate(outcome.tokens_o200k),
     })
 }
 
-/// Open a file in the default application
 #[tauri::command]
 pub fn open_file(path: String) -> Result<(), String> {
     open::that(&path).map_err(|e| format!("Failed to open file: {}", e))
@@ -246,5 +303,163 @@ pub fn open_folder(path: String) -> Result<(), String> {
         let pb = PathBuf::from(&path);
         let folder = pb.parent().unwrap_or(&pb);
         open::that(folder).map_err(|e| format!("Failed to open folder: {}", e))
+    }
+}
+
+// ============================================================================
+// HEADLESS CLI  —  turbomerger merge <src> [out] [--flags]
+// ============================================================================
+
+pub struct CliArgs {
+    pub src: String,
+    pub out: Option<String>,
+    pub format: Option<String>,
+    pub ordering: Option<String>,
+    pub max_tokens: Option<usize>,
+    pub no_redact: bool,
+    pub no_gitignore: bool,
+    pub include_hidden: bool,
+    pub include_venv: bool,
+    pub remove_empty_lines: bool,
+    pub truncate_base64: bool,
+    pub include_globs: Vec<String>,
+    pub exclude_globs: Vec<String>,
+    pub quiet: bool,
+}
+
+impl CliArgs {
+    /// Parse `merge <src> [out] [--flags]`. Returns None if argv isn't a CLI run.
+    pub fn parse(argv: &[String]) -> Option<CliArgs> {
+        let mut it = argv.iter().skip(1);
+        if it.next().map(|s| s.as_str()) != Some("merge") {
+            return None;
+        }
+        let mut a = CliArgs {
+            src: String::new(),
+            out: None,
+            format: None,
+            ordering: None,
+            max_tokens: None,
+            no_redact: false,
+            no_gitignore: false,
+            include_hidden: false,
+            include_venv: false,
+            remove_empty_lines: false,
+            truncate_base64: false,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+            quiet: false,
+        };
+        let mut positionals: Vec<String> = Vec::new();
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--format" => a.format = it.next().cloned(),
+                "--ordering" => a.ordering = it.next().cloned(),
+                "--max-tokens" => a.max_tokens = it.next().and_then(|s| s.parse().ok()),
+                "--include" => {
+                    if let Some(g) = it.next() {
+                        a.include_globs.push(g.clone());
+                    }
+                }
+                "--exclude" => {
+                    if let Some(g) = it.next() {
+                        a.exclude_globs.push(g.clone());
+                    }
+                }
+                "--no-redact" => a.no_redact = true,
+                "--no-gitignore" => a.no_gitignore = true,
+                "--include-hidden" => a.include_hidden = true,
+                "--include-venv" => a.include_venv = true,
+                "--remove-empty-lines" => a.remove_empty_lines = true,
+                "--truncate-base64" => a.truncate_base64 = true,
+                "--quiet" | "-q" => a.quiet = true,
+                other => positionals.push(other.to_string()),
+            }
+        }
+        if positionals.is_empty() {
+            eprintln!("usage: turbomerger merge <src_dir> [out] [--format md|xml|cxml|json|plain] [--ordering path|entry-first|important-last] [--max-tokens N] [--include GLOB] [--exclude GLOB] [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--remove-empty-lines] [--truncate-base64]");
+            return Some(a); // src empty -> run_cli reports error
+        }
+        a.src = positionals[0].clone();
+        a.out = positionals.get(1).cloned();
+        Some(a)
+    }
+}
+
+/// Run a headless merge. Returns process exit code.
+pub fn run_cli(a: CliArgs) -> i32 {
+    if a.src.is_empty() {
+        return 2;
+    }
+    let options = MergeOptions {
+        folder_path: a.src,
+        output_path: a.out,
+        include_venv: a.include_venv,
+        include_tree: true,
+        content_detection: true,
+        respect_gitignore: !a.no_gitignore,
+        include_hidden: a.include_hidden,
+        redact_secrets: !a.no_redact,
+        format: a.format,
+        ordering: a.ordering,
+        max_tokens: a.max_tokens,
+        include_globs: a.include_globs,
+        exclude_globs: a.exclude_globs,
+        remove_empty_lines: a.remove_empty_lines,
+        truncate_base64: a.truncate_base64,
+    };
+
+    let job = match resolve_job(&options) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
+
+    let scan = match scanner::scan_text_files(&job.root, &job.scan_options) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("scan failed: {}", e);
+            return 1;
+        }
+    };
+    if scan.files.is_empty() {
+        eprintln!("no text files found");
+        return 1;
+    }
+    let cancel = AtomicBool::new(false);
+    let progress = |_c: usize, _t: usize, _f: &str| {};
+    match crate::merger::merge_files_with_progress(
+        &job.root,
+        &scan.files,
+        &job.output_path,
+        &job.merge_config,
+        &cancel,
+        progress,
+        &scan.skipped,
+    ) {
+        Ok(o) => {
+            if !a.quiet {
+                // Aggregate, non-secret output only.
+                println!(
+                    "merged={} scan_skipped={} merge_skipped={} redacted={} tokens_o200k={} parts={}",
+                    o.files_processed,
+                    scan.skipped.len(),
+                    o.files_skipped,
+                    o.secrets_redacted,
+                    o.tokens_o200k,
+                    o.outputs.len()
+                );
+                for p in &o.outputs {
+                    println!("out={}", p.display());
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("merge failed: {}", e);
+            1
+        }
     }
 }

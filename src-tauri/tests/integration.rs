@@ -7,8 +7,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use turbomerger::merger::merge_files_with_progress;
+use turbomerger::merger::{merge_files_with_progress, MergeConfig, Ordering, OutputFormat};
 use turbomerger::scanner::{scan_text_files, ScanOptions};
+
+fn md_cfg() -> MergeConfig {
+    MergeConfig::default()
+}
 
 struct Fixture {
     root: PathBuf,
@@ -159,8 +163,7 @@ fn merge_redacts_secrets_and_keeps_fences_safe() {
         &fx.root,
         &scan.files,
         &out,
-        true,
-        true,
+        &md_cfg(),
         &cancel,
         |_, _, _| {},
         &scan.skipped,
@@ -212,7 +215,7 @@ fn merge_redacts_secrets_and_keeps_fences_safe() {
     // header is honest
     assert!(text.contains(&format!("Files scanned: {}", scan.files.len())));
     assert!(outcome.files_processed > 0);
-    assert!(outcome.token_estimate > 0);
+    assert!(outcome.tokens_o200k > 0);
 }
 
 #[test]
@@ -230,17 +233,11 @@ fn bom_stripped_and_lossy_decode_noted() {
     let scan = scan_text_files(&root, &ScanOptions::default()).unwrap();
     let out = tmp.path().join("enc_out.md");
     let cancel = AtomicBool::new(false);
-    merge_files_with_progress(
-        &root,
-        &scan.files,
-        &out,
-        false,
-        true,
-        &cancel,
-        |_, _, _| {},
-        &[],
-    )
-    .unwrap();
+    let cfg = MergeConfig {
+        include_tree: false,
+        ..MergeConfig::default()
+    };
+    merge_files_with_progress(&root, &scan.files, &out, &cfg, &cancel, |_, _, _| {}, &[]).unwrap();
 
     let text = fs::read_to_string(&out).unwrap();
     assert!(!text.contains('\u{FEFF}'), "BOM must be stripped");
@@ -250,4 +247,110 @@ fn bom_stripped_and_lossy_decode_noted() {
         "lossy decode must be reported"
     );
     assert!(text.contains("latin.txt"));
+}
+
+#[test]
+fn formats_and_split_produce_valid_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("fmt_repo");
+    fs::create_dir_all(root.join("src")).unwrap();
+    for i in 0..6 {
+        fs::write(
+            root.join("src").join(format!("f{}.rs", i)),
+            format!("fn f{}() {{ /* {} */ }}\n", i, "x".repeat(400)),
+        )
+        .unwrap();
+    }
+    let scan = scan_text_files(&root, &ScanOptions::default()).unwrap();
+    let cancel = AtomicBool::new(false);
+
+    // XML output is well-formed-ish and escapes content
+    let xml_out = tmp.path().join("o.xml");
+    let xcfg = MergeConfig {
+        format: OutputFormat::Xml,
+        ..MergeConfig::default()
+    };
+    merge_files_with_progress(
+        &root,
+        &scan.files,
+        &xml_out,
+        &xcfg,
+        &cancel,
+        |_, _, _| {},
+        &[],
+    )
+    .unwrap();
+    let xml = fs::read_to_string(&xml_out).unwrap();
+    assert!(xml.starts_with("<codebase"));
+    assert!(xml.contains("<file path=\"src/f0.rs\""));
+    assert!(xml.trim_end().ends_with("</codebase>"));
+
+    // JSON output parses
+    let json_out = tmp.path().join("o.json");
+    let jcfg = MergeConfig {
+        format: OutputFormat::Json,
+        ..MergeConfig::default()
+    };
+    merge_files_with_progress(
+        &root,
+        &scan.files,
+        &json_out,
+        &jcfg,
+        &cancel,
+        |_, _, _| {},
+        &[],
+    )
+    .unwrap();
+    let val: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&json_out).unwrap()).unwrap();
+    assert_eq!(val["files"].as_array().unwrap().len(), 6);
+    assert!(val["tokens_o200k"].as_u64().unwrap() > 0);
+
+    // Split by a tiny token budget yields multiple parts
+    let split_out = tmp.path().join("split.md");
+    let scfg = MergeConfig {
+        max_tokens: Some(50),
+        ..MergeConfig::default()
+    };
+    let outcome = merge_files_with_progress(
+        &root,
+        &scan.files,
+        &split_out,
+        &scfg,
+        &cancel,
+        |_, _, _| {},
+        &[],
+    )
+    .unwrap();
+    assert!(outcome.outputs.len() > 1, "expected split into parts");
+    assert!(outcome.outputs.iter().all(|p| p.exists()));
+    let p1 = fs::read_to_string(&outcome.outputs[0]).unwrap();
+    assert!(p1.contains("Part 1/"));
+
+    // Ordering: important-last puts a README at the very end
+    fs::write(root.join("README.md"), "# readme\n").unwrap();
+    let scan2 = scan_text_files(&root, &ScanOptions::default()).unwrap();
+    let ord_out = tmp.path().join("ord.md");
+    let ocfg = MergeConfig {
+        ordering: Ordering::ImportantLast,
+        include_tree: false,
+        ..MergeConfig::default()
+    };
+    merge_files_with_progress(
+        &root,
+        &scan2.files,
+        &ord_out,
+        &ocfg,
+        &cancel,
+        |_, _, _| {},
+        &[],
+    )
+    .unwrap();
+    let ord = fs::read_to_string(&ord_out).unwrap();
+    let readme_pos = ord.find("## README.md").unwrap();
+    let first_src = ord.find("## src/f0.rs").unwrap();
+    assert!(
+        readme_pos > first_src,
+        "important-last should put README after src files"
+    );
 }

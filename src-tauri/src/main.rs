@@ -5,5 +5,14 @@
 )]
 
 fn main() {
+    // Headless CLI path: `turbomerger merge <src> [out] [--flags]`.
+    // Lets the app run without the GUI (scripting, CI, safe testing).
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(args) = turbomerger::CliArgs::parse(&argv) {
+        // Note: a release (GUI-subsystem) build has no attached console, so the
+        // stdout summary is only visible in debug or when redirected; the merge
+        // output file(s) and the process exit code are the authoritative result.
+        std::process::exit(turbomerger::run_cli(args));
+    }
     turbomerger::run();
 }

@@ -1,6 +1,6 @@
 [package]
 name = "turbomerger"
-version = "7.2.0"
+version = "7.3.0"
 description = "One-click codebase merger"
 authors = ["TurboMerger Contributors"]
 license = "MIT"
@@ -33,6 +33,9 @@ open = "5"
 # Utilities
 phf = { version = "0.11", features = ["macros"] }
 chrono = "0.4"
+
+# Token counting (o200k_base / cl100k_base)
+tiktoken-rs = "0.6"
 
 # Security - path validation & secret detection
 unicode-normalization = "0.1"

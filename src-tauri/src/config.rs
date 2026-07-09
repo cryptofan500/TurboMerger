@@ -12,6 +12,17 @@ use std::path::Path;
 pub struct TurboMergerConfig {
     pub extensions: ExtensionConfig,
     pub scanning: ScanningConfig,
+    pub filter: FilterConfig,
+}
+
+/// Path-glob include/exclude (gitignore glob syntax)
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(default)]
+pub struct FilterConfig {
+    /// If non-empty, ONLY files matching these globs are merged.
+    pub include: Vec<String>,
+    /// Files matching these globs are dropped.
+    pub exclude: Vec<String>,
 }
 
 /// Extension override configuration

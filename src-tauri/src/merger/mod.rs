@@ -1,33 +1,98 @@
-//! Merger: reads scanned files (parallel, chunked to bound memory), redacts
-//! secrets, and writes one markdown document with collision-proof fences, a
-//! real directory tree, a linked table of contents, and a Merge Report that
-//! lists every skipped file with its reason.
+//! Merger: reads scanned files (parallel), redacts secrets, optionally slims
+//! content, counts tokens, orders files, and writes one or more output files in
+//! the chosen format (Markdown / XML / Claude-XML / JSON / Plain), splitting by
+//! a token budget when asked.
 //!
-//! v7.2 rewrite highlights:
-//! - Dynamic fences: each file gets a fence one backtick longer than the
-//!   longest run inside it, so markdown-heavy repos can't break the structure.
-//! - No more per-file canonicalize/sensitive/size re-checks (the scanner's
-//!   verdict is trusted) and no mmap (files are capped at 2 MB anyway).
-//! - Chunked parallel processing (64 files at a time) instead of materializing
-//!   the whole output in RAM; progress is emitted as files are written.
-//! - UTF-8 BOM stripped; lossy decodes are counted and reported.
+//! Design note: to support ordering, token-budget splitting, and multi-format
+//! rendering the merger holds the processed file blocks in memory (bounded by
+//! the merged-output size, which is the paste-to-chat use case). Reads are still
+//! chunked + parallel so peak memory tracks output size, not 2x it.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrd};
+use std::sync::LazyLock;
 
 use anyhow::Result;
 use rayon::prelude::*;
+use regex::Regex;
 
 use crate::scanner::SkipEntry;
+use crate::tokens;
 
-/// Files processed per parallel batch — bounds peak memory to roughly
-/// CHUNK × max_file_size while keeping all cores busy.
 const CHUNK: usize = 64;
+const MANIFEST_MAX: usize = 1000;
 
-/// Cap on per-file lines in the Merge Report
-const MANIFEST_MAX: usize = 500;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Markdown,
+    Xml,
+    Cxml,
+    Json,
+    Plain,
+}
+
+impl OutputFormat {
+    pub fn from_str_lenient(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "xml" => OutputFormat::Xml,
+            "cxml" | "claude" => OutputFormat::Cxml,
+            "json" => OutputFormat::Json,
+            "plain" | "text" | "txt" => OutputFormat::Plain,
+            _ => OutputFormat::Markdown,
+        }
+    }
+    pub fn extension(&self) -> &'static str {
+        match self {
+            OutputFormat::Json => "json",
+            OutputFormat::Xml | OutputFormat::Cxml => "xml",
+            _ => "md",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ordering {
+    Path,
+    EntryFirst,
+    ImportantLast,
+}
+
+impl Ordering {
+    pub fn from_str_lenient(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "entry-first" | "entryfirst" | "entry" => Ordering::EntryFirst,
+            "important-last" | "importantlast" => Ordering::ImportantLast,
+            _ => Ordering::Path,
+        }
+    }
+}
+
+pub struct MergeConfig {
+    pub include_tree: bool,
+    pub redact: bool,
+    pub format: OutputFormat,
+    pub ordering: Ordering,
+    /// Split output into parts if the total exceeds this many o200k tokens.
+    pub max_tokens: Option<usize>,
+    pub remove_empty_lines: bool,
+    pub truncate_base64: bool,
+}
+
+impl Default for MergeConfig {
+    fn default() -> Self {
+        Self {
+            include_tree: true,
+            redact: true,
+            format: OutputFormat::Markdown,
+            ordering: Ordering::Path,
+            max_tokens: None,
+            remove_empty_lines: false,
+            truncate_base64: false,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct MergeOutcome {
@@ -35,15 +100,15 @@ pub struct MergeOutcome {
     pub files_processed: usize,
     pub files_skipped: usize,
     pub secrets_redacted: usize,
-    /// bytes/4 heuristic (o200k-ish; Claude runs ~15–20% higher)
-    pub token_estimate: usize,
+    pub tokens_o200k: usize,
+    pub outputs: Vec<PathBuf>,
 }
 
-struct Processed {
+struct Block {
     relative: String,
     content: String,
-    fence: String,
     lang: String,
+    tokens: usize,
     utf8_note: Option<String>,
     redactions: Vec<(&'static str, usize)>,
 }
@@ -51,14 +116,16 @@ struct Processed {
 /// (relative_path, reason) for a file dropped at merge time
 type MergeSkip = (String, String);
 
-/// Merge files with progress reporting and cancellation support.
+static BASE64_RUN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[A-Za-z0-9+/]{200,}={0,2}").expect("base64 run regex"));
+
+/// Top-level entry point. Returns the outcome (including all output paths).
 #[allow(clippy::too_many_arguments)]
 pub fn merge_files_with_progress<F>(
     root: &Path,
     files: &[PathBuf],
     output: &Path,
-    include_tree: bool,
-    redact: bool,
+    cfg: &MergeConfig,
     cancel_flag: &AtomicBool,
     mut progress_callback: F,
     scan_skips: &[SkipEntry],
@@ -66,162 +133,138 @@ pub fn merge_files_with_progress<F>(
 where
     F: FnMut(usize, usize, &str),
 {
-    let mut writer = BufWriter::with_capacity(256 * 1024, File::create(output)?);
     let total_files = files.len();
 
-    // Header — raw folder name for display (sanitization is for filenames only)
-    let folder_display = root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("Project");
-    writeln!(writer, "# {} — Merged Codebase\n", folder_display)?;
-    writeln!(
-        writer,
-        "> Generated by TurboMerger v{}",
-        env!("CARGO_PKG_VERSION")
-    )?;
-    writeln!(
-        writer,
-        "> Files scanned: {} (merged/skipped detail in the Merge Report at the end)",
-        total_files
-    )?;
-    writeln!(writer, "> Source: {}\n", root.display())?;
-    writeln!(writer, "---\n")?;
+    // Order files (a stable copy so the caller's slice is untouched).
+    let mut ordered: Vec<&PathBuf> = files.iter().collect();
+    order_files(root, &mut ordered, cfg.ordering);
 
-    if include_tree {
-        writeln!(writer, "## Project Structure\n")?;
-        writeln!(writer, "```")?;
-        write!(writer, "{}", generate_tree(root, files))?;
-        writeln!(writer, "```\n")?;
-        writeln!(writer, "## Contents\n")?;
-        for f in files {
-            let rel = relative_display(root, f);
-            writeln!(writer, "- [{}](#{})", rel, anchor_for(&rel))?;
-        }
-        writeln!(writer)?;
-        writeln!(writer, "---\n")?;
-    }
-
-    let mut outcome = MergeOutcome::default();
+    // Process (read/decode/slim/redact/count) in parallel, chunked.
+    let mut blocks: Vec<Block> = Vec::with_capacity(total_files);
     let mut merge_skips: Vec<SkipEntry> = Vec::new();
-    let mut decode_notes: Vec<String> = Vec::new();
-    let mut redaction_lines: Vec<String> = Vec::new();
     let mut done = 0usize;
 
-    'outer: for chunk in files.chunks(CHUNK) {
-        if cancel_flag.load(Ordering::Relaxed) {
+    'outer: for chunk in ordered.chunks(CHUNK) {
+        if cancel_flag.load(AtomicOrd::Relaxed) {
             break;
         }
-
-        let mut processed: Vec<(usize, Result<Processed, MergeSkip>)> = chunk
+        let mut processed: Vec<(usize, std::result::Result<Block, MergeSkip>)> = chunk
             .par_iter()
             .enumerate()
-            .map(|(i, path)| (i, process_file(path, root, redact)))
+            .map(|(i, path)| (i, process_file(path, root, cfg)))
             .collect();
         processed.sort_by_key(|(i, _)| *i);
 
         for (_, res) in processed {
-            if cancel_flag.load(Ordering::Relaxed) {
+            if cancel_flag.load(AtomicOrd::Relaxed) {
                 break 'outer;
             }
             done += 1;
             match res {
-                Ok(p) => {
-                    progress_callback(done, total_files, &p.relative);
-
-                    writeln!(writer, "## {}\n", p.relative)?;
-                    writeln!(writer, "{}{}", p.fence, p.lang)?;
-                    writer.write_all(p.content.as_bytes())?;
-                    if !p.content.ends_with('\n') {
-                        writeln!(writer)?;
-                    }
-                    writeln!(writer, "{}\n", p.fence)?;
-
-                    outcome.total_bytes += p.content.len();
-                    outcome.token_estimate += p.content.len() / 4;
-                    outcome.files_processed += 1;
-                    for (rule, n) in &p.redactions {
-                        outcome.secrets_redacted += n;
-                        redaction_lines.push(format!("- `{}` — {} × {}", p.relative, n, rule));
-                    }
-                    if let Some(note) = p.utf8_note {
-                        decode_notes.push(format!("- `{}` — {}", p.relative, note));
-                    }
+                Ok(b) => {
+                    progress_callback(done, total_files, &b.relative);
+                    blocks.push(b);
                 }
                 Err((rel, reason)) => {
                     progress_callback(done, total_files, &rel);
-                    outcome.files_skipped += 1;
                     merge_skips.push(SkipEntry { path: rel, reason });
                 }
             }
         }
     }
 
-    // ---- Merge Report -------------------------------------------------
-    writeln!(writer, "---\n")?;
-    writeln!(writer, "## Merge Report\n")?;
-    writeln!(writer, "- Files merged: {}", outcome.files_processed)?;
-    writeln!(
-        writer,
-        "- Estimated tokens: ~{} (bytes/4 heuristic; Claude counts ~15-20% higher)",
-        outcome.token_estimate
-    )?;
-    if outcome.secrets_redacted > 0 {
-        writeln!(
-            writer,
-            "- Secrets redacted: {} (see Redactions below)",
-            outcome.secrets_redacted
+    // Aggregate stats.
+    let mut outcome = MergeOutcome {
+        files_skipped: merge_skips.len(),
+        ..Default::default()
+    };
+    for b in &blocks {
+        outcome.total_bytes += b.content.len();
+        outcome.tokens_o200k += b.tokens;
+        outcome.files_processed += 1;
+        for (_, n) in &b.redactions {
+            outcome.secrets_redacted += n;
+        }
+    }
+
+    // Partition into parts by token budget (single part if no budget / fits).
+    let parts = partition(&blocks, cfg.max_tokens);
+    let n_parts = parts.len().max(1);
+
+    let all_skips: Vec<&SkipEntry> = scan_skips.iter().chain(merge_skips.iter()).collect();
+
+    for (idx, part) in parts.iter().enumerate() {
+        let path = part_path(output, idx, n_parts, cfg.format);
+        let part_blocks: Vec<&Block> = part.iter().map(|&i| &blocks[i]).collect();
+        write_part(
+            &path,
+            root,
+            &part_blocks,
+            cfg,
+            idx,
+            n_parts,
+            total_files,
+            &outcome,
+            &all_skips,
         )?;
+        outcome.outputs.push(path);
     }
 
-    let total_skips = scan_skips.len() + merge_skips.len();
-    if total_skips > 0 {
-        writeln!(
-            writer,
-            "\n### Skipped files ({} at scan, {} at merge)\n",
-            scan_skips.len(),
-            merge_skips.len()
-        )?;
-        for e in scan_skips
-            .iter()
-            .chain(merge_skips.iter())
-            .take(MANIFEST_MAX)
-        {
-            writeln!(writer, "- `{}` — {}", e.path, e.reason)?;
-        }
-        if total_skips > MANIFEST_MAX {
-            writeln!(writer, "- …and {} more", total_skips - MANIFEST_MAX)?;
-        }
-    }
-
-    if !redaction_lines.is_empty() {
-        writeln!(writer, "\n### Redactions\n")?;
-        for line in &redaction_lines {
-            writeln!(writer, "{}", line)?;
-        }
-    }
-
-    if !decode_notes.is_empty() {
-        writeln!(writer, "\n### Decoding notes\n")?;
-        for line in &decode_notes {
-            writeln!(writer, "{}", line)?;
-        }
-    }
-
-    writer.flush()?;
     Ok(outcome)
 }
 
-/// Read + decode + redact a single already-vetted file.
-/// The scanner has vetted path safety, size, and binary-ness by extension;
-/// only a cheap content re-check remains (text extension but binary payload).
-fn process_file(path: &Path, root: &Path, redact: bool) -> Result<Processed, MergeSkip> {
+/// Greedy bin-packing of block indices into parts under `max_tokens`.
+fn partition(blocks: &[Block], max_tokens: Option<usize>) -> Vec<Vec<usize>> {
+    let total: usize = blocks.iter().map(|b| b.tokens).sum();
+    match max_tokens {
+        Some(budget) if budget > 0 && total > budget => {
+            let mut parts: Vec<Vec<usize>> = Vec::new();
+            let mut cur: Vec<usize> = Vec::new();
+            let mut cur_tokens = 0usize;
+            for (i, b) in blocks.iter().enumerate() {
+                if !cur.is_empty() && cur_tokens + b.tokens > budget {
+                    parts.push(std::mem::take(&mut cur));
+                    cur_tokens = 0;
+                }
+                cur.push(i);
+                cur_tokens += b.tokens;
+            }
+            if !cur.is_empty() {
+                parts.push(cur);
+            }
+            parts
+        }
+        _ => vec![(0..blocks.len()).collect()],
+    }
+}
+
+fn part_path(output: &Path, idx: usize, n_parts: usize, fmt: OutputFormat) -> PathBuf {
+    if n_parts <= 1 {
+        return output.to_path_buf();
+    }
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let stem = output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("merged");
+    parent.join(format!(
+        "{}.part{}-of-{}.{}",
+        stem,
+        idx + 1,
+        n_parts,
+        fmt.extension()
+    ))
+}
+
+/// Read + decode + slim + redact + token-count a single already-vetted file.
+fn process_file(
+    path: &Path,
+    root: &Path,
+    cfg: &MergeConfig,
+) -> std::result::Result<Block, MergeSkip> {
     let relative = relative_display(root, path);
 
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) => return Err((relative, format!("unreadable: {}", e))),
-    };
+    let file = File::open(path).map_err(|e| (relative.clone(), format!("unreadable: {}", e)))?;
     let mut buffer = Vec::new();
     if BufReader::new(file).read_to_end(&mut buffer).is_err() {
         return Err((relative, "unreadable".into()));
@@ -233,13 +276,11 @@ fn process_file(path: &Path, root: &Path, redact: bool) -> Result<Processed, Mer
             return Err((relative, "binary content".into()));
         }
     }
-
-    // Strip UTF-8 BOM so it doesn't leak into the merged document
     if buffer.starts_with(&[0xEF, 0xBB, 0xBF]) {
         buffer.drain(..3);
     }
 
-    let (content, utf8_note) = match String::from_utf8(buffer) {
+    let (mut content, utf8_note) = match String::from_utf8(buffer) {
         Ok(s) => (s, None),
         Err(e) => {
             let bytes = e.into_bytes();
@@ -255,38 +296,474 @@ fn process_file(path: &Path, root: &Path, redact: bool) -> Result<Processed, Mer
         }
     };
 
-    let (content, redactions) = if redact {
+    if cfg.truncate_base64 {
+        content = BASE64_RUN
+            .replace_all(&content, "[base64 omitted]")
+            .into_owned();
+    }
+    if cfg.remove_empty_lines {
+        let mut out = String::with_capacity(content.len());
+        for line in content.lines() {
+            if !line.trim().is_empty() {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        content = out;
+    }
+
+    let redactions = if cfg.redact {
         let (clean, events) = crate::security::redact_secrets(&content);
-        (
-            clean,
-            events.into_iter().map(|ev| (ev.rule, ev.count)).collect(),
-        )
+        content = clean;
+        events.into_iter().map(|ev| (ev.rule, ev.count)).collect()
     } else {
-        (content, Vec::new())
+        Vec::new()
     };
 
-    // Dynamic fence: one backtick longer than the longest run inside (min 3)
-    let fence = "`".repeat((longest_backtick_run(&content) + 1).max(3));
+    let tokens = tokens::count(&content);
     let lang = Path::new(&relative)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_string();
 
-    Ok(Processed {
+    Ok(Block {
         relative,
         content,
-        fence,
         lang,
+        tokens,
         utf8_note,
         redactions,
     })
 }
 
+// ============================================================================
+// WRITERS (one per part)
+// ============================================================================
+
+#[allow(clippy::too_many_arguments)]
+fn write_part(
+    path: &Path,
+    root: &Path,
+    blocks: &[&Block],
+    cfg: &MergeConfig,
+    part_idx: usize,
+    n_parts: usize,
+    total_scanned: usize,
+    outcome: &MergeOutcome,
+    skips: &[&SkipEntry],
+) -> Result<()> {
+    let mut w = BufWriter::with_capacity(256 * 1024, File::create(path)?);
+    let folder = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Project");
+    let part_note = if n_parts > 1 {
+        format!(
+            " — Part {}/{} (wait for all {} parts before answering)",
+            part_idx + 1,
+            n_parts,
+            n_parts
+        )
+    } else {
+        String::new()
+    };
+    let first = part_idx == 0;
+
+    match cfg.format {
+        OutputFormat::Json => write_json(&mut w, folder, root, blocks, outcome, skips, &part_note)?,
+        OutputFormat::Cxml => write_cxml(
+            &mut w,
+            folder,
+            root,
+            blocks,
+            cfg,
+            first,
+            total_scanned,
+            outcome,
+            skips,
+            &part_note,
+        )?,
+        OutputFormat::Xml => write_xml(
+            &mut w,
+            folder,
+            root,
+            blocks,
+            cfg,
+            first,
+            total_scanned,
+            outcome,
+            skips,
+            &part_note,
+        )?,
+        OutputFormat::Plain => write_plain(
+            &mut w,
+            folder,
+            root,
+            blocks,
+            cfg,
+            first,
+            total_scanned,
+            outcome,
+            skips,
+            &part_note,
+        )?,
+        OutputFormat::Markdown => write_markdown(
+            &mut w,
+            folder,
+            root,
+            blocks,
+            cfg,
+            first,
+            total_scanned,
+            outcome,
+            skips,
+            &part_note,
+        )?,
+    }
+    w.flush()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_markdown<W: Write>(
+    w: &mut W,
+    folder: &str,
+    root: &Path,
+    blocks: &[&Block],
+    cfg: &MergeConfig,
+    first: bool,
+    total_scanned: usize,
+    outcome: &MergeOutcome,
+    skips: &[&SkipEntry],
+    part_note: &str,
+) -> Result<()> {
+    writeln!(w, "# {} — Merged Codebase{}\n", folder, part_note)?;
+    writeln!(
+        w,
+        "> Generated by TurboMerger v{}",
+        env!("CARGO_PKG_VERSION")
+    )?;
+    writeln!(w, "> Files scanned: {}", total_scanned)?;
+    writeln!(
+        w,
+        "> Estimated tokens: ~{} (o200k) · ~{} (Claude est.)",
+        outcome.tokens_o200k,
+        tokens::claude_estimate(outcome.tokens_o200k)
+    )?;
+    writeln!(w, "> Source: {}\n", root.display())?;
+    writeln!(w, "---\n")?;
+
+    if cfg.include_tree && first {
+        writeln!(w, "## Project Structure\n")?;
+        writeln!(w, "```")?;
+        write!(w, "{}", generate_tree(root, blocks))?;
+        writeln!(w, "```\n")?;
+        writeln!(w, "## Contents\n")?;
+        for b in blocks {
+            writeln!(
+                w,
+                "- [{}](#{}) — ~{} tok",
+                b.relative,
+                anchor_for(&b.relative),
+                b.tokens
+            )?;
+        }
+        writeln!(w, "\n---\n")?;
+    }
+
+    for b in blocks {
+        let fence = "`".repeat((longest_backtick_run(&b.content) + 1).max(3));
+        writeln!(w, "## {}\n", b.relative)?;
+        writeln!(w, "{}{}", fence, b.lang)?;
+        w.write_all(b.content.as_bytes())?;
+        if !b.content.ends_with('\n') {
+            writeln!(w)?;
+        }
+        writeln!(w, "{}\n", fence)?;
+    }
+
+    write_markdown_report(w, blocks, outcome, skips)?;
+    Ok(())
+}
+
+fn write_markdown_report<W: Write>(
+    w: &mut W,
+    blocks: &[&Block],
+    outcome: &MergeOutcome,
+    skips: &[&SkipEntry],
+) -> Result<()> {
+    writeln!(w, "---\n")?;
+    writeln!(w, "## Merge Report\n")?;
+    writeln!(w, "- Files merged: {}", outcome.files_processed)?;
+    writeln!(
+        w,
+        "- Estimated tokens: ~{} (o200k) · ~{} (Claude est.)",
+        outcome.tokens_o200k,
+        tokens::claude_estimate(outcome.tokens_o200k)
+    )?;
+    if outcome.secrets_redacted > 0 {
+        writeln!(w, "- Secrets redacted: {}", outcome.secrets_redacted)?;
+    }
+    let redactions: Vec<(&str, &str, usize)> = blocks
+        .iter()
+        .flat_map(|b| {
+            b.redactions
+                .iter()
+                .map(move |(r, n)| (b.relative.as_str(), *r, *n))
+        })
+        .collect();
+    if !skips.is_empty() {
+        writeln!(w, "\n### Skipped files ({})\n", skips.len())?;
+        for e in skips.iter().take(MANIFEST_MAX) {
+            writeln!(w, "- `{}` — {}", e.path, e.reason)?;
+        }
+        if skips.len() > MANIFEST_MAX {
+            writeln!(w, "- …and {} more", skips.len() - MANIFEST_MAX)?;
+        }
+    }
+    if !redactions.is_empty() {
+        writeln!(w, "\n### Redactions\n")?;
+        for (rel, rule, n) in &redactions {
+            writeln!(w, "- `{}` — {} × {}", rel, n, rule)?;
+        }
+    }
+    let notes: Vec<(&str, &str)> = blocks
+        .iter()
+        .filter_map(|b| b.utf8_note.as_deref().map(|n| (b.relative.as_str(), n)))
+        .collect();
+    if !notes.is_empty() {
+        writeln!(w, "\n### Decoding notes\n")?;
+        for (rel, note) in &notes {
+            writeln!(w, "- `{}` — {}", rel, note)?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_plain<W: Write>(
+    w: &mut W,
+    folder: &str,
+    root: &Path,
+    blocks: &[&Block],
+    cfg: &MergeConfig,
+    first: bool,
+    total_scanned: usize,
+    outcome: &MergeOutcome,
+    skips: &[&SkipEntry],
+    part_note: &str,
+) -> Result<()> {
+    writeln!(w, "{} — Merged Codebase{}", folder, part_note)?;
+    writeln!(w, "Generated by TurboMerger v{}", env!("CARGO_PKG_VERSION"))?;
+    writeln!(
+        w,
+        "Files scanned: {}  Estimated tokens: ~{} (o200k)\n",
+        total_scanned, outcome.tokens_o200k
+    )?;
+    if cfg.include_tree && first {
+        writeln!(w, "PROJECT STRUCTURE\n{}", generate_tree(root, blocks))?;
+    }
+    for b in blocks {
+        writeln!(w, "\n===== {} =====", b.relative)?;
+        w.write_all(b.content.as_bytes())?;
+        if !b.content.ends_with('\n') {
+            writeln!(w)?;
+        }
+    }
+    writeln!(w, "\n===== MERGE REPORT =====")?;
+    writeln!(
+        w,
+        "Files merged: {}  Secrets redacted: {}",
+        outcome.files_processed, outcome.secrets_redacted
+    )?;
+    if !skips.is_empty() {
+        writeln!(w, "Skipped ({}):", skips.len())?;
+        for e in skips.iter().take(MANIFEST_MAX) {
+            writeln!(w, "  {} — {}", e.path, e.reason)?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_xml<W: Write>(
+    w: &mut W,
+    folder: &str,
+    root: &Path,
+    blocks: &[&Block],
+    cfg: &MergeConfig,
+    first: bool,
+    total_scanned: usize,
+    outcome: &MergeOutcome,
+    skips: &[&SkipEntry],
+    part_note: &str,
+) -> Result<()> {
+    writeln!(
+        w,
+        "<codebase name=\"{}\" files_scanned=\"{}\" tokens_o200k=\"{}\" note=\"{}\">",
+        xml_escape(folder),
+        total_scanned,
+        outcome.tokens_o200k,
+        xml_escape(part_note.trim_start_matches(" — "))
+    )?;
+    if cfg.include_tree && first {
+        writeln!(
+            w,
+            "  <structure>\n{}  </structure>",
+            xml_escape(&generate_tree(root, blocks))
+        )?;
+    }
+    for b in blocks {
+        writeln!(
+            w,
+            "  <file path=\"{}\" tokens=\"{}\">",
+            xml_escape(&b.relative),
+            b.tokens
+        )?;
+        w.write_all(xml_escape(&b.content).as_bytes())?;
+        if !b.content.ends_with('\n') {
+            writeln!(w)?;
+        }
+        writeln!(w, "  </file>")?;
+    }
+    writeln!(
+        w,
+        "  <merge_report files_merged=\"{}\" secrets_redacted=\"{}\">",
+        outcome.files_processed, outcome.secrets_redacted
+    )?;
+    for e in skips.iter().take(MANIFEST_MAX) {
+        writeln!(
+            w,
+            "    <skipped path=\"{}\" reason=\"{}\"/>",
+            xml_escape(&e.path),
+            xml_escape(&e.reason)
+        )?;
+    }
+    writeln!(w, "  </merge_report>")?;
+    writeln!(w, "</codebase>")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_cxml<W: Write>(
+    w: &mut W,
+    folder: &str,
+    root: &Path,
+    blocks: &[&Block],
+    cfg: &MergeConfig,
+    first: bool,
+    total_scanned: usize,
+    outcome: &MergeOutcome,
+    skips: &[&SkipEntry],
+    part_note: &str,
+) -> Result<()> {
+    // Anthropic long-context "documents" convention. Content is NOT XML-escaped
+    // (the tags are delimiters), matching files-to-prompt's cxml output.
+    writeln!(w, "<documents>")?;
+    let mut index = 1;
+    if first {
+        writeln!(w, "<document index=\"{}\">", index)?;
+        writeln!(w, "<source>MERGE_INFO</source>")?;
+        writeln!(w, "<document_contents>")?;
+        writeln!(w, "{} — Merged Codebase{}", folder, part_note)?;
+        writeln!(
+            w,
+            "Files scanned: {}  Tokens (o200k): ~{}",
+            total_scanned, outcome.tokens_o200k
+        )?;
+        if cfg.include_tree {
+            writeln!(w, "\n{}", generate_tree(root, blocks))?;
+        }
+        if !skips.is_empty() {
+            writeln!(
+                w,
+                "Skipped {} files (redaction/gitignore/binary/etc.).",
+                skips.len()
+            )?;
+        }
+        writeln!(w, "</document_contents>")?;
+        writeln!(w, "</document>")?;
+        index += 1;
+    }
+    for b in blocks {
+        writeln!(w, "<document index=\"{}\">", index)?;
+        writeln!(w, "<source>{}</source>", b.relative)?;
+        writeln!(w, "<document_contents>")?;
+        w.write_all(b.content.as_bytes())?;
+        if !b.content.ends_with('\n') {
+            writeln!(w)?;
+        }
+        writeln!(w, "</document_contents>")?;
+        writeln!(w, "</document>")?;
+        index += 1;
+    }
+    writeln!(w, "</documents>")?;
+    Ok(())
+}
+
+fn write_json<W: Write>(
+    w: &mut W,
+    folder: &str,
+    root: &Path,
+    blocks: &[&Block],
+    outcome: &MergeOutcome,
+    skips: &[&SkipEntry],
+    part_note: &str,
+) -> Result<()> {
+    let files: Vec<serde_json::Value> = blocks
+        .iter()
+        .map(|b| {
+            serde_json::json!({
+                "path": b.relative,
+                "language": b.lang,
+                "tokens": b.tokens,
+                "content": b.content,
+            })
+        })
+        .collect();
+    let skipped: Vec<serde_json::Value> = skips
+        .iter()
+        .map(|e| serde_json::json!({ "path": e.path, "reason": e.reason }))
+        .collect();
+    let doc = serde_json::json!({
+        "generator": format!("TurboMerger v{}", env!("CARGO_PKG_VERSION")),
+        "project": folder,
+        "source": root.to_string_lossy(),
+        "note": part_note.trim(),
+        "tokens_o200k": outcome.tokens_o200k,
+        "files_merged": outcome.files_processed,
+        "secrets_redacted": outcome.secrets_redacted,
+        "files": files,
+        "skipped": skipped,
+    });
+    w.write_all(serde_json::to_string_pretty(&doc)?.as_bytes())?;
+    writeln!(w)?;
+    Ok(())
+}
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
 fn relative_display(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
+}
+
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn longest_backtick_run(s: &str) -> usize {
@@ -295,9 +772,7 @@ fn longest_backtick_run(s: &str) -> usize {
     for b in s.bytes() {
         if b == b'`' {
             cur += 1;
-            if cur > max {
-                max = cur;
-            }
+            max = max.max(cur);
         } else {
             cur = 0;
         }
@@ -305,7 +780,6 @@ fn longest_backtick_run(s: &str) -> usize {
     max
 }
 
-/// GitHub-style anchor slug for a heading whose text is `rel`
 fn anchor_for(rel: &str) -> String {
     rel.chars()
         .filter_map(|c| {
@@ -321,56 +795,108 @@ fn anchor_for(rel: &str) -> String {
         .collect()
 }
 
-/// Proper recursive tree (the v7.1 version rendered a flat two-level listing
-/// with misleading connectors).
-fn generate_tree(root: &Path, files: &[PathBuf]) -> String {
+/// Rank for entry-first ordering: lower = more important (shown earlier).
+fn entry_rank(rel: &str) -> i32 {
+    let lower = rel.to_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    let depth = lower.matches('/').count() as i32;
+    let mut score = depth * 2;
+    if name.starts_with("readme") {
+        score -= 100;
+    }
+    if matches!(
+        name,
+        "main.rs"
+            | "lib.rs"
+            | "mod.rs"
+            | "main.py"
+            | "__init__.py"
+            | "index.ts"
+            | "index.js"
+            | "index.tsx"
+            | "app.tsx"
+            | "cargo.toml"
+            | "package.json"
+            | "pyproject.toml"
+            | "go.mod"
+            | "makefile"
+            | "dockerfile"
+    ) {
+        score -= 40;
+    }
+    if lower.starts_with("src/") {
+        score -= 10;
+    }
+    if lower.starts_with("tests/") || lower.starts_with("test/") || lower.contains("/tests/") {
+        score += 20;
+    }
+    if lower.starts_with("docs/") || lower.starts_with("doc/") {
+        score += 15;
+    }
+    score
+}
+
+fn order_files(root: &Path, files: &mut [&PathBuf], ordering: Ordering) {
+    match ordering {
+        Ordering::Path => files.sort(),
+        Ordering::EntryFirst => {
+            files.sort_by(|a, b| {
+                let ra = entry_rank(&relative_display(root, a));
+                let rb = entry_rank(&relative_display(root, b));
+                ra.cmp(&rb).then_with(|| a.cmp(b))
+            });
+        }
+        Ordering::ImportantLast => {
+            files.sort_by(|a, b| {
+                let ra = entry_rank(&relative_display(root, a));
+                let rb = entry_rank(&relative_display(root, b));
+                rb.cmp(&ra).then_with(|| b.cmp(a))
+            });
+        }
+    }
+}
+
+/// Recursive ASCII tree of the merged blocks.
+fn generate_tree(root: &Path, blocks: &[&Block]) -> String {
     #[derive(Default)]
     struct Node {
         dirs: std::collections::BTreeMap<String, Node>,
         files: Vec<String>,
     }
-
     let mut top = Node::default();
-    for f in files {
-        if let Ok(rel) = f.strip_prefix(root) {
-            let comps: Vec<String> = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect();
-            if comps.is_empty() {
-                continue;
-            }
-            let mut cur = &mut top;
-            for c in &comps[..comps.len() - 1] {
-                cur = cur.dirs.entry(c.clone()).or_default();
-            }
-            cur.files.push(comps[comps.len() - 1].clone());
+    for b in blocks {
+        let comps: Vec<&str> = b.relative.split('/').collect();
+        if comps.is_empty() {
+            continue;
         }
+        let mut cur = &mut top;
+        for c in &comps[..comps.len() - 1] {
+            cur = cur.dirs.entry((*c).to_string()).or_default();
+        }
+        cur.files.push(comps[comps.len() - 1].to_string());
     }
-
     fn render(node: &Node, prefix: &str, out: &mut String) {
-        let n_entries = node.dirs.len() + node.files.len();
+        let n = node.dirs.len() + node.files.len();
         let mut i = 0;
         for (name, child) in &node.dirs {
             i += 1;
-            let last = i == n_entries;
+            let last = i == n;
             out.push_str(prefix);
             out.push_str(if last { "└── " } else { "├── " });
             out.push_str(name);
             out.push_str("/\n");
-            let child_prefix = format!("{}{}", prefix, if last { "    " } else { "│   " });
-            render(child, &child_prefix, out);
+            let cp = format!("{}{}", prefix, if last { "    " } else { "│   " });
+            render(child, &cp, out);
         }
         for name in &node.files {
             i += 1;
-            let last = i == n_entries;
+            let last = i == n;
             out.push_str(prefix);
             out.push_str(if last { "└── " } else { "├── " });
             out.push_str(name);
             out.push('\n');
         }
     }
-
     let mut out = format!(
         "{}/\n",
         root.file_name().and_then(|n| n.to_str()).unwrap_or(".")
@@ -393,28 +919,34 @@ mod tests {
     #[test]
     fn anchors_match_github_slugs() {
         assert_eq!(anchor_for("src/main.rs"), "srcmainrs");
+    }
+
+    #[test]
+    fn xml_escapes_content() {
         assert_eq!(
-            anchor_for("My File Name.md"),
-            "my-file-name-md".replace("-md", "md")
+            xml_escape("a < b & c > d \"q\""),
+            "a &lt; b &amp; c &gt; d &quot;q&quot;"
         );
     }
 
     #[test]
-    fn tree_is_recursive() {
-        let root = Path::new("C:\\proj");
-        let files = vec![
-            PathBuf::from("C:\\proj\\src\\a\\deep.rs"),
-            PathBuf::from("C:\\proj\\src\\main.rs"),
-            PathBuf::from("C:\\proj\\README.md"),
-        ];
-        let tree = generate_tree(root, &files);
-        assert!(tree.contains("├── src/") || tree.contains("└── src/"));
-        assert!(
-            tree.contains("│   ├── a/") || tree.contains("    ├── a/"),
-            "{}",
-            tree
+    fn entry_first_puts_readme_and_main_early() {
+        assert!(entry_rank("README.md") < entry_rank("src/util.rs"));
+        assert!(entry_rank("src/main.rs") < entry_rank("tests/foo.rs"));
+        assert!(entry_rank("src/a.rs") < entry_rank("docs/guide.md"));
+    }
+
+    #[test]
+    fn format_and_ordering_parse() {
+        assert_eq!(OutputFormat::from_str_lenient("CXML"), OutputFormat::Cxml);
+        assert_eq!(
+            OutputFormat::from_str_lenient("weird"),
+            OutputFormat::Markdown
         );
-        assert!(tree.contains("deep.rs"));
-        assert!(tree.contains("README.md"));
+        assert_eq!(OutputFormat::Json.extension(), "json");
+        assert_eq!(
+            Ordering::from_str_lenient("important-last"),
+            Ordering::ImportantLast
+        );
     }
 }
