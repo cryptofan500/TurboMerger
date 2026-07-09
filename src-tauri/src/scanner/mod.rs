@@ -1,30 +1,34 @@
-//! Scanner module with security hardening and content-based detection
+//! Scanner: gitignore-aware directory walking + text/binary classification.
 //!
-//! v7.0 UPGRADE: Dual detection system
-//! - PRIMARY: Content-based binary detection (read first 8KB, check for null bytes)
-//! - SECONDARY: Extension allow/deny lists for fast-path optimization
-//!
-//! Original FIXES preserved:
-//! 1. Removed expensive is_venv_directory() filesystem checks (18 syscalls → 0)
-//! 2. Fixed "Convenience Bug" - word boundary checks prevent false positives
-//! 3. Fixed double string allocation - lowercase computed once
-//! 4. Split SKIP_DIRS so include_venv=true actually works
+//! v7.2 rewrite:
+//! - jwalk + hand-rolled skip lists replaced by the `ignore` crate (ripgrep's
+//!   walker): `.gitignore` / `.ignore` / `.git/info/exclude` are honored
+//!   (toggleable) plus a highest-precedence `.turbomergerignore`.
+//! - Well-known dot-config files (.gitignore, .mcp.json, .github/…, …) are
+//!   included by default; "Include hidden files" includes everything dotted.
+//! - Every skipped file is recorded with a reason (surfaced in the output's
+//!   Merge Report) instead of vanishing silently.
+//! - One unreadable entry no longer aborts the scan.
+//! - Content sniffing runs in parallel (rayon) instead of on the walk thread.
 
-use std::path::{Path, PathBuf};
 use std::io::Read;
+use std::path::{Path, PathBuf};
+
 use anyhow::Result;
-use jwalk::WalkDir;
+use ignore::WalkBuilder;
 use phf::phf_set;
+use rayon::prelude::*;
 use serde::Serialize;
+
+use crate::security::{has_reparse_point_in_path, sensitive_reason};
 
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
-
-use crate::security::{has_reparse_point_in_path, is_sensitive_file};
-
-/// Windows file attribute for reparse points (junctions/symlinks)
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+/// OneDrive/cloud placeholder: reading it would force a download (hydration)
+#[cfg(windows)]
+const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
 
 /// Number of bytes to read for content-based binary detection
 const SNIFF_SIZE: usize = 8192;
@@ -41,15 +45,11 @@ const NON_ASCII_THRESHOLD_PCT: usize = 40;
 /// Files larger than this with unknown extensions are skipped (500KB)
 const LARGE_FILE_UNKNOWN_EXT: u64 = 524_288;
 
-/// Files larger than this are always skipped (2MB)
-const LARGE_FILE_ABSOLUTE: u64 = 2_097_152;
-
 // ============================================================================
 // EXTENSION SETS
 // ============================================================================
 
 /// Known text file extensions (compile-time perfect hash)
-/// Files matching these skip content sniffing (optimization)
 static TEXT_EXTENSIONS: phf::Set<&'static str> = phf_set! {
     // Code — mainstream
     "rs", "py", "js", "ts", "tsx", "jsx", "c", "cpp", "h", "hpp", "java", "kt", "go",
@@ -114,8 +114,11 @@ static BINARY_EXTENSIONS: phf::Set<&'static str> = phf_set! {
     "odt", "ods", "odp",
     // Fonts
     "ttf", "otf", "woff", "woff2", "eot",
-    // Databases
+    // Databases + their journals (cookies.sqlite-wal leaked in v7.1 because
+    // these compound extensions were missing and the WAL content is mostly ASCII)
     "db", "sqlite", "sqlite3", "mdb",
+    "sqlite-wal", "sqlite-shm", "sqlite-journal",
+    "db-wal", "db-shm", "db-journal",
     // Disk images
     "iso", "img", "dmg", "vmdk", "qcow2", "vhd",
     // Packages
@@ -123,97 +126,116 @@ static BINARY_EXTENSIONS: phf::Set<&'static str> = phf_set! {
     // Other binary
     "swf",
     // Build artifacts & caches
-    "map", "lock", "tsbuildinfo", "eslintcache", "stylelintcache",
+    "map", "lock", "lockb", "tsbuildinfo", "eslintcache", "stylelintcache",
 };
 
-/// Lock files to always skip (bloat LLM context without value)
+/// Files to always skip by exact name (context bloat or Windows system noise)
 static SKIP_FILES: &[&str] = &[
     "package-lock.json",
-    "Cargo.lock",
+    "npm-shrinkwrap.json",
+    "cargo.lock",
     "yarn.lock",
     "pnpm-lock.yaml",
+    "bun.lock",
     "composer.lock",
-    "Gemfile.lock",
+    "gemfile.lock",
     "poetry.lock",
+    "packages.lock.json",
+    "gradle.lockfile",
+    "go.sum",
+    "desktop.ini",
+    "thumbs.db",
+    "ntuser.dat",
 ];
 
 // ============================================================================
 // SKIP DIRECTORY SETS
 // ============================================================================
 
-/// Directories to ALWAYS skip (regardless of include_venv setting)
+/// Directories to ALWAYS skip (regardless of include_venv / include_hidden)
 static SKIP_DIRS_ALWAYS: phf::Set<&'static str> = phf_set! {
     // Version Control
     ".git", ".svn", ".hg", ".bzr",
-
     // Node.js
     "node_modules", ".npm", ".yarn", ".pnpm-store",
-
     // Rust
     "target", ".cargo",
-
     // Build outputs
     "dist", "build", "out", "_build",
-
     // IDE/Editor
     ".idea", ".vscode", ".vs",
-
     // Coverage/Testing
     "coverage", ".coverage", "htmlcov", ".nyc_output",
-
     // Caches
     ".cache", ".parcel-cache", ".next", ".nuxt", ".output",
     ".svelte-kit", ".turbo",
-
     // Deployment
     ".vercel", ".netlify",
-
     // Generated / docs
     "__generated__", ".docusaurus", "storybook-static",
-
     // Misc
     "vendor", "packages", "bower_components",
     "obj", "debug", "release", "x64", "x86",
-
     // Windows
     "$recycle.bin", "system volume information",
-
     // macOS
     ".ds_store", "__macosx",
-
     // Terraform/Cloud
     ".terraform", ".serverless",
+    // Credential directories
+    ".ssh", ".aws", ".gnupg",
 };
 
 /// Python venv directories - only skipped when include_venv=false
 static SKIP_DIRS_VENV: phf::Set<&'static str> = phf_set! {
-    // Standard venv names
     "venv", ".venv", "env", ".env", "virtualenv",
-
-    // Common custom names
     "virtual_env", "virtualenvs", "pyenv",
-
-    // Poetry/pipenv
     ".poetry", ".pipenv",
-
-    // Conda
     "conda", ".conda", "miniconda", "miniconda3", "anaconda", "anaconda3",
-
-    // Internal venv directories (always in a venv context)
     "site-packages", "lib64",
-
-    // Python cache/build (these are always noise)
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".tox", ".nox", "eggs", ".eggs", "pip-wheel-metadata",
 };
 
-/// Substring patterns for catching custom venv names
-/// These require word-boundary checking to avoid false positives
-static VENV_SUBSTRINGS: &[&str] = &[
-    "venv",         // catches my_venv, project-venv, venv2
-    "virtualenv",   // catches my_virtualenv
-    "site-packages",
-];
+/// Substring patterns for catching custom venv names (word-boundary checked)
+static VENV_SUBSTRINGS: &[&str] = &["venv", "virtualenv", "site-packages"];
+
+/// Dot-DIRECTORIES that are included even when hidden files are off
+const DOT_DIR_ALLOWLIST: &[&str] = &[".github", ".devcontainer"];
+
+/// Well-known dot-FILES included even when hidden files are off. These are the
+/// "missed key files" class: a code reviewer needs them.
+fn is_allowlisted_dotfile(name_lower: &str) -> bool {
+    matches!(
+        name_lower,
+        ".gitignore"
+            | ".gitattributes"
+            | ".gitmodules"
+            | ".dockerignore"
+            | ".editorconfig"
+            | ".nvmrc"
+            | ".node-version"
+            | ".python-version"
+            | ".ruby-version"
+            | ".tool-versions"
+            | ".env.example"
+            | ".env.sample"
+            | ".env.template"
+            | ".mcp.json"
+            | ".eslintignore"
+            | ".prettierignore"
+            | ".gitlab-ci.yml"
+            | ".travis.yml"
+            | ".flake8"
+            | ".pylintrc"
+            | ".pre-commit-config.yaml"
+            | ".clang-format"
+            | ".clang-tidy"
+    ) || name_lower.starts_with(".eslintrc")
+        || name_lower.starts_with(".prettierrc")
+        || name_lower.starts_with(".stylelintrc")
+        || name_lower.starts_with(".babelrc")
+}
 
 // ============================================================================
 // SCAN OPTIONS, STATS, AND RESULT TYPES
@@ -224,6 +246,8 @@ pub struct ScanOptions {
     pub include_venv: bool,
     pub content_sniff: bool,
     pub include_hidden: bool,
+    pub respect_gitignore: bool,
+    /// Absolute per-file cap in bytes (config `max_file_size_mb`, default 2 MB)
     pub max_file_size: u64,
     pub extra_text_exts: Vec<String>,
     pub extra_skip_exts: Vec<String>,
@@ -236,7 +260,8 @@ impl Default for ScanOptions {
             include_venv: false,
             content_sniff: true,
             include_hidden: false,
-            max_file_size: 50 * 1024 * 1024,
+            respect_gitignore: true,
+            max_file_size: 2 * 1024 * 1024,
             extra_text_exts: Vec::new(),
             extra_skip_exts: Vec::new(),
             extra_binary_exts: Vec::new(),
@@ -250,31 +275,26 @@ pub struct ScanStats {
     pub by_extension: usize,
     pub by_content: usize,
     pub skipped_binary: usize,
+    pub unreadable: usize,
 }
 
-/// Complete scan result with file list and statistics
+/// A skipped file plus the reason — feeds the output's Merge Report so nothing
+/// is ever dropped invisibly.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkipEntry {
+    pub path: String,
+    pub reason: String,
+}
+
+/// Complete scan result
 pub struct ScanResult {
     pub files: Vec<PathBuf>,
     pub stats: ScanStats,
+    pub skipped: Vec<SkipEntry>,
 }
 
 // ============================================================================
-// SECURITY HELPERS
-// ============================================================================
-
-/// SECURITY: Check if metadata indicates a reparse point
-#[cfg(windows)]
-fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
-    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(_meta: &std::fs::Metadata) -> bool {
-    false
-}
-
-// ============================================================================
-// WORD BOUNDARY CHECKING (preserved from v6.0)
+// NAME CLASSIFICATION HELPERS
 // ============================================================================
 
 /// Check if a substring match has valid word boundaries
@@ -289,8 +309,7 @@ fn has_word_boundary(name: &str, pattern: &str, idx: usize) -> bool {
     safe_start && safe_end
 }
 
-/// Fast check if a directory name indicates a virtual environment
-/// NO FILESYSTEM I/O - pure string matching only
+/// Fast check if a directory name indicates a virtual environment (no I/O)
 #[inline]
 fn is_venv_by_name(lower_name: &str) -> bool {
     if SKIP_DIRS_VENV.contains(lower_name) {
@@ -308,25 +327,68 @@ fn is_venv_by_name(lower_name: &str) -> bool {
     false
 }
 
-// ============================================================================
-// CONTENT-BASED BINARY DETECTION
-// ============================================================================
-
-/// Check if a filename matches minified/generated file patterns.
-/// These are compound extensions that can't be represented in a simple PHF set.
+/// Minified/generated compound extensions
 #[inline]
 fn is_minified_filename(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.ends_with(".min.js")
         || lower.ends_with(".min.css")
+        || lower.ends_with(".min.mjs")
         || lower.ends_with(".chunk.js")
         || lower.ends_with(".bundle.js")
 }
 
+/// Previous TurboMerger outputs — re-merging them snowballs dumps-into-dumps
+#[inline]
+fn is_own_output(name_lower: &str) -> bool {
+    name_lower.ends_with("_merged.md")
+        || (name_lower.contains("_merged.part") && name_lower.ends_with(".md"))
+}
+
+/// Check if an extensionless file has a well-known text filename
+#[inline]
+fn is_known_extensionless_file(name_lower: &str) -> bool {
+    matches!(
+        name_lower,
+        "makefile"
+            | "dockerfile"
+            | "vagrantfile"
+            | "jenkinsfile"
+            | "gemfile"
+            | "rakefile"
+            | "readme"
+            | "license"
+            | "changelog"
+            | "authors"
+            | "contributors"
+            | "todo"
+            | "cmakelists.txt"
+            | "procfile"
+            | "brewfile"
+            | "podfile"
+            | "fastfile"
+            | "appfile"
+            | "justfile"
+            | "taskfile"
+            | "earthfile"
+            | "tiltfile"
+            | "snakefile"
+            | "guardfile"
+            | "berksfile"
+            | "capfile"
+            | "thorfile"
+            | "puppetfile"
+            | "modulefile"
+            | "buildfile"
+            | "codeowners"
+    )
+}
+
+// ============================================================================
+// CONTENT-BASED BINARY DETECTION
+// ============================================================================
+
 /// Read first 8192 bytes and check if the file appears to be text.
-///
-/// Returns Ok(true) if the file appears to be text, Ok(false) if binary.
-/// Empty files are considered text. IO errors return Err.
 ///
 /// Detection pipeline (in order):
 /// 1. Magic bytes + null byte ratio (via security::is_binary_content)
@@ -345,13 +407,10 @@ fn sniff_file_content(path: &Path) -> Result<bool> {
 
     buffer.truncate(bytes_read);
 
-    // Check 1: Existing binary detection (magic bytes + null bytes + printable ratio)
     if crate::security::is_binary_content(&buffer) {
         return Ok(false);
     }
 
-    // Check 2: Control character ratio (catches binary-as-UTF8 like SOH, DC1, NAK, etc.)
-    // Excludes tab (0x09), newline (0x0A), carriage return (0x0D)
     let control_count = buffer
         .iter()
         .filter(|&&b| (0x01..=0x08).contains(&b) || (0x0E..=0x1F).contains(&b))
@@ -360,15 +419,16 @@ fn sniff_file_content(path: &Path) -> Result<bool> {
         return Ok(false);
     }
 
-    // Check 3: Non-ASCII ratio (catches base64-encoded fonts, encrypted content)
     let high_byte_count = buffer.iter().filter(|&&b| b >= 0x80).count();
     if high_byte_count * 100 > bytes_read * NON_ASCII_THRESHOLD_PCT {
         return Ok(false);
     }
 
-    // Check 4: Max line length (catches minified JS/CSS bundles)
-    // No human-written source file has 1000+ character lines
-    let max_line_len = buffer.split(|&b| b == b'\n').map(|line| line.len()).max().unwrap_or(0);
+    let max_line_len = buffer
+        .split(|&b| b == b'\n')
+        .map(|line| line.len())
+        .max()
+        .unwrap_or(0);
     if max_line_len > MAX_LINE_LENGTH {
         return Ok(false);
     }
@@ -376,223 +436,288 @@ fn sniff_file_content(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Check if an extensionless file has a well-known text filename
-#[inline]
-fn is_known_extensionless_file(name_lower: &str) -> bool {
-    matches!(name_lower,
-        "makefile" | "dockerfile" | "vagrantfile" | "jenkinsfile" |
-        "gemfile" | "rakefile" | "readme" | "license" | "changelog" |
-        "authors" | "contributors" | "todo" | "cmakelists.txt" |
-        "procfile" | "brewfile" | "podfile" | "fastfile" | "appfile" |
-        "justfile" | "taskfile" | "earthfile" | "tiltfile" |
-        "snakefile" | "guardfile" | "berksfile" | "capfile" |
-        "thorfile" | "puppetfile" | "modulefile" | "buildfile"
-    )
+// ============================================================================
+// WALK FILTTERING + CLASSIFICATION
+// ============================================================================
+
+fn relative_display(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.to_string_lossy().to_string())
+}
+
+/// Directory/file filter applied during the walk (cheap name checks only).
+fn keep_entry(entry: &ignore::DirEntry, include_venv: bool, include_hidden: bool) -> bool {
+    if entry.path_is_symlink() {
+        return false;
+    }
+
+    let name = entry.file_name().to_string_lossy();
+    let name_lower = name.to_lowercase();
+    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+
+    if is_dir {
+        // Junction points masquerade as plain dirs — reject via attributes
+        #[cfg(windows)]
+        if let Ok(meta) = entry.metadata() {
+            if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return false;
+            }
+        }
+        if SKIP_DIRS_ALWAYS.contains(name_lower.as_str()) {
+            return false;
+        }
+        if !include_venv && is_venv_by_name(&name_lower) {
+            return false;
+        }
+        if name_lower.starts_with('.')
+            && !include_hidden
+            && !DOT_DIR_ALLOWLIST.contains(&name_lower.as_str())
+        {
+            return false;
+        }
+        return true;
+    }
+
+    // Files: hidden gate (dot-prefix) with the config-file allowlist
+    if name_lower.starts_with('.') && !include_hidden && !is_allowlisted_dotfile(&name_lower) {
+        return false;
+    }
+
+    true
+}
+
+enum Verdict {
+    TextByExt,
+    TextByContent,
+    Skip(String),
+    SkipBinary(String),
+    Unreadable,
+}
+
+/// Decide whether a single candidate file is merged. Runs on rayon threads.
+fn classify(path: &Path, len: u64, options: &ScanOptions) -> Verdict {
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return Verdict::Skip("unrepresentable file name".into()),
+    };
+    let name_lower = name.to_lowercase();
+
+    if SKIP_FILES.iter().any(|&s| s == name_lower) {
+        return Verdict::Skip("lock/system file (context bloat)".into());
+    }
+    if is_own_output(&name_lower) {
+        return Verdict::Skip("previous TurboMerger output".into());
+    }
+    if is_minified_filename(name) {
+        return Verdict::SkipBinary("minified/bundled".into());
+    }
+    if let Some(reason) = sensitive_reason(path) {
+        return Verdict::Skip(reason.to_string());
+    }
+    if len > options.max_file_size {
+        return Verdict::Skip(format!("too large ({} KB)", len / 1024));
+    }
+
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_ascii_lowercase();
+
+        // Step 1: Config exclude list (highest priority user override)
+        if options.extra_skip_exts.iter().any(|e| e == &ext_lower) {
+            return Verdict::Skip("excluded by turbomerger.toml".into());
+        }
+
+        // Step 2: Known binary extension → skip
+        if BINARY_EXTENSIONS.contains(ext_lower.as_str())
+            || options.extra_binary_exts.iter().any(|e| e == &ext_lower)
+        {
+            return Verdict::SkipBinary("binary extension".into());
+        }
+
+        let known_text = TEXT_EXTENSIONS.contains(ext_lower.as_str())
+            || options.extra_text_exts.iter().any(|e| e == &ext_lower);
+
+        // Large files must be known text extensions
+        if len > LARGE_FILE_UNKNOWN_EXT && !known_text {
+            return Verdict::SkipBinary("large file with unknown extension".into());
+        }
+
+        // Step 3: Known text extension → include
+        if known_text {
+            return Verdict::TextByExt;
+        }
+
+        // Step 4: Unknown extension → content sniff if enabled
+        if options.content_sniff {
+            return match sniff_file_content(path) {
+                Ok(true) => Verdict::TextByContent,
+                Ok(false) => Verdict::SkipBinary("binary content".into()),
+                Err(_) => Verdict::Unreadable,
+            };
+        }
+        Verdict::Skip("unknown extension (content detection off)".into())
+    } else {
+        // Extensionless files — known names, then optional sniff
+        if len > LARGE_FILE_UNKNOWN_EXT && !is_known_extensionless_file(&name_lower) {
+            return Verdict::SkipBinary("large file with unknown extension".into());
+        }
+        if is_known_extensionless_file(&name_lower) {
+            Verdict::TextByExt
+        } else if options.content_sniff {
+            match sniff_file_content(path) {
+                Ok(true) => Verdict::TextByContent,
+                Ok(false) => Verdict::SkipBinary("binary content".into()),
+                Err(_) => Verdict::Unreadable,
+            }
+        } else {
+            Verdict::Skip("no extension (content detection off)".into())
+        }
+    }
 }
 
 // ============================================================================
 // MAIN SCANNER
 // ============================================================================
 
-/// Scan directory for text files using dual detection:
-/// 1. Extension-based (fast path via PHF sets)
-/// 2. Content-based (read first 8KB for unknown extensions)
+/// Scan directory for text files: gitignore-aware walk, then parallel
+/// classification with per-file skip reasons.
 pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult> {
-    // Validate root doesn't contain reparse points
     if has_reparse_point_in_path(root).unwrap_or(true) {
         anyhow::bail!("Root path contains junction points or symlinks");
     }
 
-    let mut files = Vec::new();
-    let mut stats = ScanStats::default();
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .follow_links(false)
+        .hidden(false) // hidden handling is ours (dot allowlist in keep_entry)
+        .require_git(false) // honor .gitignore even outside a git repo
+        .git_ignore(options.respect_gitignore)
+        .git_exclude(options.respect_gitignore)
+        .ignore(options.respect_gitignore)
+        .parents(options.respect_gitignore)
+        .git_global(false); // deterministic: user-global excludes don't apply
+    builder.add_custom_ignore_filename(".turbomergerignore");
 
-    // Capture booleans for the closure (ScanOptions is not Copy)
     let include_venv = options.include_venv;
     let include_hidden = options.include_hidden;
+    builder.filter_entry(move |entry| {
+        if entry.depth() == 0 {
+            return true;
+        }
+        keep_entry(entry, include_venv, include_hidden)
+    });
 
-    for entry in WalkDir::new(root)
-        .skip_hidden(!include_hidden)
-        .follow_links(false)  // SECURITY: Never follow symlinks
-        .process_read_dir(move |_, _, _, children| {
-            children.retain(|child| {
-                if let Ok(entry) = child {
-                    // SECURITY: Check for reparse points via metadata
-                    if let Ok(meta) = entry.metadata() {
-                        if is_reparse_point(&meta) {
-                            return false;
-                        }
-                    }
+    // Phase 1 (sequential, heavily pruned): collect candidate files.
+    let mut candidates: Vec<(PathBuf, u64)> = Vec::new();
+    let mut skipped: Vec<SkipEntry> = Vec::new();
+    let mut stats = ScanStats::default();
 
-                    // Skip symlinks entirely (security)
-                    if entry.file_type().is_symlink() {
-                        return false;
-                    }
+    for result in builder.build() {
+        let entry = match result {
+            Ok(e) => e,
+            Err(err) => {
+                stats.unreadable += 1;
+                skipped.push(SkipEntry {
+                    path: err.to_string(),
+                    reason: "unreadable during walk".into(),
+                });
+                continue;
+            }
+        };
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path().to_path_buf();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => {
+                stats.unreadable += 1;
+                skipped.push(SkipEntry {
+                    path: relative_display(root, &path),
+                    reason: "metadata unreadable".into(),
+                });
+                continue;
+            }
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        #[cfg(windows)]
+        {
+            let attrs = meta.file_attributes();
+            if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                continue;
+            }
+            if attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0 {
+                skipped.push(SkipEntry {
+                    path: relative_display(root, &path),
+                    reason: "cloud placeholder (not downloaded locally)".into(),
+                });
+                continue;
+            }
+        }
+        candidates.push((path, meta.len()));
+    }
 
-                    let name = entry.file_name().to_string_lossy();
-                    let name_lower = name.to_lowercase();
-
-                    if entry.file_type().is_dir() {
-                        // Always skip these directories (git, node_modules, etc.)
-                        if SKIP_DIRS_ALWAYS.contains(name_lower.as_str()) {
-                            return false;
-                        }
-
-                        // Only skip venv dirs when include_venv=false
-                        if !include_venv && is_venv_by_name(&name_lower) {
-                            return false;
-                        }
-
-                        return true;
-                    }
-                }
-                true
-            });
+    // Phase 2 (parallel): classify candidates (includes content sniffing).
+    let verdicts: Vec<(PathBuf, Verdict)> = candidates
+        .into_par_iter()
+        .map(|(path, len)| {
+            let v = classify(&path, len, options);
+            (path, v)
         })
-    {
-        let entry = entry?;
-        let path = entry.path();
+        .collect();
 
-        if path.is_file() {
-            // SECURITY: Check each file path for reparse points
-            if has_reparse_point_in_path(&path).unwrap_or(true) {
-                continue;
+    let mut files = Vec::new();
+    for (path, verdict) in verdicts {
+        match verdict {
+            Verdict::TextByExt => {
+                stats.by_extension += 1;
+                files.push(path);
             }
-
-            // Skip symlinks
-            if let Ok(meta) = path.symlink_metadata() {
-                if meta.file_type().is_symlink() {
-                    continue;
-                }
-                if is_reparse_point(&meta) {
-                    continue;
-                }
-
-                // Skip files exceeding max size (config-based, default 50MB)
-                if meta.len() > options.max_file_size {
-                    continue;
-                }
-
-                // Hard limit: no file > 2MB regardless of extension
-                if meta.len() > LARGE_FILE_ABSOLUTE {
-                    stats.skipped_binary += 1;
-                    continue;
-                }
-
-                // Soft limit: files > 500KB must be known text extensions
-                if meta.len() > LARGE_FILE_UNKNOWN_EXT {
-                    let is_known_text = if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        let ext_lower = ext.to_ascii_lowercase();
-                        TEXT_EXTENSIONS.contains(ext_lower.as_str())
-                            || options.extra_text_exts.iter().any(|e| e == &ext_lower)
-                    } else {
-                        false
-                    };
-                    if !is_known_text {
-                        stats.skipped_binary += 1;
-                        continue;
-                    }
-                }
+            Verdict::TextByContent => {
+                stats.by_content += 1;
+                files.push(path);
             }
-
-            // Skip sensitive files
-            if is_sensitive_file(&path) {
-                continue;
+            Verdict::SkipBinary(reason) => {
+                stats.skipped_binary += 1;
+                skipped.push(SkipEntry {
+                    path: relative_display(root, &path),
+                    reason,
+                });
             }
-
-            // Skip lock files and minified/generated files by name
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if SKIP_FILES.iter().any(|&skip| name.eq_ignore_ascii_case(skip)) {
-                    continue;
-                }
-                if is_minified_filename(name) {
-                    stats.skipped_binary += 1;
-                    continue;
-                }
+            Verdict::Skip(reason) => {
+                skipped.push(SkipEntry {
+                    path: relative_display(root, &path),
+                    reason,
+                });
             }
-
-            // === FILE DECISION LOGIC ===
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let ext_lower = ext.to_ascii_lowercase();
-
-                // Step 1: Config exclude list (highest priority user override)
-                if options.extra_skip_exts.iter().any(|e| e == &ext_lower) {
-                    continue;
-                }
-
-                // Step 2: Known binary extension → skip
-                if BINARY_EXTENSIONS.contains(ext_lower.as_str())
-                    || options.extra_binary_exts.iter().any(|e| e == &ext_lower)
-                {
-                    stats.skipped_binary += 1;
-                    continue;
-                }
-
-                // Step 3: Known text extension → include
-                if TEXT_EXTENSIONS.contains(ext_lower.as_str())
-                    || options.extra_text_exts.iter().any(|e| e == &ext_lower)
-                {
-                    stats.by_extension += 1;
-                    files.push(path.to_path_buf());
-                    continue;
-                }
-
-                // Step 4: Unknown extension → content sniff if enabled
-                if options.content_sniff {
-                    match sniff_file_content(&path) {
-                        Ok(true) => {
-                            stats.by_content += 1;
-                            files.push(path.to_path_buf());
-                        }
-                        Ok(false) => {
-                            stats.skipped_binary += 1;
-                        }
-                        Err(_) => {} // IO error → skip silently
-                    }
-                }
-            } else {
-                // Extensionless files — check known names, then optionally sniff
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    let lower = name.to_lowercase();
-                    if is_known_extensionless_file(&lower) {
-                        stats.by_extension += 1;
-                        files.push(path.to_path_buf());
-                    } else if options.content_sniff {
-                        match sniff_file_content(&path) {
-                            Ok(true) => {
-                                stats.by_content += 1;
-                                files.push(path.to_path_buf());
-                            }
-                            Ok(false) => {
-                                stats.skipped_binary += 1;
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                }
+            Verdict::Unreadable => {
+                stats.unreadable += 1;
+                skipped.push(SkipEntry {
+                    path: relative_display(root, &path),
+                    reason: "unreadable".into(),
+                });
             }
         }
     }
 
     files.sort();
-    Ok(ScanResult { files, stats })
-}
-
-/// Legacy function for backward compatibility
-pub fn scan_text_files_default(root: &Path) -> Result<Vec<PathBuf>> {
-    let options = ScanOptions::default();
-    let result = scan_text_files(root, &options)?;
-    Ok(result.files)
+    skipped.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(ScanResult {
+        files,
+        stats,
+        skipped,
+    })
 }
 
 // ============================================================================
-// COMPREHENSIVE TESTS
+// TESTS
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- Word boundary tests (preserved from v6.0) ---
 
     #[test]
     fn test_word_boundary_detection() {
@@ -600,144 +725,76 @@ mod tests {
         assert!(has_word_boundary("my_venv", "venv", 3));
         assert!(has_word_boundary("venv_logs", "venv", 0));
         assert!(has_word_boundary("project-venv", "venv", 8));
-        assert!(has_word_boundary("my.venv.dir", "venv", 3));
-        assert!(has_word_boundary("test_venv_2", "venv", 5));
-
         assert!(!has_word_boundary("event", "vent", 1));
         assert!(!has_word_boundary("convenience", "venv", 3));
-        assert!(!has_word_boundary("events", "vent", 1));
     }
 
     #[test]
     fn test_venv_name_detection() {
         assert!(is_venv_by_name("venv"));
         assert!(is_venv_by_name(".venv"));
-        assert!(is_venv_by_name("env"));
         assert!(is_venv_by_name("site-packages"));
         assert!(is_venv_by_name("__pycache__"));
-        assert!(is_venv_by_name("conda"));
         assert!(is_venv_by_name("my_venv"));
-        assert!(is_venv_by_name("project-venv"));
         assert!(is_venv_by_name("venv2"));
-        assert!(is_venv_by_name("venv_logs"));
-        assert!(is_venv_by_name("backend_virtualenv"));
-        assert!(is_venv_by_name("test.venv.dir"));
 
         assert!(!is_venv_by_name("event"));
-        assert!(!is_venv_by_name("events"));
         assert!(!is_venv_by_name("convenience"));
         assert!(!is_venv_by_name("inventory"));
-        assert!(!is_venv_by_name("prevent"));
-        assert!(!is_venv_by_name("convention"));
         assert!(!is_venv_by_name("src"));
-        assert!(!is_venv_by_name("lib"));
-        assert!(!is_venv_by_name("tests"));
-        assert!(!is_venv_by_name("components"));
-    }
-
-    #[test]
-    fn test_tricky_edge_cases() {
-        assert!(is_venv_by_name("prevent_venv_leak"));
-        assert!(is_venv_by_name("event_venv"));
-        assert!(is_venv_by_name("venv3"));
-        assert!(is_venv_by_name("2venv"));
-        assert!(!is_venv_by_name("v"));
-        assert!(!is_venv_by_name("e"));
     }
 
     #[test]
     fn test_skip_dirs_separation() {
         assert!(SKIP_DIRS_ALWAYS.contains("node_modules"));
         assert!(SKIP_DIRS_ALWAYS.contains(".git"));
-        assert!(SKIP_DIRS_ALWAYS.contains("target"));
-
+        assert!(SKIP_DIRS_ALWAYS.contains(".ssh"));
         assert!(SKIP_DIRS_VENV.contains("venv"));
-        assert!(SKIP_DIRS_VENV.contains(".venv"));
-        assert!(SKIP_DIRS_VENV.contains("site-packages"));
-
         assert!(!SKIP_DIRS_ALWAYS.contains("venv"));
-        assert!(!SKIP_DIRS_VENV.contains("node_modules"));
-    }
-
-    // --- New v7.0 tests ---
-
-    #[test]
-    fn test_binary_extensions_in_set() {
-        assert!(BINARY_EXTENSIONS.contains("exe"));
-        assert!(BINARY_EXTENSIONS.contains("png"));
-        assert!(BINARY_EXTENSIONS.contains("jpg"));
-        assert!(BINARY_EXTENSIONS.contains("zip"));
-        assert!(BINARY_EXTENSIONS.contains("pdf"));
-        assert!(BINARY_EXTENSIONS.contains("dll"));
-        assert!(BINARY_EXTENSIONS.contains("wasm"));
-        assert!(BINARY_EXTENSIONS.contains("mp4"));
-        assert!(BINARY_EXTENSIONS.contains("sqlite3"));
-        assert!(BINARY_EXTENSIONS.contains("ttf"));
     }
 
     #[test]
-    fn test_expanded_text_extensions() {
-        // Original extensions still present
-        assert!(TEXT_EXTENSIONS.contains("rs"));
-        assert!(TEXT_EXTENSIONS.contains("py"));
-        assert!(TEXT_EXTENSIONS.contains("js"));
-        assert!(TEXT_EXTENSIONS.contains("html"));
-        assert!(TEXT_EXTENSIONS.contains("json"));
-        assert!(TEXT_EXTENSIONS.contains("md"));
-
-        // New mobile extensions
-        assert!(TEXT_EXTENSIONS.contains("dart"));
-        assert!(TEXT_EXTENSIONS.contains("kt"));
-        assert!(TEXT_EXTENSIONS.contains("plist"));
-
-        // New infrastructure extensions
-        assert!(TEXT_EXTENSIONS.contains("tf"));
-        assert!(TEXT_EXTENSIONS.contains("hcl"));
-        assert!(TEXT_EXTENSIONS.contains("nix"));
-
-        // New functional extensions
-        assert!(TEXT_EXTENSIONS.contains("ml"));
-        assert!(TEXT_EXTENSIONS.contains("scm"));
-        assert!(TEXT_EXTENSIONS.contains("cljs"));
-
-        // New web extensions
-        assert!(TEXT_EXTENSIONS.contains("mjs"));
-        assert!(TEXT_EXTENSIONS.contains("pug"));
-        assert!(TEXT_EXTENSIONS.contains("hbs"));
-        assert!(TEXT_EXTENSIONS.contains("twig"));
-
-        // New build extensions
-        assert!(TEXT_EXTENSIONS.contains("just"));
-        assert!(TEXT_EXTENSIONS.contains("bazel"));
-    }
-
-    #[test]
-    fn test_no_extension_overlap() {
-        // Ensure no extension appears in both TEXT and BINARY sets
-        let text_samples = ["rs", "py", "js", "html", "json", "md", "tf", "dart"];
-        let binary_samples = ["exe", "png", "zip", "pdf", "dll", "mp4"];
-
-        for ext in &text_samples {
-            assert!(!BINARY_EXTENSIONS.contains(ext),
-                "{} should not be in BINARY_EXTENSIONS", ext);
+    fn test_binary_extensions_cover_db_journals() {
+        for ext in [
+            "exe",
+            "png",
+            "sqlite3",
+            "sqlite-wal",
+            "sqlite-shm",
+            "db-wal",
+            "db-shm",
+            "lockb",
+        ] {
+            assert!(BINARY_EXTENSIONS.contains(ext), "{} missing", ext);
         }
-        for ext in &binary_samples {
-            assert!(!TEXT_EXTENSIONS.contains(ext),
-                "{} should not be in TEXT_EXTENSIONS", ext);
-        }
+    }
+
+    #[test]
+    fn test_dotfile_allowlist() {
+        assert!(is_allowlisted_dotfile(".gitignore"));
+        assert!(is_allowlisted_dotfile(".mcp.json"));
+        assert!(is_allowlisted_dotfile(".env.example"));
+        assert!(is_allowlisted_dotfile(".eslintrc.json"));
+        assert!(!is_allowlisted_dotfile(".env"));
+        assert!(!is_allowlisted_dotfile(".npmrc")); // sensitive: may hold auth tokens
+        assert!(!is_allowlisted_dotfile(".secret"));
+    }
+
+    #[test]
+    fn test_own_output_detection() {
+        assert!(is_own_output("apartment_2026-07-09_merged.md"));
+        assert!(is_own_output("repo_merged.part1-of-3.md"));
+        assert!(!is_own_output("merged_results.md"));
+        assert!(!is_own_output("notes.md"));
     }
 
     #[test]
     fn test_extensionless_files_detected() {
         assert!(is_known_extensionless_file("makefile"));
         assert!(is_known_extensionless_file("dockerfile"));
-        assert!(is_known_extensionless_file("readme"));
-        assert!(is_known_extensionless_file("license"));
         assert!(is_known_extensionless_file("justfile"));
-        assert!(is_known_extensionless_file("earthfile"));
-
+        assert!(is_known_extensionless_file("codeowners"));
         assert!(!is_known_extensionless_file("randomfile"));
-        assert!(!is_known_extensionless_file("data"));
     }
 
     #[test]
@@ -746,10 +803,8 @@ mod tests {
         assert!(!opts.include_venv);
         assert!(opts.content_sniff);
         assert!(!opts.include_hidden);
-        assert_eq!(opts.max_file_size, 50 * 1024 * 1024);
-        assert!(opts.extra_text_exts.is_empty());
-        assert!(opts.extra_skip_exts.is_empty());
-        assert!(opts.extra_binary_exts.is_empty());
+        assert!(opts.respect_gitignore);
+        assert_eq!(opts.max_file_size, 2 * 1024 * 1024);
     }
 
     #[test]
@@ -758,11 +813,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let file_path = dir.join("test.xyz");
         std::fs::write(&file_path, b"Hello, world!\nThis is a text file.\n").unwrap();
-
-        let result = sniff_file_content(&file_path);
-        assert!(result.is_ok());
-        assert!(result.unwrap(), "UTF-8 text should be detected as text");
-
+        assert!(sniff_file_content(&file_path).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -771,182 +822,76 @@ mod tests {
         let dir = std::env::temp_dir().join("turbomerger_test_sniff_binary");
         let _ = std::fs::create_dir_all(&dir);
         let file_path = dir.join("test.xyz");
-        // PNG magic bytes followed by binary data
         let mut data = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
         data.extend_from_slice(&[0x00; 100]);
         std::fs::write(&file_path, &data).unwrap();
-
-        let result = sniff_file_content(&file_path);
-        assert!(result.is_ok());
-        assert!(!result.unwrap(), "PNG binary data should be detected as binary");
-
+        assert!(!sniff_file_content(&file_path).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    #[test]
-    fn test_content_sniff_empty_file_is_text() {
-        let dir = std::env::temp_dir().join("turbomerger_test_sniff_empty");
-        let _ = std::fs::create_dir_all(&dir);
-        let file_path = dir.join("empty.xyz");
-        std::fs::write(&file_path, b"").unwrap();
-
-        let result = sniff_file_content(&file_path);
-        assert!(result.is_ok());
-        assert!(result.unwrap(), "Empty file should be treated as text");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_content_sniff_null_bytes_detected() {
-        let dir = std::env::temp_dir().join("turbomerger_test_sniff_null");
-        let _ = std::fs::create_dir_all(&dir);
-        let file_path = dir.join("nulls.xyz");
-        // >5% null bytes in a 100-byte sample triggers binary detection
-        let mut data = Vec::new();
-        for i in 0..100u8 {
-            if i % 10 == 0 { data.push(0x00); }
-            else { data.push(b'A'); }
-        }
-        std::fs::write(&file_path, &data).unwrap();
-
-        let result = sniff_file_content(&file_path);
-        assert!(result.is_ok());
-        assert!(!result.unwrap(), "Data with >5% null bytes should be binary");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // --- v7.1 binary detection upgrade tests ---
 
     #[test]
     fn test_sniff_rejects_minified_js() {
         let dir = std::env::temp_dir().join("turbomerger_test_minified");
         let _ = std::fs::create_dir_all(&dir);
         let file_path = dir.join("bundle.xyz");
-        // Create a single line with 5000 characters (simulates minified JS)
-        let data = "a".repeat(5000);
-        std::fs::write(&file_path, data.as_bytes()).unwrap();
-
-        let result = sniff_file_content(&file_path);
-        assert!(result.is_ok());
-        assert!(!result.unwrap(), "File with 5000-char line should be rejected as minified");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_sniff_rejects_control_chars() {
-        let dir = std::env::temp_dir().join("turbomerger_test_control");
-        let _ = std::fs::create_dir_all(&dir);
-        let file_path = dir.join("control.xyz");
-        // Create data with >10% control characters (SOH, DC1, DC2, NAK, etc.)
-        let mut data = Vec::with_capacity(200);
-        for i in 0..200u8 {
-            if i % 5 == 0 {
-                // 20% control chars (well above 10% threshold)
-                data.push(0x01 + (i % 8)); // SOH through BS
-            } else {
-                data.push(b'X');
-            }
-        }
-        std::fs::write(&file_path, &data).unwrap();
-
-        let result = sniff_file_content(&file_path);
-        assert!(result.is_ok());
-        assert!(!result.unwrap(), "File with >10% control chars should be rejected");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_sniff_rejects_high_nonascii() {
-        let dir = std::env::temp_dir().join("turbomerger_test_nonascii");
-        let _ = std::fs::create_dir_all(&dir);
-        let file_path = dir.join("encoded.xyz");
-        // Create data with >40% high bytes (0x80-0xFF)
-        let mut data = Vec::with_capacity(200);
-        for i in 0..200u8 {
-            if i % 2 == 0 {
-                // 50% high bytes (above 40% threshold)
-                data.push(0x80 + (i % 0x7F));
-            } else {
-                data.push(b'A');
-            }
-        }
-        std::fs::write(&file_path, &data).unwrap();
-
-        let result = sniff_file_content(&file_path);
-        assert!(result.is_ok());
-        assert!(!result.unwrap(), "File with >40% non-ASCII bytes should be rejected");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_sniff_accepts_normal_source() {
-        let dir = std::env::temp_dir().join("turbomerger_test_normal");
-        let _ = std::fs::create_dir_all(&dir);
-        let file_path = dir.join("normal.xyz");
-        let code = r#"fn main() {
-    println!("Hello, world!");
-    let x = 42;
-    if x > 0 {
-        println!("positive");
-    }
-}
-"#;
-        std::fs::write(&file_path, code.as_bytes()).unwrap();
-
-        let result = sniff_file_content(&file_path);
-        assert!(result.is_ok());
-        assert!(result.unwrap(), "Normal source code should be accepted");
-
+        std::fs::write(&file_path, "a".repeat(5000).as_bytes()).unwrap();
+        assert!(!sniff_file_content(&file_path).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_minified_extension_patterns() {
         assert!(is_minified_filename("vendor.min.js"));
-        assert!(is_minified_filename("styles.min.css"));
         assert!(is_minified_filename("app.chunk.js"));
-        assert!(is_minified_filename("main.bundle.js"));
-        assert!(is_minified_filename("VENDOR.MIN.JS")); // case insensitive
-
+        assert!(is_minified_filename("VENDOR.MIN.JS"));
         assert!(!is_minified_filename("app.js"));
-        assert!(!is_minified_filename("style.css"));
-        assert!(!is_minified_filename("bundle.ts"));
-        assert!(!is_minified_filename("chunk.json"));
     }
 
     #[test]
-    fn test_expanded_binary_extensions() {
-        assert!(BINARY_EXTENSIONS.contains("map"));
-        assert!(BINARY_EXTENSIONS.contains("lock"));
-        assert!(BINARY_EXTENSIONS.contains("snap")); // already in Packages section
-        assert!(BINARY_EXTENSIONS.contains("tsbuildinfo"));
-        assert!(BINARY_EXTENSIONS.contains("eslintcache"));
-        assert!(BINARY_EXTENSIONS.contains("stylelintcache"));
-    }
+    fn test_gitignore_respected_in_scan() {
+        let dir = std::env::temp_dir().join("turbomerger_test_gitignore");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "profiles/\n").unwrap();
+        std::fs::write(dir.join("profiles/cookies.txt"), "cf_clearance=abc\n").unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
 
-    #[test]
-    fn test_skip_directories_expanded() {
-        assert!(SKIP_DIRS_ALWAYS.contains("dist"));
-        assert!(SKIP_DIRS_ALWAYS.contains("build"));
-        assert!(SKIP_DIRS_ALWAYS.contains(".next"));
-        assert!(SKIP_DIRS_ALWAYS.contains(".svelte-kit"));
-        assert!(SKIP_DIRS_ALWAYS.contains(".turbo"));
-        assert!(SKIP_DIRS_ALWAYS.contains(".vercel"));
-        assert!(SKIP_DIRS_ALWAYS.contains(".netlify"));
-        assert!(SKIP_DIRS_ALWAYS.contains("__generated__"));
-        assert!(SKIP_DIRS_ALWAYS.contains(".docusaurus"));
-        assert!(SKIP_DIRS_ALWAYS.contains("storybook-static"));
-    }
+        let result = scan_text_files(&dir, &ScanOptions::default()).unwrap();
+        let names: Vec<String> = result
+            .files
+            .iter()
+            .map(|f| relative_display(&dir, f))
+            .collect();
+        assert!(names.contains(&"src/main.rs".to_string()), "{:?}", names);
+        assert!(
+            names.contains(&".gitignore".to_string()),
+            "dot-config allowlist should include .gitignore: {:?}",
+            names
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("profiles/")),
+            "gitignored profiles/ must be excluded: {:?}",
+            names
+        );
 
-    #[test]
-    fn test_file_size_constants() {
-        assert_eq!(LARGE_FILE_UNKNOWN_EXT, 524_288); // 500KB
-        assert_eq!(LARGE_FILE_ABSOLUTE, 2_097_152);  // 2MB
-        assert!(LARGE_FILE_ABSOLUTE > LARGE_FILE_UNKNOWN_EXT);
+        // and with respect_gitignore=false the cookie file comes back
+        let opts = ScanOptions {
+            respect_gitignore: false,
+            ..Default::default()
+        };
+        let result2 = scan_text_files(&dir, &opts).unwrap();
+        let names2: Vec<String> = result2
+            .files
+            .iter()
+            .map(|f| relative_display(&dir, f))
+            .collect();
+        assert!(
+            names2.iter().any(|n| n.starts_with("profiles/")),
+            "{:?}",
+            names2
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

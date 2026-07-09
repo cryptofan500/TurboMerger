@@ -1,6 +1,6 @@
 [package]
 name = "turbomerger"
-version = "7.1.0"
+version = "7.2.0"
 description = "One-click codebase merger"
 authors = ["TurboMerger Contributors"]
 license = "MIT"
@@ -13,7 +13,6 @@ tauri-build = { version = "2", features = [] }
 # Tauri
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
-tauri-plugin-fs = "2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -26,9 +25,8 @@ anyhow = "1"
 # Parallelism
 rayon = "1.10"
 
-# File system
-jwalk = "0.8"
-memmap2 = "0.9"
+# File system — gitignore-aware walker (ripgrep's)
+ignore = "0.4"
 dirs = "5"
 open = "5"
 
@@ -36,13 +34,15 @@ open = "5"
 phf = { version = "0.11", features = ["macros"] }
 chrono = "0.4"
 
-# Security - TOCTOU prevention & secret detection
+# Security - path validation & secret detection
 unicode-normalization = "0.1"
 regex = "1"
-lazy_static = "1.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 panic = "abort"
