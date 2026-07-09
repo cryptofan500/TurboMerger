@@ -5,58 +5,16 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to release (e.g., 6.0.0)'
-        required: true
-        type: string
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      version: ${{ steps.get_version.outputs.version }}
-    steps:
-      - name: Get version
-        id: get_version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ steps.get_version.outputs.version }}
-          release_name: TurboMerger v${{ steps.get_version.outputs.version }}
-          draft: true
-          prerelease: false
-          body: |
-            ## TurboMerger v${{ steps.get_version.outputs.version }}
-
-            ### Changes
-            - See commits for details
-
-            ### Installation
-            Download the `.msi` installer or `.exe` setup for Windows 10/11 x64.
-
-            ### Requirements
-            - Windows 10 or Windows 11 (x64)
-            - WebView2 Runtime (included in Windows 11, auto-installed on Windows 10)
-
   build-windows:
-    name: Build Windows
-    needs: create-release
+    name: Build & Release Windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -64,7 +22,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Setup Rust
@@ -78,47 +36,24 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: Update version in Cargo.toml
-        run: |
-          $version = "${{ needs.create-release.outputs.version }}"
-          (Get-Content src-tauri/Cargo.toml) -replace 'version = ".*"', "version = `"$version`"" | Set-Content src-tauri/Cargo.toml
-
+      # Version comes from the repo (Cargo.toml / tauri.conf.json / package.json,
+      # bumped in a normal commit before tagging) — the workflow never rewrites it.
       - name: Build Tauri app
         run: npm run tauri build
 
-      - name: Upload MSI
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: src-tauri/target/release/bundle/msi/TurboMerger_${{ needs.create-release.outputs.version }}_x64_en-US.msi
-          asset_name: TurboMerger_${{ needs.create-release.outputs.version }}_x64.msi
-          asset_content_type: application/x-msi
-
-      - name: Upload NSIS installer
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: src-tauri/target/release/bundle/nsis/TurboMerger_${{ needs.create-release.outputs.version }}_x64-setup.exe
-          asset_name: TurboMerger_${{ needs.create-release.outputs.version }}_x64_setup.exe
-          asset_content_type: application/x-executable
-        continue-on-error: true
-
-      - name: Generate checksum
+      - name: Generate checksums
         run: |
-          $msiPath = "src-tauri/target/release/bundle/msi/TurboMerger_${{ needs.create-release.outputs.version }}_x64_en-US.msi"
-          $hash = Get-FileHash $msiPath -Algorithm SHA256
-          "$($hash.Hash)  TurboMerger_${{ needs.create-release.outputs.version }}_x64.msi" | Out-File -FilePath checksums.txt
+          Get-ChildItem src-tauri/target/release/bundle -Recurse -Include *.msi,*-setup.exe | ForEach-Object {
+            $h = Get-FileHash $_.FullName -Algorithm SHA256
+            "$($h.Hash)  $($_.Name)" | Out-File -FilePath checksums.txt -Append
+          }
 
-      - name: Upload checksums
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: checksums.txt
-          asset_name: checksums.txt
-          asset_content_type: text/plain
+          draft: true
+          generate_release_notes: true
+          files: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            checksums.txt
