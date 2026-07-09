@@ -78,6 +78,10 @@ pub struct MergeConfig {
     pub max_tokens: Option<usize>,
     pub remove_empty_lines: bool,
     pub truncate_base64: bool,
+    /// Elide function/method bodies via tree-sitter (signatures-only mode).
+    pub compress: bool,
+    /// Remove comments via tree-sitter.
+    pub strip_comments: bool,
 }
 
 impl Default for MergeConfig {
@@ -90,6 +94,8 @@ impl Default for MergeConfig {
             max_tokens: None,
             remove_empty_lines: false,
             truncate_base64: false,
+            compress: false,
+            strip_comments: false,
         }
     }
 }
@@ -100,6 +106,7 @@ pub struct MergeOutcome {
     pub files_processed: usize,
     pub files_skipped: usize,
     pub secrets_redacted: usize,
+    pub files_compressed: usize,
     pub tokens_o200k: usize,
     pub outputs: Vec<PathBuf>,
 }
@@ -111,6 +118,7 @@ struct Block {
     tokens: usize,
     utf8_note: Option<String>,
     redactions: Vec<(&'static str, usize)>,
+    compressed: bool,
 }
 
 /// (relative_path, reason) for a file dropped at merge time
@@ -182,6 +190,9 @@ where
         outcome.total_bytes += b.content.len();
         outcome.tokens_o200k += b.tokens;
         outcome.files_processed += 1;
+        if b.compressed {
+            outcome.files_compressed += 1;
+        }
         for (_, n) in &b.redactions {
             outcome.secrets_redacted += n;
         }
@@ -296,6 +307,29 @@ fn process_file(
         ));
     }
 
+    let lang = Path::new(&relative)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // Tree-sitter reductions (a failed parse keeps the original; redaction
+    // still runs on whatever survives). Comment strip must run BEFORE
+    // compression: elided bodies (`{ ... }`) are placeholders, not parseable
+    // source, so the reverse order can't re-parse.
+    let mut compressed = false;
+    if cfg.strip_comments {
+        if let Some(slim) = crate::compress::strip_comments(&content, &lang) {
+            content = slim;
+        }
+    }
+    if cfg.compress {
+        if let Some(slim) = crate::compress::compress_signatures(&content, &lang) {
+            content = slim;
+            compressed = true;
+        }
+    }
+
     if cfg.truncate_base64 {
         content = BASE64_RUN
             .replace_all(&content, "[base64 omitted]")
@@ -321,11 +355,6 @@ fn process_file(
     };
 
     let tokens = tokens::count(&content);
-    let lang = Path::new(&relative)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_string();
 
     Ok(Block {
         relative,
@@ -334,6 +363,7 @@ fn process_file(
         tokens,
         utf8_note,
         redactions,
+        compressed,
     })
 }
 
@@ -562,6 +592,13 @@ fn write_markdown_report<W: Write>(
     )?;
     if outcome.secrets_redacted > 0 {
         writeln!(w, "- Secrets redacted: {}", outcome.secrets_redacted)?;
+    }
+    if outcome.files_compressed > 0 {
+        writeln!(
+            w,
+            "- Compressed to signatures (function bodies elided): {} files",
+            outcome.files_compressed
+        )?;
     }
     let redactions: Vec<(&str, &str, usize)> = blocks
         .iter()

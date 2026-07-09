@@ -82,6 +82,12 @@ pub struct MergeOptions {
     pub remove_empty_lines: bool,
     #[serde(default)]
     pub truncate_base64: bool,
+    /// Signatures-only mode: elide function bodies via tree-sitter (T2-3).
+    #[serde(default)]
+    pub compress: bool,
+    /// Remove comments via tree-sitter (T2-4).
+    #[serde(default)]
+    pub strip_comments: bool,
     /// Exact relative paths to merge (curated in the file tree). None = all.
     #[serde(default)]
     pub selected_paths: Option<Vec<String>>,
@@ -163,6 +169,8 @@ fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         max_tokens: options.max_tokens.filter(|&t| t > 0),
         remove_empty_lines: options.remove_empty_lines,
         truncate_base64: options.truncate_base64,
+        compress: options.compress,
+        strip_comments: options.strip_comments,
     };
 
     Ok(ResolvedJob {
@@ -257,7 +265,7 @@ pub async fn scan_folder(app: AppHandle, options: MergeOptions) -> Result<ScanRe
                 .map(|bytes| crate::tokens::count(&String::from_utf8_lossy(&bytes)))
                 .unwrap_or(0);
             let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 32 == 0 || done == total {
+            if done.is_multiple_of(32) || done == total {
                 let _ = app.emit(
                     "scan-progress",
                     ProgressUpdate {
@@ -451,6 +459,8 @@ pub struct CliArgs {
     pub include_venv: bool,
     pub remove_empty_lines: bool,
     pub truncate_base64: bool,
+    pub compress: bool,
+    pub strip_comments: bool,
     pub include_globs: Vec<String>,
     pub exclude_globs: Vec<String>,
     pub quiet: bool,
@@ -475,6 +485,8 @@ impl CliArgs {
             include_venv: false,
             remove_empty_lines: false,
             truncate_base64: false,
+            compress: false,
+            strip_comments: false,
             include_globs: Vec::new(),
             exclude_globs: Vec::new(),
             quiet: false,
@@ -501,63 +513,19 @@ impl CliArgs {
                 "--include-venv" => a.include_venv = true,
                 "--remove-empty-lines" => a.remove_empty_lines = true,
                 "--truncate-base64" => a.truncate_base64 = true,
+                "--compress" => a.compress = true,
+                "--strip-comments" => a.strip_comments = true,
                 "--quiet" | "-q" => a.quiet = true,
                 other => positionals.push(other.to_string()),
             }
         }
         if positionals.is_empty() {
-            eprintln!("usage: turbomerger merge <src_dir> [out] [--format md|xml|cxml|json|plain] [--ordering path|entry-first|important-last] [--max-tokens N] [--include GLOB] [--exclude GLOB] [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--remove-empty-lines] [--truncate-base64]");
+            eprintln!("usage: turbomerger merge <src_dir> [out] [--format md|xml|cxml|json|plain] [--ordering path|entry-first|important-last] [--max-tokens N] [--include GLOB] [--exclude GLOB] [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--remove-empty-lines] [--truncate-base64] [--compress] [--strip-comments]");
             return Some(a); // src empty -> run_cli reports error
         }
         a.src = positionals[0].clone();
         a.out = positionals.get(1).cloned();
         Some(a)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn selection_filters_and_force_include_rescues() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
-        std::fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
-        std::fs::write(root.join("notes.txt"), "hello\n").unwrap();
-
-        let mut files = vec![root.join("a.rs"), root.join("b.rs")];
-        let mut skipped = vec![crate::scanner::SkipEntry {
-            path: "notes.txt".into(),
-            reason: "test skip".into(),
-        }];
-
-        // Force-include rescues the skipped file and clears its skip entry.
-        apply_selection(
-            &root,
-            &mut files,
-            &mut skipped,
-            &None,
-            &["notes.txt".to_string(), "../escape.txt".to_string()],
-        );
-        assert!(files.iter().any(|f| f.ends_with("notes.txt")));
-        assert!(skipped.is_empty());
-        assert_eq!(files.len(), 3, "path traversal must not add files");
-
-        // Selection keeps exactly the named subset.
-        apply_selection(
-            &root,
-            &mut files,
-            &mut skipped,
-            &Some(vec!["a.rs".to_string(), "notes.txt".to_string()]),
-            &[],
-        );
-        let rels: Vec<String> = files
-            .iter()
-            .map(|f| crate::scanner::relative_display(&root, f))
-            .collect();
-        assert_eq!(rels, vec!["a.rs", "notes.txt"]);
     }
 }
 
@@ -582,6 +550,8 @@ pub fn run_cli(a: CliArgs) -> i32 {
         exclude_globs: a.exclude_globs,
         remove_empty_lines: a.remove_empty_lines,
         truncate_base64: a.truncate_base64,
+        compress: a.compress,
+        strip_comments: a.strip_comments,
         selected_paths: None,
         force_include: Vec::new(),
     };
@@ -638,5 +608,51 @@ pub fn run_cli(a: CliArgs) -> i32 {
             eprintln!("merge failed: {}", e);
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_filters_and_force_include_rescues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
+        std::fs::write(root.join("notes.txt"), "hello\n").unwrap();
+
+        let mut files = vec![root.join("a.rs"), root.join("b.rs")];
+        let mut skipped = vec![crate::scanner::SkipEntry {
+            path: "notes.txt".into(),
+            reason: "test skip".into(),
+        }];
+
+        // Force-include rescues the skipped file and clears its skip entry.
+        apply_selection(
+            &root,
+            &mut files,
+            &mut skipped,
+            &None,
+            &["notes.txt".to_string(), "../escape.txt".to_string()],
+        );
+        assert!(files.iter().any(|f| f.ends_with("notes.txt")));
+        assert!(skipped.is_empty());
+        assert_eq!(files.len(), 3, "path traversal must not add files");
+
+        // Selection keeps exactly the named subset.
+        apply_selection(
+            &root,
+            &mut files,
+            &mut skipped,
+            &Some(vec!["a.rs".to_string(), "notes.txt".to_string()]),
+            &[],
+        );
+        let rels: Vec<String> = files
+            .iter()
+            .map(|f| crate::scanner::relative_display(&root, f))
+            .collect();
+        assert_eq!(rels, vec!["a.rs", "notes.txt"]);
     }
 }

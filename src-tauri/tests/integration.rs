@@ -369,3 +369,54 @@ fn formats_and_split_produce_valid_output() {
         "important-last should put README after src files"
     );
 }
+
+#[test]
+fn compress_elides_bodies_and_strip_removes_comments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cmp_repo");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "// top comment\npub fn add(a: i32, b: i32) -> i32 {\n    a + b // inline math\n}\n\npub struct Keep {\n    pub field: u32,\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/util.py"),
+        "# helper\ndef double(x):\n    return x * 2\n",
+    )
+    .unwrap();
+    // Unsupported language must pass through untouched.
+    fs::write(root.join("notes.md"), "# Notes\n\nplain prose\n").unwrap();
+
+    let scan = scan_text_files(&root, &ScanOptions::default()).unwrap();
+    let out = tmp.path().join("cmp.md");
+    let cancel = AtomicBool::new(false);
+    let cfg = MergeConfig {
+        compress: true,
+        strip_comments: true,
+        include_tree: false,
+        ..MergeConfig::default()
+    };
+    let outcome =
+        merge_files_with_progress(&root, &scan.files, &out, &cfg, &cancel, |_, _, _| {}, &[])
+            .unwrap();
+
+    let text = fs::read_to_string(&out).unwrap();
+    assert!(
+        text.contains("pub fn add(a: i32, b: i32) -> i32 { ... }"),
+        "rust body must be elided: {}",
+        text
+    );
+    assert!(!text.contains("a + b"), "rust body leaked");
+    assert!(text.contains("pub struct Keep"), "struct must survive");
+    assert!(text.contains("def double(x):\n    ..."), "python body must be elided");
+    assert!(!text.contains("x * 2"), "python body leaked");
+    assert!(!text.contains("top comment"), "rust comment must be stripped");
+    assert!(!text.contains("# helper"), "python comment must be stripped");
+    assert!(text.contains("plain prose"), "unsupported md must pass through");
+    assert_eq!(outcome.files_compressed, 2, "both code files compressed");
+    assert!(
+        text.contains("Compressed to signatures"),
+        "merge report must note compression"
+    );
+}

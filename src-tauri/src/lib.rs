@@ -1,4 +1,5 @@
 mod commands;
+pub mod compress;
 pub mod config;
 pub mod merger;
 pub mod scanner;
