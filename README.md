@@ -20,12 +20,25 @@ Gemini.
 - **Gitignore-aware scanning** — honors `.gitignore`, `.ignore`, `.git/info/exclude`, and
   a highest-precedence `.turbomergerignore` (via the `ignore` crate, ripgrep's walker).
   Works even outside a git repo. Toggle off if you want everything.
+- **Real token counting** — exact `o200k_base` (tiktoken) counts per file and per merge, a
+  Claude estimate, and a fit hint against GPT 128k / Claude 200k / Gemini 1M.
+- **Output formats** — Markdown, **Claude XML (cxml)**, XML, JSON, or Plain text.
+- **Token-budget splitting** — cap tokens and the output splits at file boundaries into
+  `…part1-of-N` files, each labelled "Part N/M".
+- **Ordering** — alphabetical, entry-points-first, or important-last (README/entry files at
+  the end, where LLMs weight context most).
+- **Include/exclude globs** — UI + `turbomerger.toml [filter]`; plus content slimming
+  (remove empty lines, truncate long base64 blobs). **Presets**: LLM-review-lean,
+  Claude-cxml, Full archive, Docs only.
 - **Secret redaction** — API keys, tokens, private keys, and DB connection strings
   (AWS, GitHub, GitLab, OpenAI, Anthropic, Google, Stripe, Slack, JWTs, …) are replaced
-  with `[REDACTED]` before writing, with an entropy gate + placeholder stopwords to avoid
-  false positives on ordinary code. On by default; counted in the report.
+  with `[REDACTED]` before writing (entropy gate + placeholder stopwords). Credential
+  *data files* and *credential-dense* files are excluded wholesale (see *Security*).
+  On by default; counted in the report.
 - **Nothing dropped silently** — every excluded file appears in the Merge Report with a
-  reason (binary, too large, gitignored, sensitive, unreadable, previous dump, …).
+  reason (binary, too large, gitignored, sensitive, credential-dense, unreadable, …).
+- **Headless CLI** — `turbomerger merge <src> [out] [--flags]` for scripting/CI; drag a
+  folder onto the window; settings persist; open-in-chat links.
 - **Sensible dotfile handling** — well-known config dotfiles (`.gitignore`, `.mcp.json`,
   `.github/`, `.env.example`, `.eslintrc*`, …) are included; sensitive ones (`.env`,
   `*.pem`, `id_rsa`) are excluded-with-reason. "Include hidden dotfiles" opts in to the rest.
@@ -106,7 +119,17 @@ Lock files, minified bundles, and previous TurboMerger outputs are skipped by na
   scan roots.
 - Sensitive files (`.env`, key/cert material, SSH keys, credential stores) are excluded and
   listed in the report.
-- Detected secrets are redacted from file contents before writing.
+- **Credential data files** (e.g. `*_CREDENTIALS_*.md`, `passwords.csv`, `vault.txt`,
+  `*.secrets.yaml`) and **credential-dense files** (content with multiple inline logins,
+  Google app-passwords, or key blocks) are excluded wholesale — never partially redacted.
+  Source files that merely mention the words (`password_reset.py`, `useApiKey.ts`) are not
+  affected.
+- Detected secrets are redacted from file contents before writing, including context-gated
+  Google app-passwords and `email:password` values.
+- **Limitation:** no redactor catches every credential embedded in free-form prose. Default
+  (gitignore-respecting) mode is safest — it prunes ignored credential docs entirely. The
+  **Full archive / `--no-gitignore`** mode deliberately includes everything and may surface
+  prose-embedded secrets; review the output before uploading.
 - Strict Content-Security-Policy on the WebView.
 
 ## Development

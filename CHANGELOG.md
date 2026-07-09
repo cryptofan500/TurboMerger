@@ -24,11 +24,19 @@ Feature release — token awareness, output formats, and curation controls.
 - **Quality-of-life**: drag-and-drop a folder onto the window; settings persist between
   runs; open-in-chat links (claude.ai / chatgpt.com / gemini); multi-part output list.
 
-### Hardened
+### Hardened (validated against a real credential-heavy repo, counts-only method)
 - **Credential data files** (the `<NAME>_CREDENTIALS_<UTC>.md` convention, `passwords.csv`,
-  `vault.txt`, `*.secrets.yaml`, …) are now excluded wholesale and listed in the report,
-  rather than relying on per-line redaction. Source files that merely mention the words
+  `vault.txt`, `*.secrets.yaml`, …) are excluded wholesale and listed in the report, rather
+  than relying on per-line redaction. Source files that merely mention the words
   (`password_reset.py`, `useApiKey.ts`) are unaffected.
+- **Credential-dense files** (≥2 inline-credential indicators — login tables, Google
+  app-passwords, key blocks) are excluded wholesale and reported.
+- **Contextual redaction** of Google app-passwords and `email:password` values on
+  credential-flavoured lines, leaving ordinary prose untouched.
+- Result: in default (gitignore-respecting) mode the tested credential repo produced **zero**
+  credential leaks (structured secrets, app-passwords, email:pass all zero). Free-form
+  prose-embedded secrets in explicit `--no-gitignore` archive mode remain a documented
+  limitation.
 
 ## [7.2.0] - 2026-07-09
 
