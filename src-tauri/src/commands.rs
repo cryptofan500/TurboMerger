@@ -82,6 +82,14 @@ pub struct MergeOptions {
     pub remove_empty_lines: bool,
     #[serde(default)]
     pub truncate_base64: bool,
+    /// Exact relative paths to merge (curated in the file tree). None = all.
+    #[serde(default)]
+    pub selected_paths: Option<Vec<String>>,
+    /// Relative paths rescued from scan-level skips ("include anyway").
+    /// Merge-level safety (binary check, credential-dense exclusion,
+    /// redaction) still applies to these.
+    #[serde(default)]
+    pub force_include: Vec<String>,
 }
 
 /// Everything needed to run a merge, resolved from UI options + config file.
@@ -165,6 +173,120 @@ fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
     })
 }
 
+/// Apply force-include rescues and the curated selection to a scan result.
+/// Force-included paths are validated to stay inside the root; selection is
+/// an exact relative-path filter.
+fn apply_selection(
+    root: &std::path::Path,
+    files: &mut Vec<PathBuf>,
+    skipped: &mut Vec<scanner::SkipEntry>,
+    selected_paths: &Option<Vec<String>>,
+    force_include: &[String],
+) {
+    for rel in force_include {
+        let candidate = root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let Ok(canon) = candidate.canonicalize() else {
+            continue;
+        };
+        // std canonicalize yields \\?\-prefixed paths on Windows; compare
+        // against the canonicalized root the same way.
+        let Ok(root_canon) = root.canonicalize() else {
+            continue;
+        };
+        if !canon.starts_with(&root_canon) || !candidate.is_file() {
+            continue;
+        }
+        if !files.contains(&candidate) {
+            files.push(candidate);
+            skipped.retain(|s| s.path != *rel);
+        }
+    }
+    if let Some(sel) = selected_paths {
+        let want: std::collections::HashSet<&str> = sel.iter().map(|s| s.as_str()).collect();
+        files.retain(|f| want.contains(scanner::relative_display(root, f).as_str()));
+    }
+    files.sort();
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScanEntry {
+    pub path: String,
+    pub size: u64,
+    pub tokens: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScanReport {
+    pub root: String,
+    pub included: Vec<ScanEntry>,
+    pub skipped: Vec<scanner::SkipEntry>,
+    pub total_tokens: usize,
+    pub duration_ms: u64,
+}
+
+/// Scan without merging: per-file sizes + o200k token counts feed the curate
+/// tree, the treemap, and the skip drill-in. Token counts are on raw content
+/// (pre-redaction/slimming) — close enough for curation.
+#[tauri::command]
+pub async fn scan_folder(app: AppHandle, options: MergeOptions) -> Result<ScanReport, String> {
+    let start = std::time::Instant::now();
+    let job = resolve_job(&options)?;
+
+    let _ = app.emit(
+        "scan-progress",
+        ProgressUpdate {
+            current: 0,
+            total: 0,
+            current_file: "Scanning directory...".to_string(),
+            percentage: 0.0,
+        },
+    );
+
+    let scan = scanner::scan_text_files(&job.root, &job.scan_options)
+        .map_err(|e| format!("Scan failed: {}", e))?;
+
+    use rayon::prelude::*;
+    let total = scan.files.len();
+    let counter = std::sync::atomic::AtomicUsize::new(0);
+    let mut included: Vec<ScanEntry> = scan
+        .files
+        .par_iter()
+        .map(|path| {
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let tokens = std::fs::read(path)
+                .map(|bytes| crate::tokens::count(&String::from_utf8_lossy(&bytes)))
+                .unwrap_or(0);
+            let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % 32 == 0 || done == total {
+                let _ = app.emit(
+                    "scan-progress",
+                    ProgressUpdate {
+                        current: done,
+                        total,
+                        current_file: scanner::relative_display(&job.root, path),
+                        percentage: (done as f32 / total as f32) * 100.0,
+                    },
+                );
+            }
+            ScanEntry {
+                path: scanner::relative_display(&job.root, path),
+                size,
+                tokens,
+            }
+        })
+        .collect();
+    included.sort_by(|a, b| a.path.cmp(&b.path));
+    let total_tokens = included.iter().map(|e| e.tokens).sum();
+
+    Ok(ScanReport {
+        root: job.root.to_string_lossy().to_string(),
+        included,
+        skipped: scan.skipped,
+        total_tokens,
+        duration_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
 #[tauri::command]
 pub fn get_downloads_path() -> Result<String, String> {
     dirs::download_dir()
@@ -220,8 +342,15 @@ pub async fn merge_folder(
     let scan = scanner::scan_text_files(&job.root, &job.scan_options)
         .map_err(|e| format!("Scan failed: {}", e))?;
     let scan_stats = scan.stats;
-    let scan_skips = scan.skipped;
-    let files = scan.files;
+    let mut scan_skips = scan.skipped;
+    let mut files = scan.files;
+    apply_selection(
+        &job.root,
+        &mut files,
+        &mut scan_skips,
+        &options.selected_paths,
+        &options.force_include,
+    );
     if files.is_empty() {
         return Err("No text files found in directory".to_string());
     }
@@ -386,6 +515,52 @@ impl CliArgs {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_filters_and_force_include_rescues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
+        std::fs::write(root.join("notes.txt"), "hello\n").unwrap();
+
+        let mut files = vec![root.join("a.rs"), root.join("b.rs")];
+        let mut skipped = vec![crate::scanner::SkipEntry {
+            path: "notes.txt".into(),
+            reason: "test skip".into(),
+        }];
+
+        // Force-include rescues the skipped file and clears its skip entry.
+        apply_selection(
+            &root,
+            &mut files,
+            &mut skipped,
+            &None,
+            &["notes.txt".to_string(), "../escape.txt".to_string()],
+        );
+        assert!(files.iter().any(|f| f.ends_with("notes.txt")));
+        assert!(skipped.is_empty());
+        assert_eq!(files.len(), 3, "path traversal must not add files");
+
+        // Selection keeps exactly the named subset.
+        apply_selection(
+            &root,
+            &mut files,
+            &mut skipped,
+            &Some(vec!["a.rs".to_string(), "notes.txt".to_string()]),
+            &[],
+        );
+        let rels: Vec<String> = files
+            .iter()
+            .map(|f| crate::scanner::relative_display(&root, f))
+            .collect();
+        assert_eq!(rels, vec!["a.rs", "notes.txt"]);
+    }
+}
+
 /// Run a headless merge. Returns process exit code.
 pub fn run_cli(a: CliArgs) -> i32 {
     if a.src.is_empty() {
@@ -407,6 +582,8 @@ pub fn run_cli(a: CliArgs) -> i32 {
         exclude_globs: a.exclude_globs,
         remove_empty_lines: a.remove_empty_lines,
         truncate_base64: a.truncate_base64,
+        selected_paths: None,
+        force_include: Vec::new(),
     };
 
     let job = match resolve_job(&options) {

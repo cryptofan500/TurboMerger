@@ -16,6 +16,7 @@ pub fn run() {
         .manage(Mutex::new(commands::AppState::default()))
         .invoke_handler(tauri::generate_handler![
             commands::merge_folder,
+            commands::scan_folder,
             commands::cancel_merge,
             commands::reset_cancel,
             commands::get_downloads_path,

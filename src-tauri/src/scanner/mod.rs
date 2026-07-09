@@ -446,7 +446,8 @@ fn sniff_file_content(path: &Path) -> Result<bool> {
 // WALK FILTTERING + CLASSIFICATION
 // ============================================================================
 
-fn relative_display(root: &Path, path: &Path) -> String {
+/// Root-relative display path with forward slashes (shared across modules).
+pub fn relative_display(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
