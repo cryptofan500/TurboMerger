@@ -296,6 +296,20 @@ fn process_file(
         }
     };
 
+    // Whole-file exclusion for credential-dense content (inline login tables,
+    // Google app-passwords, key blocks) that per-line redaction can't fully
+    // scrub. Checked on the raw decoded text, before any slimming/redaction.
+    let cred_count = crate::security::credential_indicator_count(&content);
+    if cred_count >= crate::security::CREDENTIAL_DENSITY_THRESHOLD {
+        return Err((
+            relative,
+            format!(
+                "credential-dense content ({} inline credentials) — excluded",
+                cred_count
+            ),
+        ));
+    }
+
     if cfg.truncate_base64 {
         content = BASE64_RUN
             .replace_all(&content, "[base64 omitted]")

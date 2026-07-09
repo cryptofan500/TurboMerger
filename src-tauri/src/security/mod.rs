@@ -549,8 +549,132 @@ pub fn redact_secrets(content: &str) -> (String, Vec<RedactionEvent>) {
         }
     }
 
+    // Contextual pass: redact Google app-password quads and email:password
+    // values on credential-flavoured lines AND the couple of lines following a
+    // credential label ("Gmail app password:\n abcd efgh ijkl mnop"). The window
+    // gate keeps ordinary prose (four short words in a row) intact while still
+    // catching label-then-value layouts. Placeholder lines are skipped.
+    let mut ctx_count = 0usize;
+    let mut rebuilt = String::with_capacity(text.len());
+    let mut window = 0u8;
+    for seg in text.split_inclusive('\n') {
+        let lower = seg.to_ascii_lowercase();
+        let has_kw = [
+            "password",
+            "passcode",
+            "gmail",
+            "login",
+            "app pw",
+            "app-pw",
+            "credential",
+            "api key",
+            "apikey",
+            "api-key",
+        ]
+        .iter()
+        .any(|k| lower.contains(k));
+        if has_kw {
+            window = 3; // this line + next 2
+        }
+        let placeholder = SECRET_STOPWORDS.iter().any(|w| lower.contains(w));
+        if window > 0 && !placeholder {
+            let mut line = seg.to_string();
+            let q = APP_PW_RE.find_iter(&line).count();
+            if q > 0 {
+                line = APP_PW_RE.replace_all(&line, "[REDACTED]").into_owned();
+                ctx_count += q;
+            }
+            let before = line.clone();
+            line = EMAIL_PASS_VALUE_RE
+                .replace_all(&line, "$email[REDACTED]")
+                .into_owned();
+            if line != before {
+                ctx_count += 1;
+            }
+            rebuilt.push_str(&line);
+        } else {
+            rebuilt.push_str(seg);
+        }
+        window = window.saturating_sub(1);
+    }
+    text = rebuilt;
+    if ctx_count > 0 {
+        events.push(RedactionEvent {
+            rule: "Contextual credential (app-pw / email:pass)",
+            count: ctx_count,
+        });
+    }
+
     (text, events)
 }
+
+static EMAIL_PASS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\s*[:|]\s*\S{6,}").unwrap()
+});
+/// Captures the email+separator as `email` so the value after it can be redacted.
+static EMAIL_PASS_VALUE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?P<email>[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\s*[:|]\s*)\S{6,}").unwrap()
+});
+static APP_PW_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[a-z]{4}\s[a-z]{4}\s[a-z]{4}\s[a-z]{4}\b").unwrap());
+static PASS_ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(password|passwd|pwd|api[_-]?key|secret)\b\s*[:=|]\s*\S{8,}").unwrap()
+});
+static PRIVKEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"-----BEGIN [A-Z ]{0,20}PRIVATE KEY").unwrap());
+
+/// Count strong inline-credential indicators in `content`. Used to exclude
+/// credential-dense DATA files wholesale (markdown tables of logins, Google
+/// app-passwords, etc.) that per-line token redaction can't catch. Placeholder/
+/// example lines are ignored to spare tutorials and test fixtures.
+pub fn credential_indicator_count(content: &str) -> usize {
+    let mut n = PRIVKEY_RE.find_iter(content).count();
+    // File-level credential context: in a file that is clearly about
+    // logins/passwords, app-password quads anywhere count (they slip per-line
+    // gating when the label sits a few lines above the value). Excluding such a
+    // file wholesale is the safe call — it is reported and can be re-included.
+    let lower_all = content.to_ascii_lowercase();
+    let file_ctx = [
+        "password",
+        "credential",
+        "gmail",
+        " login",
+        "app password",
+        "app-password",
+        "2fa",
+        "authenticator",
+        "recovery code",
+        "backup code",
+    ]
+    .iter()
+    .any(|k| lower_all.contains(k));
+    for line in content.lines() {
+        let lower = line.to_ascii_lowercase();
+        if SECRET_STOPWORDS.iter().any(|w| lower.contains(w)) {
+            continue;
+        }
+        if EMAIL_PASS_RE.is_match(line) {
+            n += 1;
+            continue;
+        }
+        let line_ctx = lower.contains("password")
+            || lower.contains("app pw")
+            || lower.contains("app-pw")
+            || lower.contains("gmail")
+            || lower.contains("login");
+        if (line_ctx || file_ctx) && APP_PW_RE.is_match(line) {
+            n += 1;
+            continue;
+        }
+        if PASS_ASSIGN_RE.is_match(line) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Files with at least this many inline-credential indicators are excluded whole.
+pub const CREDENTIAL_DENSITY_THRESHOLD: usize = 2;
 
 /// Shannon entropy (bits per character)
 pub fn calculate_entropy(data: &str) -> f64 {
@@ -699,5 +823,44 @@ mod tests {
     fn entropy_sane() {
         assert!(calculate_entropy("aaaaaaaaaa") < 1.0);
         assert!(calculate_entropy("k9X!qPz$7Lm@2Wv#") > 3.5);
+    }
+
+    #[test]
+    fn contextual_redaction_catches_labelled_app_password() {
+        // Label on one line, the app-password quad on the next.
+        let input = "Gmail app password:\nabcd efgh ijkl mnop\ndone\n";
+        let (out, _) = redact_secrets(input);
+        assert!(
+            !out.contains("abcd efgh ijkl mnop"),
+            "app password leaked: {}",
+            out
+        );
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn contextual_redaction_spares_ordinary_prose() {
+        // No credential context anywhere -> four short words survive verbatim.
+        let input = "when will they come home\nthey will stay here alone\n";
+        let (out, _) = redact_secrets(input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn credential_density_flags_inline_dumps() {
+        let dump = "\
+Gmail: alice@example.org | Sup3rSecretPw!\n\
+Bob login bob@work.co : hunter2xyz\n\
+app password: abcd efgh ijkl mnop\n";
+        assert!(credential_indicator_count(dump) >= CREDENTIAL_DENSITY_THRESHOLD);
+
+        // ordinary prose / a single documented example must not trip it
+        let doc = "Contact us at hello@example.com for support.\nSet your password in Settings.\n";
+        assert!(credential_indicator_count(doc) < CREDENTIAL_DENSITY_THRESHOLD);
+
+        // an app-password quad with NO credential context is not counted
+        // (avoids matching e.g. four consecutive four-letter English words)
+        let prose = "when will they come back home\nthey will stay here with them\n";
+        assert_eq!(credential_indicator_count(prose), 0);
     }
 }
