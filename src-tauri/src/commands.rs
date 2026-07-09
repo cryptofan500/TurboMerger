@@ -349,14 +349,57 @@ pub async fn merge_folder(
     state: State<'_, Mutex<AppState>>,
     options: MergeOptions,
 ) -> Result<MergeResult, String> {
-    let start = std::time::Instant::now();
-    let job = resolve_job(&options)?;
+    let cancel_flag = {
+        let state = state.lock().map_err(|e| e.to_string())?;
+        state.cancel_flag.clone()
+    };
+    cancel_flag.store(false, Ordering::Relaxed);
+    do_merge(&app, &cancel_flag, &options)
+}
+
+/// Pack a remote repo: shallow-clone (temp, self-cleaning) then run the
+/// normal merge pipeline over the checkout. `pat` stays in memory only.
+#[tauri::command]
+pub async fn pack_remote(
+    app: AppHandle,
+    state: State<'_, Mutex<AppState>>,
+    url: String,
+    pat: Option<String>,
+    options: MergeOptions,
+) -> Result<MergeResult, String> {
+    let (clone_url, name) = crate::remote::parse_remote(&url)
+        .ok_or("Not a recognizable repo reference (URL or owner/repo)")?;
+    let _ = app.emit(
+        "merge-progress",
+        ProgressUpdate {
+            current: 0,
+            total: 0,
+            current_file: format!("Cloning {} (shallow)...", clone_url),
+            percentage: 0.0,
+        },
+    );
+    let checkout = crate::remote::clone_shallow(&clone_url, &name, pat.as_deref())?;
 
     let cancel_flag = {
         let state = state.lock().map_err(|e| e.to_string())?;
         state.cancel_flag.clone()
     };
     cancel_flag.store(false, Ordering::Relaxed);
+
+    let mut opts = options;
+    opts.folder_path = checkout.path.to_string_lossy().to_string();
+    do_merge(&app, &cancel_flag, &opts)
+    // checkout drops here: temp clone deleted.
+}
+
+/// The shared merge core: scan → curate → merge with progress events.
+fn do_merge(
+    app: &AppHandle,
+    cancel_flag: &std::sync::atomic::AtomicBool,
+    options: &MergeOptions,
+) -> Result<MergeResult, String> {
+    let start = std::time::Instant::now();
+    let job = resolve_job(options)?;
 
     let _ = app.emit(
         "merge-progress",
@@ -392,7 +435,7 @@ pub async fn merge_folder(
         &files,
         &job.output_path,
         &cfg,
-        &cancel_flag,
+        cancel_flag,
         |current, total, file_name| {
             let _ = app.emit(
                 "merge-progress",
@@ -784,8 +827,15 @@ pub fn run_map_cli(a: MapArgs) -> i32 {
     if a.src.is_empty() {
         return 2;
     }
+    let (src_root, _checkout) = match resolve_cli_source(&a.src) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
     let options = MergeOptions {
-        folder_path: a.src,
+        folder_path: src_root,
         output_path: None,
         include_venv: a.include_venv,
         include_tree: false,
@@ -835,13 +885,37 @@ pub fn run_map_cli(a: MapArgs) -> i32 {
     0
 }
 
+/// Resolve a CLI source: an existing local path passes through; otherwise a
+/// remote-looking ref is shallow-cloned (PAT via TURBOMERGER_PAT env, never
+/// argv). Returns (root_path, checkout guard to keep alive).
+fn resolve_cli_source(src: &str) -> Result<(String, Option<crate::remote::RemoteCheckout>), String> {
+    if std::path::Path::new(src).exists() {
+        return Ok((src.to_string(), None));
+    }
+    if let Some((url, name)) = crate::remote::parse_remote(src) {
+        let pat = std::env::var("TURBOMERGER_PAT").ok();
+        eprintln!("cloning {} (shallow)...", url);
+        let co = crate::remote::clone_shallow(&url, &name, pat.as_deref())?;
+        let path = co.path.to_string_lossy().to_string();
+        return Ok((path, Some(co)));
+    }
+    Err(format!("source not found: {}", src))
+}
+
 /// Run a headless merge. Returns process exit code.
 pub fn run_cli(a: CliArgs) -> i32 {
     if a.src.is_empty() {
         return 2;
     }
+    let (src_root, _checkout) = match resolve_cli_source(&a.src) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
     let options = MergeOptions {
-        folder_path: a.src,
+        folder_path: src_root,
         output_path: a.out,
         include_venv: a.include_venv,
         include_tree: true,

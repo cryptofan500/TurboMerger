@@ -2,6 +2,7 @@ mod commands;
 pub mod compress;
 pub mod config;
 pub mod merger;
+pub mod remote;
 pub mod repomap;
 pub mod scanner;
 pub mod security;
@@ -19,6 +20,7 @@ pub fn run() {
         .manage(Mutex::new(commands::WatchState::default()))
         .invoke_handler(tauri::generate_handler![
             commands::merge_folder,
+            commands::pack_remote,
             commands::scan_folder,
             commands::repo_map,
             commands::start_watch,

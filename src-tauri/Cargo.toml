@@ -53,6 +53,8 @@ notify = "8.2.0"
 notify-debouncer-mini = "0.7.0"
 encoding_rs = "0.8.35"
 chardetng = "1.0.0"
+# Remote repo packing (T2-8): shallow clones land in a self-cleaning tempdir
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
