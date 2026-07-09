@@ -35,11 +35,24 @@ phf = { version = "0.11", features = ["macros"] }
 chrono = "0.4"
 
 # Token counting (o200k_base / cl100k_base)
-tiktoken-rs = "0.6"
+tiktoken-rs = "0.12"
 
 # Security - path validation & secret detection
 unicode-normalization = "0.1"
 regex = "1"
+tree-sitter = "0.26.10"
+tree-sitter-rust = "0.24.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+notify = "8.2.0"
+notify-debouncer-mini = "0.7.0"
+encoding_rs = "0.8.35"
+chardetng = "1.0.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
