@@ -520,6 +520,187 @@ fn skill_generation_writes_skill_md_only_when_asked() {
 }
 
 #[test]
+fn known_secrets_propagate_to_unlabeled_prose() {
+    // The leak class a differential source-vs-output test found on a real
+    // credential-heavy repo (2026-07-10): a credential FILE is excluded, but
+    // prose elsewhere echoes its values without any label. Harvest+propagate
+    // must scrub every echo.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("prop_repo");
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Opaque fakes (no real-provider prefix, an embedded hyphen so they can't
+    // match the 40-char AWS-secret shape) that still pass the secret gate:
+    // letters+digits, length, a special char.
+    let secret = "Vr7wKp2walKotwica91";
+    let grammarless = "svcKey-Zx9Kq2Mv7Rt4Lp8Wb";
+    // Credential-dense file (labeled values + app password context) — excluded.
+    // One value sits behind grammar no labeled rule parses (dense-token path).
+    fs::write(
+        root.join("logins.md"),
+        format!(
+            "# logins\n\npassword: {}\nzbig77@wp-post.org:Tr4mwaj9Nocny88\ngmail app password: zkvw qhnd bxrp mtjs\nRENDER api (dashboard -> settings) {}\n",
+            secret, grammarless
+        ),
+    )
+    .unwrap();
+    // Prose files echo the password with NO label on the line.
+    fs::write(
+        root.join("CHANGELOG.md"),
+        format!(
+            "## 2026-07-03\n\nRotated the vault entry to {} after the incident.\nRender key {} still active.\n",
+            secret, grammarless
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/seed.js"),
+        format!("await page.fill('#pw', '{}');\nconsole.log('seeded');\n", secret),
+    )
+    .unwrap();
+
+    let scan = scan_text_files(&root, &ScanOptions::default()).unwrap();
+    let out = tmp.path().join("prop_out.md");
+    let cancel = AtomicBool::new(false);
+    let outcome = merge_files_with_progress(
+        &root,
+        &scan.files,
+        &out,
+        &md_cfg(),
+        &cancel,
+        |_, _, _| {},
+        &scan.skipped,
+    )
+    .unwrap();
+
+    let text = fs::read_to_string(&out).unwrap();
+    assert!(
+        !text.contains(secret),
+        "unlabeled echo of a known secret leaked into the output"
+    );
+    assert!(
+        !text.contains(grammarless),
+        "dense-file token echo leaked into the output"
+    );
+    assert!(text.contains("Rotated the vault entry to [REDACTED]"));
+    assert!(text.contains("'[REDACTED]'"), "code echo must be scrubbed too");
+    assert!(text.contains("console.log('seeded')"), "non-secret code intact");
+    assert!(
+        text.contains("credential-dense"),
+        "the source credential file itself is excluded with a reason"
+    );
+    assert!(
+        text.contains("Propagated known secret"),
+        "merge report names the propagation rule"
+    );
+    assert!(outcome.secrets_redacted >= 2);
+}
+
+#[test]
+fn scanner_excluded_credential_file_still_scrubs_its_echoes() {
+    // A `*_CREDENTIALS_*.md` file is excluded by the scanner's sensitive-name
+    // rule (the merger never reads it as a section). Its values are echoed —
+    // unlabeled — in a merged session note. The merger must still harvest the
+    // credential file and scrub those echoes. (The exact SSM_support leak
+    // class found 2026-07-10.)
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cred_repo");
+    fs::create_dir_all(&root).unwrap();
+    let access_token = "Zx9Kq2Mv-Rt4Lp8Wb-3nYc6dHf-1gJ2kL5mN";
+    let service_id = "9f8e7d6c-5b4a-3210-fedc-ba9876543210";
+    fs::write(
+        root.join("MASTER_CREDENTIALS_2026-07-03T1950Z.md"),
+        format!(
+            "# creds\n\nSUPABASE_ACCESS_TOKEN={}\nservice id: `{}`\n",
+            access_token, service_id
+        ),
+    )
+    .unwrap();
+    // Merged files that echo those values without a usable label.
+    fs::write(
+        root.join("SESSION_NOTES.md"),
+        format!(
+            "## notes\n\nSwapped to {} for the deploy; the id {} is stale now.\n",
+            access_token, service_id
+        ),
+    )
+    .unwrap();
+
+    let scan = scan_text_files(&root, &ScanOptions::default()).unwrap();
+    // The credential file is scanner-excluded.
+    assert!(
+        scan.skipped.iter().any(|s| s.path.contains("MASTER_CREDENTIALS")
+            && s.reason.contains("credential")),
+        "credential file must be scanner-excluded: {:?}",
+        scan.skipped
+    );
+    let out = tmp.path().join("cred_out.md");
+    let cancel = AtomicBool::new(false);
+    merge_files_with_progress(
+        &root,
+        &scan.files,
+        &out,
+        &md_cfg(),
+        &cancel,
+        |_, _, _| {},
+        &scan.skipped,
+    )
+    .unwrap();
+    let text = fs::read_to_string(&out).unwrap();
+    assert!(!text.contains(access_token), "access token echo leaked: {}", &text[..200.min(text.len())]);
+    assert!(!text.contains(service_id), "service id echo leaked");
+    assert!(text.contains("Swapped to [REDACTED] for the deploy"));
+}
+
+#[test]
+fn gitignored_credential_file_still_scrubs_its_echoes() {
+    // The real SSM_support leak class (2026-07-10): the credential file is
+    // GITIGNORED, so the gitignore-aware scan prunes it silently — it's not
+    // merged and not even in the skip list. Its values still echo, unlabeled,
+    // in merged notes. The harvest pass reads credential files regardless of
+    // gitignore (harvest-only) so those echoes are scrubbed anyway.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("gi_repo");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join(".gitignore"), "MASTER_CREDENTIALS_*.md\n*.env\n").unwrap();
+    let token = "Qm2Zx9Rt-Lp8Wb3nY-c6dHf1gJ-2kL5mN8pR";
+    fs::write(
+        root.join("MASTER_CREDENTIALS_2026-07-03T1950Z.md"),
+        format!("# creds\n\nSUPABASE_ACCESS_TOKEN={}\n", token),
+    )
+    .unwrap();
+    fs::write(
+        root.join("NOTES.md"),
+        format!("## log\n\nDeploy used {} last night.\n", token),
+    )
+    .unwrap();
+
+    let scan = scan_text_files(&root, &ScanOptions::default()).unwrap();
+    // Gitignored: neither merged nor even recorded as a skip.
+    let names: Vec<String> = rel_names(&root, &scan.files);
+    assert!(
+        !names.iter().any(|n| n.contains("MASTER_CREDENTIALS")),
+        "gitignored credential file must not be scanned"
+    );
+    let out = tmp.path().join("gi_out.md");
+    let cancel = AtomicBool::new(false);
+    merge_files_with_progress(
+        &root,
+        &scan.files,
+        &out,
+        &md_cfg(),
+        &cancel,
+        |_, _, _| {},
+        &scan.skipped,
+    )
+    .unwrap();
+    let text = fs::read_to_string(&out).unwrap();
+    assert!(!text.contains(token), "gitignored credential value leaked via echo");
+    assert!(text.contains("Deploy used [REDACTED] last night"));
+    // The credential file's own content is never in the output.
+    assert!(!text.contains("## MASTER_CREDENTIALS_2026-07-03T1950Z.md"));
+}
+
+#[test]
 fn compress_elides_bodies_and_strip_removes_comments() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("cmp_repo");

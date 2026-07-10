@@ -184,6 +184,8 @@ static SKIP_DIRS_ALWAYS: phf::Set<&'static str> = phf_set! {
     ".terraform", ".serverless",
     // Credential directories
     ".ssh", ".aws", ".gnupg",
+    // TurboMerger's own apply-back backups (T3-3)
+    ".turbomerger",
 };
 
 /// Python venv directories - only skipped when include_venv=false
@@ -599,6 +601,82 @@ fn classify(path: &Path, len: u64, options: &ScanOptions) -> Verdict {
 }
 
 // ============================================================================
+// CREDENTIAL FILE DISCOVERY (harvest-only)
+// ============================================================================
+
+/// Find credential-store DOCUMENT files by name, **ignoring .gitignore** —
+/// credential files (`MASTER_CREDENTIALS_*.md`, `.env`, `credentials.json`)
+/// are almost always gitignored, so the normal scan never sees them. The
+/// merger reads these *harvest-only* (to redact their values from prose
+/// echoes elsewhere) and NEVER merges their content. Key/cert/SSH material is
+/// excluded — a private-key body doesn't echo as prose and would add noise.
+/// Bounded to a modest size; always-skip dirs are still pruned for speed.
+pub fn find_credential_files(root: &Path) -> Vec<PathBuf> {
+    const HARVEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .follow_links(false)
+        .hidden(false)
+        .require_git(false)
+        .git_ignore(false) // the whole point: see gitignored credential files
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
+        .git_global(false);
+    builder.filter_entry(|entry| {
+        if entry.depth() == 0 {
+            return true;
+        }
+        if entry.path_is_symlink() {
+            return false;
+        }
+        let name_lower = entry.file_name().to_string_lossy().to_lowercase();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            #[cfg(windows)]
+            if let Ok(meta) = entry.metadata() {
+                if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return false;
+                }
+            }
+            // Prune noise dirs and venvs; keep everything else, dotdirs included.
+            return !SKIP_DIRS_ALWAYS.contains(name_lower.as_str())
+                && !is_venv_by_name(&name_lower);
+        }
+        true
+    });
+
+    let mut out = Vec::new();
+    for result in builder.build() {
+        let Ok(entry) = result else { continue };
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        // Only credential DOCUMENTS whose values plausibly echo as text.
+        let harvestable = match crate::security::sensitive_reason(path) {
+            Some(r) => {
+                r.starts_with("env file")
+                    || r == "credential store"
+                    || r == "credential/secret data file"
+            }
+            None => false,
+        };
+        if !harvestable {
+            continue;
+        }
+        if entry
+            .metadata()
+            .map(|m| m.is_file() && m.len() <= HARVEST_MAX_BYTES)
+            .unwrap_or(false)
+        {
+            out.push(path.to_path_buf());
+        }
+    }
+    out
+}
+
+// ============================================================================
 // MAIN SCANNER
 // ============================================================================
 
@@ -795,6 +873,7 @@ mod tests {
         assert!(SKIP_DIRS_ALWAYS.contains("node_modules"));
         assert!(SKIP_DIRS_ALWAYS.contains(".git"));
         assert!(SKIP_DIRS_ALWAYS.contains(".ssh"));
+        assert!(SKIP_DIRS_ALWAYS.contains(".turbomerger"));
         assert!(SKIP_DIRS_VENV.contains("venv"));
         assert!(!SKIP_DIRS_ALWAYS.contains("venv"));
     }

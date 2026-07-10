@@ -137,6 +137,14 @@ struct Block {
 
 /// (relative_path, reason) for a file dropped at merge time
 type MergeSkip = (String, String);
+/// A processed file plus harvested secrets: `.1` = labeled values (high
+/// confidence, propagate unconditionally), `.2` = whole-file opaque tokens
+/// from a credential-dense exclusion (propagate behind a frequency guard).
+type ProcessedFile = (std::result::Result<Block, MergeSkip>, Vec<String>, Vec<String>);
+
+/// A dense-file token seen in more than this many blocks is a common term
+/// (project name, hostname), not a secret — the frequency guard drops it.
+const DENSE_TOKEN_MAX_BLOCKS: usize = 8;
 
 static BASE64_RUN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z0-9+/]{200,}={0,2}").expect("base64 run regex"));
@@ -166,21 +174,30 @@ where
     let mut merge_skips: Vec<SkipEntry> = Vec::new();
     let mut done = 0usize;
 
+    // Labeled secret values harvested from every read file — INCLUDING
+    // credential-dense files that are then excluded — for repo-wide
+    // propagation after processing. Dense-file opaque tokens ride separately
+    // (they face a frequency guard first).
+    let mut known_secrets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dense_candidates: Vec<String> = Vec::new();
+
     'outer: for chunk in ordered.chunks(CHUNK) {
         if cancel_flag.load(AtomicOrd::Relaxed) {
             break;
         }
-        let mut processed: Vec<(usize, std::result::Result<Block, MergeSkip>)> = chunk
+        let mut processed: Vec<(usize, ProcessedFile)> = chunk
             .par_iter()
             .enumerate()
             .map(|(i, path)| (i, process_file(path, root, cfg)))
             .collect();
         processed.sort_by_key(|(i, _)| *i);
 
-        for (_, res) in processed {
+        for (_, (res, harvested, dense)) in processed {
             if cancel_flag.load(AtomicOrd::Relaxed) {
                 break 'outer;
             }
+            known_secrets.extend(harvested);
+            dense_candidates.extend(dense);
             done += 1;
             match res {
                 Ok(b) => {
@@ -195,10 +212,59 @@ where
         }
     }
 
+    // Harvest secrets from credential files the merge never includes —
+    // `.env`, `MASTER_CREDENTIALS_*.md`, credential stores — INCLUDING
+    // gitignored ones (they almost always are, so the scan never yields
+    // them). Their values echo in prose elsewhere (session notes,
+    // changelogs); harvesting lets the propagation pass scrub those echoes.
+    // Harvest-only: content is read, secrets extracted, content dropped —
+    // the credential file itself is never merged.
+    if cfg.redact && !cancel_flag.load(AtomicOrd::Relaxed) {
+        harvest_from_credential_files(root, &mut known_secrets, &mut dense_candidates);
+    }
+
     // Git context rides at the very end (LLMs weight the end of context;
     // "review my change" wants the diff last).
     if !cancel_flag.load(AtomicOrd::Relaxed) && (cfg.git_diff || cfg.git_log > 0) {
         blocks.extend(git_context_blocks(root, cfg, &mut merge_skips));
+    }
+
+    // Frequency guard for dense-file tokens: a real secret echoes in a couple
+    // of places; a token in many blocks is a name/host and must not be
+    // propagated (it would shred the whole merge).
+    if cfg.redact {
+        for t in dense_candidates {
+            if known_secrets.contains(&t) {
+                continue;
+            }
+            let n_blocks = blocks
+                .iter()
+                .filter(|b| b.content.contains(t.as_str()))
+                .count();
+            if n_blocks > 0 && n_blocks <= DENSE_TOKEN_MAX_BLOCKS {
+                known_secrets.insert(t);
+            }
+        }
+    }
+
+    // Repo-wide known-secret propagation: a value that was LABELED a secret
+    // anywhere (even in an excluded credential file) is redacted in every
+    // block — prose that echoes a password without a label leaks it
+    // otherwise. Tokens are recounted for touched blocks.
+    if cfg.redact && !known_secrets.is_empty() {
+        for b in &mut blocks {
+            let mut n = 0usize;
+            for s in &known_secrets {
+                if b.content.contains(s.as_str()) {
+                    n += b.content.matches(s.as_str()).count();
+                    b.content = b.content.replace(s.as_str(), "[REDACTED]");
+                }
+            }
+            if n > 0 {
+                b.redactions.push(("Propagated known secret", n));
+                b.tokens = tokens::count(&b.content);
+            }
+        }
     }
 
     // Aggregate stats.
@@ -250,6 +316,26 @@ where
     }
 
     Ok(outcome)
+}
+
+/// Read credential DOCUMENT files (credential stores, `.env`,
+/// `*_CREDENTIALS_*.md`) — found regardless of gitignore — purely to harvest
+/// their secret values for repo-wide propagation. The files themselves are
+/// never merged. Key/cert/SSH material is skipped (a private-key body doesn't
+/// echo as prose). Bounded per file inside `find_credential_files`.
+fn harvest_from_credential_files(
+    root: &Path,
+    known_secrets: &mut std::collections::HashSet<String>,
+    dense_candidates: &mut Vec<String>,
+) {
+    for path in crate::scanner::find_credential_files(root) {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let content = String::from_utf8_lossy(&bytes);
+        known_secrets.extend(crate::security::harvest_labeled_values(&content));
+        dense_candidates.extend(crate::security::harvest_dense_file_tokens(&content));
+    }
 }
 
 /// Write `.claude/skills/<repo>/SKILL.md` describing the merged snapshot and
@@ -349,10 +435,22 @@ fn part_path(output: &Path, idx: usize, n_parts: usize, fmt: OutputFormat) -> Pa
 }
 
 /// Read + decode + slim + redact + token-count a single already-vetted file.
-fn process_file(
+/// Also returns the secrets harvested from the decoded text — harvested
+/// BEFORE the credential-density exclusion, so an excluded credential file
+/// still teaches the propagation pass its values.
+fn process_file(path: &Path, root: &Path, cfg: &MergeConfig) -> ProcessedFile {
+    let mut harvested: Vec<String> = Vec::new();
+    let mut dense: Vec<String> = Vec::new();
+    let res = process_file_inner(path, root, cfg, &mut harvested, &mut dense);
+    (res, harvested, dense)
+}
+
+fn process_file_inner(
     path: &Path,
     root: &Path,
     cfg: &MergeConfig,
+    harvested: &mut Vec<String>,
+    dense: &mut Vec<String>,
 ) -> std::result::Result<Block, MergeSkip> {
     let relative = relative_display(root, path);
 
@@ -374,11 +472,31 @@ fn process_file(
 
     let (mut content, utf8_note) = decode_text(buffer, bom);
 
+    if cfg.redact {
+        *harvested = crate::security::harvest_labeled_values(&content);
+    }
+
     // Whole-file exclusion for credential-dense content (inline login tables,
     // Google app-passwords, key blocks) that per-line redaction can't fully
     // scrub. Checked on the raw decoded text, before any slimming/redaction.
+    // Every opaque token of such a file is harvested for propagation — the
+    // file IS a credential store, and its values echo in prose elsewhere
+    // (grammar no labeled rule can parse).
     let cred_count = crate::security::credential_indicator_count(&content);
     if cred_count >= crate::security::CREDENTIAL_DENSITY_THRESHOLD {
+        // Whole-token harvest only for credential DOCUMENTS: a dense CODE
+        // file (a seed script with test logins) would contribute its
+        // identifiers and shred the merge with propagation false positives.
+        let ext = Path::new(&relative)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if cfg.redact
+            && matches!(ext.as_str(), "md" | "markdown" | "txt" | "text" | "csv" | "log" | "")
+        {
+            *dense = crate::security::harvest_dense_file_tokens(&content);
+        }
         return Err((
             relative,
             format!(

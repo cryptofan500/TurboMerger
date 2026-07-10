@@ -496,6 +496,12 @@ const SECRET_STOPWORDS: &[&str] = &[
     "${",
     "{{",
     "todo",
+    // Env lookups are the SAFE pattern — never literal secrets. Spares
+    // `secret: process.env.JWT_SECRET` style code from the generic rules.
+    "process.env",
+    "os.environ",
+    "getenv",
+    "import.meta",
 ];
 
 #[derive(Debug, Clone)]
@@ -554,6 +560,14 @@ pub fn redact_secrets(content: &str) -> (String, Vec<RedactionEvent>) {
     // credential label ("Gmail app password:\n abcd efgh ijkl mnop"). The window
     // gate keeps ordinary prose (four short words in a row) intact while still
     // catching label-then-value layouts. Placeholder lines are skipped.
+    //
+    // A third contextual rule runs on EVERY non-placeholder line: labeled
+    // values (`password: X`, `token = Y`, `secret: Z`, …) are redacted when
+    // the value looks like a real secret (see `labeled_value_is_secret`).
+    // This is the fix for prose-quoted credentials — changelogs and session
+    // notes that echo values out of an (excluded) credential file; a
+    // differential source-vs-output test on a credential-heavy repo caught
+    // exactly that class passing through (2026-07-10).
     let mut ctx_count = 0usize;
     let mut rebuilt = String::with_capacity(text.len());
     let mut window = 0u8;
@@ -577,8 +591,29 @@ pub fn redact_secrets(content: &str) -> (String, Vec<RedactionEvent>) {
             window = 3; // this line + next 2
         }
         let placeholder = SECRET_STOPWORDS.iter().any(|w| lower.contains(w));
-        if window > 0 && !placeholder {
-            let mut line = seg.to_string();
+        if placeholder {
+            rebuilt.push_str(seg);
+            window = window.saturating_sub(1);
+            continue;
+        }
+        let mut line = seg.to_string();
+        // Labeled `key: value` secrets, independent of the window (the label
+        // is on the line itself).
+        let replaced = LABELED_VALUE_RE.replace_all(&line, |caps: &regex::Captures| {
+            let whole = caps.get(0).expect("capture 0").as_str();
+            let v = caps.name("v").expect("v capture").as_str();
+            if labeled_value_is_secret(v) {
+                ctx_count += 1;
+                // `v` is a suffix of the whole match, so this slice is safe.
+                format!("{}[REDACTED]", &whole[..whole.len() - v.len()])
+            } else {
+                whole.to_string()
+            }
+        });
+        if let std::borrow::Cow::Owned(s) = replaced {
+            line = s;
+        }
+        if window > 0 {
             let q = APP_PW_RE.find_iter(&line).count();
             if q > 0 {
                 line = APP_PW_RE.replace_all(&line, "[REDACTED]").into_owned();
@@ -591,21 +626,172 @@ pub fn redact_secrets(content: &str) -> (String, Vec<RedactionEvent>) {
             if line != before {
                 ctx_count += 1;
             }
-            rebuilt.push_str(&line);
-        } else {
-            rebuilt.push_str(seg);
+            // Opaque-token sweep, window lines only: a credential-flavoured
+            // line ("gmail accounts: a@b.test / Xk2v!mQ9 shared") can hold
+            // values no label grammar reaches. Tokens with '='/':' belong to
+            // the labeled and email:pass rules; paths/URLs/versions/emails
+            // are spared, and the value gate does the rest.
+            let sweep: Vec<String> = line
+                .split_whitespace()
+                .map(trim_token)
+                .filter(|t| {
+                    t.len() >= 8
+                        && !t.contains('=')
+                        && !t.contains(':')
+                        && !t.contains('/')
+                        && !t.contains('\\')
+                        && !EMAIL_ONLY_RE.is_match(t)
+                        && !looks_like_version_or_timestamp(t)
+                        && labeled_value_is_secret(t)
+                })
+                .map(|t| t.to_string())
+                .collect();
+            for t in sweep {
+                if line.contains(&t) {
+                    ctx_count += line.matches(t.as_str()).count();
+                    line = line.replace(t.as_str(), "[REDACTED]");
+                }
+            }
         }
+        rebuilt.push_str(&line);
         window = window.saturating_sub(1);
     }
     text = rebuilt;
     if ctx_count > 0 {
         events.push(RedactionEvent {
-            rule: "Contextual credential (app-pw / email:pass)",
+            rule: "Contextual credential (labeled value / app-pw / email:pass)",
             count: ctx_count,
         });
     }
 
     (text, events)
+}
+
+/// Harvest labeled secret values (`password: X`, `token = Y`, `email:pass`
+/// values) from `content` for repo-wide propagation: a value learned here is
+/// redacted EVERYWHERE in the merge, including prose lines that quote it
+/// without a label — the changelog/session-note echo of an excluded
+/// credential file. Same gates as redaction, so ordinary code never
+/// contributes.
+pub fn harvest_labeled_values(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let lower = line.to_ascii_lowercase();
+        if SECRET_STOPWORDS.iter().any(|w| lower.contains(w)) {
+            continue;
+        }
+        for caps in LABELED_VALUE_RE.captures_iter(line) {
+            let v = caps.name("v").expect("v capture").as_str();
+            if labeled_value_is_secret(v) {
+                out.push(v.to_string());
+            }
+        }
+        for m in EMAIL_PASS_RE.find_iter(line) {
+            if let Some(pos) = m.as_str().find([':', '|']) {
+                let v = m.as_str()[pos + 1..].trim();
+                if labeled_value_is_secret(v) {
+                    out.push(v.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Harvest EVERY opaque token from a file that is being excluded as
+/// credential-dense: such a file is a credentials store by definition, so its
+/// opaque tokens ARE the secrets — including ones whose line grammar no
+/// labeled rule can parse ("RENDER token (dashboard → api): rnd_…"). The
+/// caller applies a frequency guard before propagating (a token that appears
+/// all over the repo is a name, not a secret).
+pub fn harvest_dense_file_tokens(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in content.split_whitespace() {
+        let token = trim_token(raw);
+        consider_dense_token(token, &mut out);
+        // `KEY=value` / `key:value` glued tokens — the tail is the candidate
+        // (a bare `SECRET=uuid` line echoes elsewhere as just the uuid).
+        for sep in ['=', ':'] {
+            if let Some((_, tail)) = token.split_once(sep) {
+                consider_dense_token(trim_token(tail), &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Strip surrounding punctuation from a whitespace-token to recover the bare
+/// value. Two passes: the first keeps value-internal specials (so a JWT's dots
+/// or a key's `+/=` survive); the second strips edge-only delimiters that are
+/// never part of a secret but the first pass can strand (a backtick sitting
+/// *inside* a trailing `` `. `` — markdown-quoted then sentence-punctuated —
+/// which is exactly how credential docs cite values). Without pass two the
+/// harvested token carries trailing cruft and never matches the bare echo.
+fn trim_token(raw: &str) -> &str {
+    let t = raw.trim_matches(|c: char| {
+        c.is_ascii_punctuation()
+            && !matches!(c, '!' | '#' | '$' | '%' | '^' | '&' | '*' | '+' | '=' | '_' | '-' | '.' | '@' | '?' | '~')
+    });
+    t.trim_matches(|c: char| matches!(c, '.' | '`' | '\'' | '"' | ',' | ';' | ':' | '(' | ')' | '[' | ']'))
+}
+
+fn consider_dense_token(token: &str, out: &mut Vec<String>) {
+    if token.len() < 8 || token.contains("://") {
+        return;
+    }
+    // Slashes usually mean a path — but base64 material legitimately contains
+    // '/' and '+', and API keys ARE base64ish. Only path-looking tokens skip.
+    let base64ish = token.len() >= 16
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-'));
+    if (token.contains('/') || token.contains('\\')) && !base64ish {
+        return;
+    }
+    // Emails are logins, not passwords — redacting them repo-wide mangles
+    // legit code/config. The email:pass rules handle their values.
+    if EMAIL_ONLY_RE.is_match(token) || looks_like_version_or_timestamp(token) {
+        return;
+    }
+    if labeled_value_is_secret(token) {
+        out.push(token.to_string());
+    }
+}
+
+/// Version strings and date/timestamps have letters+digits+specials but are
+/// never secrets; spare them from token sweeps.
+fn looks_like_version_or_timestamp(t: &str) -> bool {
+    let stripped: String = t
+        .chars()
+        .filter(|c| !matches!(c, 'v' | 'V' | 't' | 'T' | 'z' | 'Z' | 'h' | 'H' | 'm' | 's'))
+        .collect();
+    !stripped.is_empty()
+        && stripped
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | ':' | '+'))
+}
+
+/// Gate for `LABELED_VALUE_RE` captures: only values that plausibly ARE
+/// secrets get redacted, so code that says `token = userToken` or
+/// `secret: process.env.KEY` stays intact. Requires letters AND digits
+/// (identifier references and type names rarely have both), length >= 8,
+/// no stopwords/URLs, and either a non-alphanumeric character or decent
+/// entropy. Letters-only passwords slip through by design — the cost of
+/// not mangling ordinary code.
+fn labeled_value_is_secret(v: &str) -> bool {
+    if v.len() < 8 {
+        return false;
+    }
+    let has_digit = v.bytes().any(|b| b.is_ascii_digit());
+    let has_alpha = v.bytes().any(|b| b.is_ascii_alphabetic());
+    if !has_digit || !has_alpha {
+        return false;
+    }
+    let lower = v.to_ascii_lowercase();
+    if SECRET_STOPWORDS.iter().any(|w| lower.contains(w)) || lower.contains("://") {
+        return false;
+    }
+    v.bytes().any(|b| !b.is_ascii_alphanumeric()) || calculate_entropy(v) >= 3.0
 }
 
 static EMAIL_PASS_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -620,8 +806,24 @@ static APP_PW_RE: LazyLock<Regex> =
 static PASS_ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(password|passwd|pwd|api[_-]?key|secret)\b\s*[:=|]\s*\S{8,}").unwrap()
 });
+/// Labeled credential value: `password: X` / `token = "Y"` / `client_secret: Z`.
+/// The label tolerates compound forms (`DB_PASSWORD`, `SUPABASE_SERVICE_TOKEN`,
+/// `userPassword`) — credential files use those most, and `\btoken\b` can never
+/// match inside them because `_` is a word character. The value class excludes
+/// quotes, brackets, and call syntax so identifier references, function calls,
+/// and env lookups never match whole; `labeled_value_is_secret` gates the rest.
+static LABELED_VALUE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)[a-z0-9_.-]*(?:password|passwd|pwd|token|secret|api[_-]?key|app[_-]?password|client[_-]?secret)[a-z0-9_-]*\s*[:=|]\s*["']?(?P<v>[^\s"'()<>\{\}\[\]`,;]{8,})"#,
+    )
+    .unwrap()
+});
 static PRIVKEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"-----BEGIN [A-Z ]{0,20}PRIVATE KEY").unwrap());
+/// A token that is exactly an email address (a login, not a secret).
+static EMAIL_ONLY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$").unwrap()
+});
 
 /// Count strong inline-credential indicators in `content`. Used to exclude
 /// credential-dense DATA files wholesale (markdown tables of logins, Google
@@ -823,6 +1025,78 @@ mod tests {
     fn entropy_sane() {
         assert!(calculate_entropy("aaaaaaaaaa") < 1.0);
         assert!(calculate_entropy("k9X!qPz$7Lm@2Wv#") > 3.5);
+    }
+
+    #[test]
+    fn labeled_values_redact_secrets_but_spare_code() {
+        // Prose-quoted credentials (the changelog/session-note leak class).
+        let input = "Rotated the login.\npassword: Vr7wKp2walKotwica91\nnew token = q8Zt3xNv7Rb2Lm9Dw4Ys\nSupabase secret: 4f2a91c3-77b2-4f0e-9a01-2b8cd91e55aa\n";
+        let (out, events) = redact_secrets(input);
+        assert!(!out.contains("Vr7wKp2walKotwica91"), "password leaked: {}", out);
+        assert!(!out.contains("q8Zt3xNv7Rb2Lm9Dw4Ys"), "token leaked: {}", out);
+        assert!(!out.contains("4f2a91c3"), "uuid secret leaked: {}", out);
+        assert!(events.iter().any(|e| e.rule.contains("labeled value")));
+
+        // Compound labels — the shapes credential files actually use.
+        let compound = "DB_PASSWORD: Xk2mQv9rT4w\nSUPABASE_SERVICE_TOKEN=ab12CD34ef56GH78\nconst userPassword = 'Vb3nM8qL2wZ'\n";
+        let (out3, _) = redact_secrets(compound);
+        assert!(!out3.contains("Xk2mQv9rT4w"), "compound label leaked: {}", out3);
+        assert!(!out3.contains("ab12CD34ef56GH78"), "compound label leaked: {}", out3);
+        assert!(!out3.contains("Vb3nM8qL2wZ"), "single-quoted value leaked: {}", out3);
+
+        // Ordinary code must stay intact: identifier references, env lookups,
+        // type annotations, short values, and placeholders.
+        let code = "const token = userAccessToken;\nsecret: process.env.JWT_SECRET\ntoken: TokenType\npwd = ab12\npassword = \"changeme123456\"\n";
+        let (out2, _) = redact_secrets(code);
+        assert_eq!(out2, code, "code mangled: {}", out2);
+    }
+
+    #[test]
+    fn window_sweep_and_dense_harvest_catch_grammarless_values() {
+        // Windowed opaque-token sweep: credential-flavoured line, value with
+        // no adjacent label.
+        let input = "gmail creds below\nshared drive uses Xk9v!m22QrL for both accounts\n";
+        let (out, _) = redact_secrets(input);
+        assert!(!out.contains("Xk9v!m22QrL"), "swept value leaked: {}", out);
+        // Non-credential lines are never swept; versions/dates survive even
+        // inside the window.
+        let benign = "login page v2.1.153 shipped 2026-07-03\nreleased to prod\n";
+        let (out2, _) = redact_secrets(benign);
+        assert_eq!(out2, benign, "benign windowed line mangled: {}", out2);
+
+        // Dense-file token harvest: arbitrary grammar, tokens gated.
+        let dense = "RENDER api (dashboard -> settings): svcKey-Zx9Kq2Mv7Rt4Lp\nsee https://dash.render.com/x and C:\\Users\\admin\\keys\nlogin zbig@wp-post.org on v7.4.0 at 2026-07-03T1950Z\n";
+        let toks = harvest_dense_file_tokens(dense);
+        assert!(toks.contains(&"svcKey-Zx9Kq2Mv7Rt4Lp".to_string()), "{:?}", toks);
+        assert!(!toks.iter().any(|t| t.contains("render.com")), "url harvested: {:?}", toks);
+        assert!(!toks.iter().any(|t| t.contains("Users")), "path harvested: {:?}", toks);
+        assert!(!toks.contains(&"zbig@wp-post.org".to_string()), "email harvested: {:?}", toks);
+        assert!(!toks.contains(&"v7.4.0".to_string()), "version harvested: {:?}", toks);
+        assert!(!toks.contains(&"2026-07-03T1950Z".to_string()), "timestamp harvested: {:?}", toks);
+
+        // Glued `KEY=value` yields the tail; base64-with-slash is a key, not a path.
+        let glued = "SUPABASE_JWT_SECRET=4f2a91c3-77b2-4f0e-9a01-2b8cd91e55aa\nkey b64+Q2v/9KtLm4Pz7Bw1x= end\n";
+        let toks2 = harvest_dense_file_tokens(glued);
+        assert!(
+            toks2.contains(&"4f2a91c3-77b2-4f0e-9a01-2b8cd91e55aa".to_string()),
+            "glued tail missing: {:?}",
+            toks2
+        );
+        assert!(
+            toks2.contains(&"b64+Q2v/9KtLm4Pz7Bw1x=".to_string()),
+            "base64-with-slash missing: {:?}",
+            toks2
+        );
+
+        // Markdown-quoted then sentence-punctuated: `` `<uuid>`. `` — the bare
+        // value must be recovered so it matches the un-quoted echo elsewhere.
+        let quoted = "service id is `9f8e7d6c-5b4a-3210-fedc-ba9876543210`.\n";
+        let toks3 = harvest_dense_file_tokens(quoted);
+        assert!(
+            toks3.contains(&"9f8e7d6c-5b4a-3210-fedc-ba9876543210".to_string()),
+            "backtick-wrapped uuid not un-wrapped: {:?}",
+            toks3
+        );
     }
 
     #[test]
