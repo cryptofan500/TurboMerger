@@ -50,11 +50,20 @@ Gemini.
   `grep_output` to Claude Desktop/Code over stdio (redaction forced on).
 - **Claude skill** — optional `.claude/skills/<repo>/SKILL.md` emission describing the
   snapshot and how to regenerate it.
+- **Apply-back with visual diffs** — paste the LLM's reply (fenced blocks under `## path`
+  headers, cxml documents, or unified diffs) into the **Apply** panel: per-file
+  side-by-side diff review with accept/reject, then one click writes the accepted files.
+  Dry-run by default; originals are backed up to `.turbomerger/backups/<UTC>/` with a
+  one-click **Restore last apply**. Proposals can never escape the source folder, binary
+  targets are refused, deletions are shown but never executed, and a file that changed on
+  disk since the preview fails safe. CLI twin: `turbomerger apply`.
 - **Secret redaction** — API keys, tokens, private keys, and DB connection strings
   (AWS, GitHub, GitLab, OpenAI, Anthropic, Google, Stripe, Slack, JWTs, …) are replaced
-  with `[REDACTED]` before writing (entropy gate + placeholder stopwords). Credential
-  *data files* and *credential-dense* files are excluded wholesale (see *Security*).
-  On by default; counted in the report.
+  with `[REDACTED]` before writing (entropy gate + placeholder stopwords). Labeled
+  values (`password: X`, `token = Y`) are redacted contextually even in prose — the
+  changelog/session-note leak class — while identifier references and env lookups in
+  code stay intact. Credential *data files* and *credential-dense* files are excluded
+  wholesale (see *Security*). On by default; counted in the report.
 - **Nothing dropped silently** — every excluded file appears in the Merge Report with a
   reason (binary, too large, gitignored, sensitive, credential-dense, unreadable, …).
 - **Headless CLI** — `turbomerger merge <src> [out] [--flags]` for scripting/CI; drag a
@@ -118,9 +127,28 @@ turbomerger merge <src|owner/repo|URL> [out]
     [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--quiet]
 turbomerger map <src|owner/repo|URL> [out] [--tokens N]
 turbomerger mcp     # stdio MCP server
+turbomerger apply <root> --from reply.md [--yes]   # dry-run without --yes
+turbomerger apply <root> --restore                 # undo the last apply
 ```
 
 Remote refs shallow-clone to a temp dir (private repos: set `TURBOMERGER_PAT`).
+
+### Apply-back (paste the LLM's answer back)
+
+Merge → paste into a chat → ask for changes → paste the reply into **Apply an LLM reply
+back to this folder** → *Preview changes* → review each file's side-by-side diff →
+*Apply*. Recognized reply shapes:
+
+- a file header — `## path/to/file.rs`, `**path**`, `File: path`, or a backticked path
+  (backticks also allow paths with spaces) — followed by a fenced code block
+  (whole-file replacement; unknown paths create new files);
+- TurboMerger's own cxml output (`<source>path</source>` documents) pasted back;
+- unified diffs (`--- a/x` / `+++ b/x` / `@@` hunks), fenced or bare — tolerant of the
+  drifted line numbers and lost trailing whitespace typical of chat replies.
+
+Every apply first copies originals to `.turbomerger/backups/<UTC>/` (manifest included)
+— *Restore last apply* (or `turbomerger apply <root> --restore`) reverses it, deleting
+files the apply created. CRLF files stay CRLF even when the reply is LF-only.
 
 ### MCP (Claude Desktop / Claude Code)
 
@@ -173,11 +201,21 @@ Lock files, minified bundles, and previous TurboMerger outputs are skipped by na
   Source files that merely mention the words (`password_reset.py`, `useApiKey.ts`) are not
   affected.
 - Detected secrets are redacted from file contents before writing, including context-gated
-  Google app-passwords and `email:password` values.
-- **Limitation:** no redactor catches every credential embedded in free-form prose. Default
-  (gitignore-respecting) mode is safest — it prunes ignored credential docs entirely. The
-  **Full archive / `--no-gitignore`** mode deliberately includes everything and may surface
-  prose-embedded secrets; review the output before uploading.
+  Google app-passwords, `email:password` values, and labeled values (`password: …`,
+  `token = …`) whose contents look like real secrets.
+- **Known-secret propagation.** Values learned from labeled lines and from credential
+  files are redacted in *every* merged file — so a password quoted in a changelog or
+  session note (with no label on that line) is scrubbed even though it's just prose. To
+  make this work, credential documents (`.env`, `*_CREDENTIALS_*.md`, `credentials.json`)
+  are read *harvest-only* — **even when gitignored** — purely to learn their values; their
+  contents are **never merged** (the file itself stays excluded). Verified end-to-end by a
+  differential source-vs-output containment test on real credential-heavy repos: no
+  source-extracted secret survives into default-mode output.
+- **Limitation:** no redactor catches every credential embedded in free-form prose (a
+  never-labeled, never-in-a-credential-file value can still slip). Default
+  (gitignore-respecting) mode is safest. The **Full archive / `--no-gitignore`** mode
+  deliberately includes everything and may surface prose-embedded secrets; review the
+  output before uploading.
 - Strict Content-Security-Policy on the WebView.
 
 ## Development

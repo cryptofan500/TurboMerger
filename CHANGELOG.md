@@ -2,6 +2,79 @@
 
 All notable changes to TurboMerger will be documented in this file.
 
+## [7.5.0] - 2026-07-10
+
+Apply-back release (T3-3) — the merge → chat → **apply the reply** loop closes.
+
+### Added
+- **Apply-back with visual diffs**: paste an LLM reply into the new **Apply** panel
+  (or `turbomerger apply <root> --from reply.md [--yes]`). Parses three reply shapes:
+  file headers (`## path`, `**path**`, `File: path`, backticked paths — TurboMerger's
+  own markdown round-trips) followed by fenced blocks as whole-file replacements
+  (new paths create files); TurboMerger's cxml documents pasted back; and unified
+  diffs (fenced or bare) with drift-tolerant hunk placement and trailing-whitespace
+  tolerance. Per-file **side-by-side diff** review with accept/reject checkboxes and
+  +adds/−dels counts.
+- **Backups + restore**: every apply first copies originals to
+  `<root>/.turbomerger/backups/<UTC>/files/<rel>` plus a `manifest.json`;
+  **Restore last apply** (UI button or `turbomerger apply <root> --restore`) reverses
+  the newest apply, deleting files it created. `.turbomerger/` joined the always-skip
+  set so backups never re-merge.
+- **Safety rails** (all covered by tests): dry-run by default — parsing/previewing
+  writes nothing; proposal paths are lexically confined to the target root (absolute,
+  drive-qualified, `..`, and ADS `:stream` paths refused); binary targets refused;
+  deletion diffs (`+++ /dev/null`) surfaced but never executed; per-file content-hash
+  check between preview and apply fails files that changed on disk in the meantime;
+  CRLF originals stay CRLF even when the reply is LF-only; chained changes to one file
+  fold in reply order. The CLI prints paths + counts only (replies can embed secrets).
+
+### Security
+- **Labeled-value redaction** (new contextual rule): `password: X` / `token = Y` /
+  `secret: Z` values (single- or double-quoted or bare) are redacted on any line when
+  the value looks like a real secret (≥8 chars, letters *and* digits,
+  entropy/special-char gate, stopword-immune). Code stays intact by design:
+  identifier references (`token = userAccessToken`), env lookups, call expressions,
+  type annotations, and placeholders never match.
+- **Repo-wide known-secret propagation**: values learned from labeled lines and from
+  credential files anywhere in the scan are redacted in **every** merged block. This
+  closes the **prose-echo** class: changelogs, TODOs, and session notes that quote a
+  password out of a credential file without any label on the line. Found by a
+  differential source-vs-output containment test on two real credential-heavy repos
+  (2026-07-10); structured-pattern scans alone cannot see this class. Reported per
+  file as "Propagated known secret".
+- **Credential-file harvest (gitignore-bypassing, harvest-only)**: credential documents
+  (`.env`, `MASTER_CREDENTIALS_*.md`, `credentials.json`, …) are read to learn their
+  secret values **even when gitignored** — they almost always are, so the normal scan
+  never sees them, yet their values echo across the repo. Content is read, secrets
+  extracted, content dropped: the credential file itself is **never merged** (the
+  scanner still excludes it). This is what lets propagation scrub echoes of a
+  gitignored secrets file.
+- **Credential-dense document token sweep**: a file excluded for credential density
+  (a login table, a keys doc) has *every* opaque token harvested — even values whose
+  line grammar no labeled rule can parse — behind a frequency guard (a token in many
+  blocks is a name/host, not a secret) so the merge is never shredded. Windowed
+  opaque-token sweep does the same within credential-flavoured lines of merged files.
+- **Env lookups added to stopwords** (`process.env`, `os.environ`, `getenv`,
+  `import.meta`): the generic secret-assignment rule no longer mangles
+  `secret: process.env.JWT_SECRET` style code — a pre-existing false positive the
+  new tests exposed.
+
+### Changed
+- Merged outputs round-trip: feeding a TurboMerger markdown or cxml output back into
+  the parser yields byte-identical proposals (golden-tested), so "apply the whole
+  snapshot" is a no-op instead of a rewrite.
+
+### Internal
+- New `applyback` module (parser, hunk applier, `similar`-based preview diffs,
+  backup/restore engine); 3 new Tauri commands (`preview_apply`, `apply_accepted`,
+  `restore_backup`); scanner `find_credential_files` (gitignore-bypassing, harvest-only);
+  +27 tests → 94 total (76 unit, 8 apply-back integration, 10 core integration).
+  Mixed-line-ending round-trips (LF file with stray CRLF lines) are byte-exact — caught
+  by release-exe E2E, locked in by tests. Credential safety verified end-to-end against
+  the real `[private-repo-A]` (+ Support) repos by a counts-only differential
+  source-vs-output containment harness: 0 of 36 source-extracted secret candidates
+  survive into the default-mode output; no secret value ever printed.
+
 ## [7.4.0] - 2026-07-09
 
 Agent + curation release — tree-sitter compression, repo map, a curate GUI,
