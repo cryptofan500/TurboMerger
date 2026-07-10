@@ -17,6 +17,10 @@ fn main() {
     if let Some(args) = turbomerger::MapArgs::parse(&argv) {
         std::process::exit(turbomerger::run_map_cli(args));
     }
+    // Apply-back CLI: `turbomerger apply <root> --from reply.md [--yes]`.
+    if let Some(args) = turbomerger::ApplyArgs::parse(&argv) {
+        std::process::exit(turbomerger::run_apply_cli(args));
+    }
     // MCP sidecar: `turbomerger mcp` serves Model Context Protocol on stdio.
     if argv.get(1).map(|s| s.as_str()) == Some("mcp") {
         std::process::exit(turbomerger::run_mcp());

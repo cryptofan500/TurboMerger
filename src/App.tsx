@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import CuratePanel, { ScanReport } from "./components/CuratePanel";
+import ApplyPanel from "./components/ApplyPanel";
 import "./styles/global.css";
 
 interface MergeResult {
@@ -62,6 +63,7 @@ function App() {
   const [emitSkill, setEmitSkill] = useState(false);
   const [preset, setPreset] = useState<Preset>("custom");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showApply, setShowApply] = useState(false);
 
   // Remote packing (T2-8): PAT stays in memory only — never persisted.
   const [pat, setPat] = useState<string>("");
@@ -644,6 +646,19 @@ function App() {
             {result.output_paths.map((p) => <p className="output-path" key={p}>{p}</p>)}
           </section>
         )}
+
+        <section className="section">
+          <button className="link-btn" onClick={() => setShowApply(!showApply)}>
+            {showApply ? "▾" : "▸"} Apply an LLM reply back to this folder (T3-3)
+          </button>
+          {showApply && (
+            !sourcePath || isRemote ? (
+              <p className="hint">Pick a local source folder above first — apply-back writes into it.</p>
+            ) : (
+              <ApplyPanel root={sourcePath} disabled={isWorking || watching} />
+            )
+          )}
+        </section>
 
         {error && <section className="section error-section"><p className="error-text">{error}</p></section>}
         {status === "cancelled" && <section className="section cancelled-section"><p className="cancelled-text">Operation cancelled</p></section>}

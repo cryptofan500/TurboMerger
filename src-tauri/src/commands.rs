@@ -653,6 +653,90 @@ pub fn stop_watch(watch: State<'_, Mutex<WatchState>>) -> Result<(), String> {
     Ok(())
 }
 
+// ============================================================================
+// APPLY-BACK (T3-3)
+// ============================================================================
+
+/// The last parsed preview, held server-side so apply never round-trips the
+/// proposed file contents through the webview.
+#[derive(Default)]
+pub struct ApplyUiState {
+    pending: Option<PendingApply>,
+}
+
+struct PendingApply {
+    root: PathBuf,
+    ready: Vec<crate::applyback::ReadyFile>,
+}
+
+/// Parse a pasted LLM reply against `root` and return per-file diffs.
+/// Dry-run: nothing is written; the appliable set is parked in state.
+#[tauri::command]
+pub fn preview_apply(
+    state: State<'_, Mutex<ApplyUiState>>,
+    root: String,
+    reply: String,
+) -> Result<crate::applyback::Preview, String> {
+    let root = security::validate_and_canonicalize(&root)
+        .map_err(|e| format!("Security error: {}", e))?;
+    if !root.is_dir() {
+        return Err("Target root is not a folder".to_string());
+    }
+    let changes = crate::applyback::parse_reply(&reply);
+    if changes.is_empty() {
+        return Err(
+            "No file changes recognized. Supported: `## path` + fenced code block, \
+             cxml <source> documents, and unified diffs (--- / +++ / @@)."
+                .to_string(),
+        );
+    }
+    let built = crate::applyback::build_preview(&root, &changes)?;
+    state.lock().map_err(|e| e.to_string())?.pending = Some(PendingApply {
+        root,
+        ready: built.ready,
+    });
+    Ok(built.preview)
+}
+
+/// Write the accepted subset of the last preview (with backups). One-shot:
+/// the pending preview is consumed; re-parse for another round.
+#[tauri::command]
+pub fn apply_accepted(
+    state: State<'_, Mutex<ApplyUiState>>,
+    root: String,
+    accept: Vec<String>,
+) -> Result<crate::applyback::ApplyOutcome, String> {
+    let pending = state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .pending
+        .take()
+        .ok_or("Nothing parsed — paste a reply and preview it first")?;
+    let root = security::validate_and_canonicalize(&root)
+        .map_err(|e| format!("Security error: {}", e))?;
+    if root != pending.root {
+        return Err("Preview is for a different folder — re-parse the reply".to_string());
+    }
+    let want: std::collections::HashSet<&str> = accept.iter().map(|s| s.as_str()).collect();
+    let files: Vec<crate::applyback::ReadyFile> = pending
+        .ready
+        .into_iter()
+        .filter(|f| want.contains(f.rel_path.as_str()))
+        .collect();
+    if files.is_empty() {
+        return Err("No accepted files to apply".to_string());
+    }
+    crate::applyback::apply_files(&root, &files)
+}
+
+/// Reverse the most recent apply for `root` from its backup manifest.
+#[tauri::command]
+pub fn restore_backup(root: String) -> Result<crate::applyback::RestoreOutcome, String> {
+    let root = security::validate_and_canonicalize(&root)
+        .map_err(|e| format!("Security error: {}", e))?;
+    crate::applyback::restore_last(&root)
+}
+
 #[tauri::command]
 pub fn open_file(path: String) -> Result<(), String> {
     open::that(&path).map_err(|e| format!("Failed to open file: {}", e))
@@ -1011,6 +1095,152 @@ pub fn run_cli(a: CliArgs) -> i32 {
         }
         Err(e) => {
             eprintln!("merge failed: {}", e);
+            1
+        }
+    }
+}
+
+// ============================================================================
+// HEADLESS CLI  —  turbomerger apply <root> --from reply.md [--yes] | --restore
+// ============================================================================
+
+pub struct ApplyArgs {
+    pub root: String,
+    pub from: Option<String>,
+    pub yes: bool,
+    pub restore: bool,
+}
+
+impl ApplyArgs {
+    /// Parse `apply <root> [--from FILE] [--yes] [--restore]`.
+    pub fn parse(argv: &[String]) -> Option<ApplyArgs> {
+        let mut it = argv.iter().skip(1);
+        if it.next().map(|s| s.as_str()) != Some("apply") {
+            return None;
+        }
+        let mut a = ApplyArgs {
+            root: String::new(),
+            from: None,
+            yes: false,
+            restore: false,
+        };
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--from" => a.from = it.next().cloned(),
+                "--yes" | "-y" => a.yes = true,
+                "--restore" => a.restore = true,
+                other if a.root.is_empty() => a.root = other.to_string(),
+                _ => {}
+            }
+        }
+        if a.root.is_empty() {
+            eprintln!("usage: turbomerger apply <root> --from reply.md [--yes]   (dry-run without --yes)");
+            eprintln!("       turbomerger apply <root> --restore                 (undo the last apply)");
+        }
+        Some(a)
+    }
+}
+
+/// Run a headless apply/restore. Prints paths + counts only (never content —
+/// pasted replies can embed secrets). Exit code.
+pub fn run_apply_cli(a: ApplyArgs) -> i32 {
+    if a.root.is_empty() {
+        return 2;
+    }
+    let root = match security::validate_and_canonicalize(&a.root) {
+        Ok(r) if r.is_dir() => r,
+        Ok(_) => {
+            eprintln!("error: root is not a folder");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
+
+    if a.restore {
+        return match crate::applyback::restore_last(&root) {
+            Ok(r) => {
+                for p in &r.restored {
+                    println!("restored {}", p);
+                }
+                for p in &r.deleted {
+                    println!("deleted  {}", p);
+                }
+                println!("from={}", r.backup_dir);
+                0
+            }
+            Err(e) => {
+                eprintln!("restore failed: {}", e);
+                1
+            }
+        };
+    }
+
+    let Some(from) = a.from.as_deref() else {
+        eprintln!("error: --from <reply file> is required (or --restore)");
+        return 2;
+    };
+    let reply = match std::fs::read_to_string(from) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {}", from, e);
+            return 1;
+        }
+    };
+    let changes = crate::applyback::parse_reply(&reply);
+    if changes.is_empty() {
+        eprintln!("no file changes recognized in {}", from);
+        return 1;
+    }
+    let built = match crate::applyback::build_preview(&root, &changes) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
+    for f in &built.preview.files {
+        if f.identical {
+            println!("same   {} (already matches disk)", f.rel_path);
+        } else if f.ok {
+            println!("{:6} {} +{} -{}", f.action, f.rel_path, f.adds, f.dels);
+        } else {
+            println!("SKIP   {} — {}", f.rel_path, f.note);
+        }
+    }
+    if built.ready.is_empty() {
+        println!("nothing to apply");
+        return 0;
+    }
+    if !a.yes {
+        println!(
+            "dry-run: {} file(s) would be written — pass --yes to apply (backups are taken)",
+            built.ready.len()
+        );
+        return 0;
+    }
+    match crate::applyback::apply_files(&root, &built.ready) {
+        Ok(o) => {
+            for p in &o.applied {
+                println!("applied {}", p);
+            }
+            for f in &o.failed {
+                eprintln!("failed  {} — {}", f.rel_path, f.reason);
+            }
+            if let Some(b) = &o.backup_dir {
+                println!("backup={}", b);
+                println!("undo: turbomerger apply \"{}\" --restore", root.display());
+            }
+            if o.failed.is_empty() {
+                0
+            } else {
+                1
+            }
+        }
+        Err(e) => {
+            eprintln!("apply failed: {}", e);
             1
         }
     }

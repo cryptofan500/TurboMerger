@@ -1,3 +1,4 @@
+pub mod applyback;
 mod commands;
 pub mod compress;
 pub mod config;
@@ -9,7 +10,7 @@ pub mod scanner;
 pub mod security;
 pub mod tokens;
 
-pub use commands::{run_cli, run_map_cli, CliArgs, MapArgs};
+pub use commands::{run_apply_cli, run_cli, run_map_cli, ApplyArgs, CliArgs, MapArgs};
 pub use mcp::run_mcp;
 
 use std::sync::Mutex;
@@ -20,6 +21,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(commands::AppState::default()))
         .manage(Mutex::new(commands::WatchState::default()))
+        .manage(Mutex::new(commands::ApplyUiState::default()))
         .invoke_handler(tauri::generate_handler![
             commands::merge_folder,
             commands::pack_remote,
@@ -32,6 +34,9 @@ pub fn run() {
             commands::get_downloads_path,
             commands::open_file,
             commands::open_folder,
+            commands::preview_apply,
+            commands::apply_accepted,
+            commands::restore_backup,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
