@@ -56,7 +56,7 @@ chardetng = "1.0.0"
 # Remote repo packing (T2-8): shallow clones land in a self-cleaning tempdir
 tempfile = "3"
 # Apply-back diffs (T3-3)
-similar = "2"
+similar = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
