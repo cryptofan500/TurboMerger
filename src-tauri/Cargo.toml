@@ -27,7 +27,7 @@ rayon = "1.10"
 
 # File system — gitignore-aware walker (ripgrep's)
 ignore = "0.4"
-dirs = "5"
+dirs = "6"
 open = "5"
 
 # Utilities
