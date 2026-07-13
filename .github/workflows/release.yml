@@ -107,9 +107,11 @@ jobs:
         if: runner.os == 'Windows'
         run: npm run tauri:build:windows
 
-      - name: Build Apple Silicon DMG
+      - name: Build Apple Silicon app and DMG
         if: runner.os == 'macOS'
-        run: npm run tauri:build:mac -- --bundles dmg
+        # No --bundles override: the config targets are dmg AND app. Requesting
+        # only dmg leaves no retained .app in bundle/macos to verify.
+        run: npm run tauri:build:mac
 
       - name: Verify Apple Silicon application and DMG
         if: runner.os == 'macOS'
@@ -117,9 +119,10 @@ jobs:
         run: |
           set -euo pipefail
           app="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app" || { echo "no .app produced under bundle/macos" >&2; exit 1; }
           binary="$(find "$app/Contents/MacOS" -maxdepth 1 -type f -print -quit)"
           dmg="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
-          test -n "$app" && test -n "$binary" && test -n "$dmg"
+          test -n "$binary" && test -n "$dmg"
           lipo -archs "$binary" | grep -qw arm64
           codesign --verify --deep --strict --verbose=2 "$app"
           hdiutil verify "$dmg"
