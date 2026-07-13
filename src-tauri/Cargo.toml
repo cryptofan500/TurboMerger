@@ -31,7 +31,7 @@ dirs = "5"
 open = "5"
 
 # Utilities
-phf = { version = "0.11", features = ["macros"] }
+phf = { version = "0.13", features = ["macros"] }
 chrono = "0.4"
 
 # Token counting (o200k_base / cl100k_base)
