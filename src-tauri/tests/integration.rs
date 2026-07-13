@@ -261,7 +261,10 @@ fn bom_stripped_and_legacy_encodings_decoded() {
         "non-UTF-8 decodes must be reported"
     );
     assert!(text.contains("latin.txt"));
-    assert!(text.contains("UTF-16LE"), "UTF-16 note must name the encoding");
+    assert!(
+        text.contains("UTF-16LE"),
+        "UTF-16 note must name the encoding"
+    );
 }
 
 #[test]
@@ -439,7 +442,11 @@ fn git_context_blocks_append_redact_and_degrade() {
         .split("## Contents")
         .next()
         .unwrap();
-    assert!(!tree.contains("GIT DIFF"), "tree lists synthetic block:\n{}", tree);
+    assert!(
+        !tree.contains("GIT DIFF"),
+        "tree lists synthetic block:\n{}",
+        tree
+    );
 
     // Non-repo: merge still succeeds, report explains why there's no section.
     let plain = tmp.path().join("plain_dir");
@@ -495,23 +502,23 @@ fn skill_generation_writes_skill_md_only_when_asked() {
         emit_skill: true,
         ..MergeConfig::default()
     };
-    let outcome = merge_files_with_progress(
-        &root,
-        &scan.files,
-        &out2,
-        &cfg,
-        &cancel,
-        |_, _, _| {},
-        &[],
-    )
-    .unwrap();
+    let outcome =
+        merge_files_with_progress(&root, &scan.files, &out2, &cfg, &cancel, |_, _, _| {}, &[])
+            .unwrap();
     let skill_path = outcome.skill.expect("skill written");
     assert!(skill_path.ends_with("SKILL.md"));
     assert!(skill_path.starts_with(root.join(".claude").join("skills")));
     let text = fs::read_to_string(&skill_path).unwrap();
-    assert!(text.starts_with("---\nname: my-repo\n"), "frontmatter: {}", text);
+    assert!(
+        text.starts_with("---\nname: my-repo\n"),
+        "frontmatter: {}",
+        text
+    );
     assert!(text.contains("description: Repo context for My Repo"));
-    assert!(text.contains("src/") && text.contains("lib.rs"), "tree missing");
+    assert!(
+        text.contains("src/") && text.contains("lib.rs"),
+        "tree missing"
+    );
     assert!(
         text.contains(&out2.display().to_string()),
         "must point at the merged output"
@@ -554,7 +561,10 @@ fn known_secrets_propagate_to_unlabeled_prose() {
     .unwrap();
     fs::write(
         root.join("src/seed.js"),
-        format!("await page.fill('#pw', '{}');\nconsole.log('seeded');\n", secret),
+        format!(
+            "await page.fill('#pw', '{}');\nconsole.log('seeded');\n",
+            secret
+        ),
     )
     .unwrap();
 
@@ -582,8 +592,14 @@ fn known_secrets_propagate_to_unlabeled_prose() {
         "dense-file token echo leaked into the output"
     );
     assert!(text.contains("Rotated the vault entry to [REDACTED]"));
-    assert!(text.contains("'[REDACTED]'"), "code echo must be scrubbed too");
-    assert!(text.contains("console.log('seeded')"), "non-secret code intact");
+    assert!(
+        text.contains("'[REDACTED]'"),
+        "code echo must be scrubbed too"
+    );
+    assert!(
+        text.contains("console.log('seeded')"),
+        "non-secret code intact"
+    );
     assert!(
         text.contains("credential-dense"),
         "the source credential file itself is excluded with a reason"
@@ -628,8 +644,9 @@ fn scanner_excluded_credential_file_still_scrubs_its_echoes() {
     let scan = scan_text_files(&root, &ScanOptions::default()).unwrap();
     // The credential file is scanner-excluded.
     assert!(
-        scan.skipped.iter().any(|s| s.path.contains("MASTER_CREDENTIALS")
-            && s.reason.contains("credential")),
+        scan.skipped
+            .iter()
+            .any(|s| s.path.contains("MASTER_CREDENTIALS") && s.reason.contains("credential")),
         "credential file must be scanner-excluded: {:?}",
         scan.skipped
     );
@@ -646,7 +663,11 @@ fn scanner_excluded_credential_file_still_scrubs_its_echoes() {
     )
     .unwrap();
     let text = fs::read_to_string(&out).unwrap();
-    assert!(!text.contains(access_token), "access token echo leaked: {}", &text[..200.min(text.len())]);
+    assert!(
+        !text.contains(access_token),
+        "access token echo leaked: {}",
+        &text[..200.min(text.len())]
+    );
     assert!(!text.contains(service_id), "service id echo leaked");
     assert!(text.contains("Swapped to [REDACTED] for the deploy"));
 }
@@ -694,7 +715,10 @@ fn gitignored_credential_file_still_scrubs_its_echoes() {
     )
     .unwrap();
     let text = fs::read_to_string(&out).unwrap();
-    assert!(!text.contains(token), "gitignored credential value leaked via echo");
+    assert!(
+        !text.contains(token),
+        "gitignored credential value leaked via echo"
+    );
     assert!(text.contains("Deploy used [REDACTED] last night"));
     // The credential file's own content is never in the output.
     assert!(!text.contains("## MASTER_CREDENTIALS_2026-07-03T1950Z.md"));
@@ -739,11 +763,23 @@ fn compress_elides_bodies_and_strip_removes_comments() {
     );
     assert!(!text.contains("a + b"), "rust body leaked");
     assert!(text.contains("pub struct Keep"), "struct must survive");
-    assert!(text.contains("def double(x):\n    ..."), "python body must be elided");
+    assert!(
+        text.contains("def double(x):\n    ..."),
+        "python body must be elided"
+    );
     assert!(!text.contains("x * 2"), "python body leaked");
-    assert!(!text.contains("top comment"), "rust comment must be stripped");
-    assert!(!text.contains("# helper"), "python comment must be stripped");
-    assert!(text.contains("plain prose"), "unsupported md must pass through");
+    assert!(
+        !text.contains("top comment"),
+        "rust comment must be stripped"
+    );
+    assert!(
+        !text.contains("# helper"),
+        "python comment must be stripped"
+    );
+    assert!(
+        text.contains("plain prose"),
+        "unsupported md must pass through"
+    );
     assert_eq!(outcome.files_compressed, 2, "both code files compressed");
     assert!(
         text.contains("Compressed to signatures"),

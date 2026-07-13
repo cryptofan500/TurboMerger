@@ -20,6 +20,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 /// Top-level system directories that must never be scanned. Checked against the
 /// FIRST component under the drive root only — a repo folder named `windows`
 /// somewhere deeper is fine.
+#[cfg(windows)]
 const BLOCKED_ROOT_DIRS: &[&str] = &[
     "windows",
     "program files",
@@ -27,6 +28,18 @@ const BLOCKED_ROOT_DIRS: &[&str] = &[
     "programdata",
     "$recycle.bin",
     "system volume information",
+];
+
+#[cfg(target_os = "macos")]
+const BLOCKED_ROOT_DIRS: &[&str] = &[
+    "system",  // /System
+    "library", // /Library
+    "usr", "bin", "sbin", "dev", "etc", "cores",
+];
+
+#[cfg(all(unix, not(target_os = "macos")))]
+const BLOCKED_ROOT_DIRS: &[&str] = &[
+    "usr", "bin", "sbin", "dev", "etc", "proc", "sys", "run", "boot", "lib", "lib64",
 ];
 
 #[derive(Debug)]
@@ -58,8 +71,8 @@ impl From<io::Error> for SecurityError {
     }
 }
 
-/// Check if any path component is a reparse point (junction/symlink).
-/// Used once on the scan root; per-file checks are handled by the walker.
+/// Check whether a Windows scan-root path traverses a reparse point.
+/// Per-file checks are handled by the walker.
 #[cfg(windows)]
 pub fn has_reparse_point_in_path(path: &Path) -> Result<bool, SecurityError> {
     use std::os::windows::fs::MetadataExt;
@@ -82,21 +95,15 @@ pub fn has_reparse_point_in_path(path: &Path) -> Result<bool, SecurityError> {
 
 #[cfg(not(windows))]
 pub fn has_reparse_point_in_path(path: &Path) -> Result<bool, SecurityError> {
-    for ancestor in path.ancestors() {
-        if ancestor.as_os_str().is_empty() {
-            continue;
-        }
-        match fs::symlink_metadata(ancestor) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    return Ok(true);
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(SecurityError::IoError(e)),
-        }
+    // Darwin's /tmp, /var, and /etc are system-managed symlinks. The selected
+    // leaf is still rejected when it is a symlink; canonicalization below
+    // resolves safe ancestor aliases before the system-path policy is applied.
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Ok(true),
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(SecurityError::IoError(e)),
     }
-    Ok(false)
 }
 
 /// Normalize path to long name format (defeats 8.3 short name bypass)
@@ -151,8 +158,46 @@ pub fn normalize_unicode(input: &str) -> String {
     input.nfkc().collect()
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn is_blocked_macos_path(canonical: &Path) -> bool {
+    // These are legitimate project locations once they include a descendant.
+    // In particular, tempfile (and remote-repo packing) resolves through
+    // /var/folders to /private/var/folders on macOS.
+    const ALLOWED_PREFIXES: &[&str] =
+        &["/Users", "/Volumes", "/private/tmp", "/private/var/folders"];
+    if ALLOWED_PREFIXES
+        .iter()
+        .any(|prefix| canonical != Path::new(*prefix) && canonical.starts_with(*prefix))
+    {
+        return false;
+    }
+
+    // Refuse broad roots that are easy to select accidentally, plus every
+    // descendant of protected system prefixes. Path::starts_with compares
+    // components, so names such as /UsersBackup do not match /Users.
+    const EXACT_ROOTS: &[&str] = &[
+        "/",
+        "/Applications",
+        "/Network",
+        "/Users",
+        "/Volumes",
+        "/private/tmp",
+        "/private/var/folders",
+    ];
+    if EXACT_ROOTS.iter().any(|root| canonical == Path::new(*root)) {
+        return true;
+    }
+
+    const PROTECTED_PREFIXES: &[&str] = &[
+        "/System", "/Library", "/usr", "/bin", "/sbin", "/dev", "/etc", "/private", "/cores",
+    ];
+    PROTECTED_PREFIXES
+        .iter()
+        .any(|prefix| canonical.starts_with(*prefix))
+}
+
 /// Validates a scan root: unicode-normalized, reparse-point-free, canonical,
-/// long-named, and not a Windows system root.
+/// long-named, and outside protected operating-system roots.
 pub fn validate_and_canonicalize(path: &str) -> Result<PathBuf, SecurityError> {
     let normalized_input = normalize_unicode(path);
     let path = PathBuf::from(&normalized_input);
@@ -169,6 +214,11 @@ pub fn validate_and_canonicalize(path: &str) -> Result<PathBuf, SecurityError> {
     }
 
     let long_path = normalize_to_long_path(&canonical)?;
+
+    #[cfg(target_os = "macos")]
+    if is_blocked_macos_path(&long_path) {
+        return Err(SecurityError::SystemPathBlocked);
+    }
 
     // Block scanning system roots (C:\Windows, C:\Program Files, …) — first
     // normal component under the drive root only.
@@ -730,9 +780,30 @@ pub fn harvest_dense_file_tokens(content: &str) -> Vec<String> {
 fn trim_token(raw: &str) -> &str {
     let t = raw.trim_matches(|c: char| {
         c.is_ascii_punctuation()
-            && !matches!(c, '!' | '#' | '$' | '%' | '^' | '&' | '*' | '+' | '=' | '_' | '-' | '.' | '@' | '?' | '~')
+            && !matches!(
+                c,
+                '!' | '#'
+                    | '$'
+                    | '%'
+                    | '^'
+                    | '&'
+                    | '*'
+                    | '+'
+                    | '='
+                    | '_'
+                    | '-'
+                    | '.'
+                    | '@'
+                    | '?'
+                    | '~'
+            )
     });
-    t.trim_matches(|c: char| matches!(c, '.' | '`' | '\'' | '"' | ',' | ';' | ':' | '(' | ')' | '[' | ']'))
+    t.trim_matches(|c: char| {
+        matches!(
+            c,
+            '.' | '`' | '\'' | '"' | ',' | ';' | ':' | '(' | ')' | '[' | ']'
+        )
+    })
 }
 
 fn consider_dense_token(token: &str, out: &mut Vec<String>) {
@@ -821,9 +892,8 @@ static LABELED_VALUE_RE: LazyLock<Regex> = LazyLock::new(|| {
 static PRIVKEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"-----BEGIN [A-Z ]{0,20}PRIVATE KEY").unwrap());
 /// A token that is exactly an email address (a login, not a secret).
-static EMAIL_ONLY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$").unwrap()
-});
+static EMAIL_ONLY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$").unwrap());
 
 /// Count strong inline-credential indicators in `content`. Used to exclude
 /// credential-dense DATA files wholesale (markdown tables of logins, Google
@@ -1010,7 +1080,16 @@ mod tests {
 
     #[test]
     fn blocked_roots_only_at_top_level() {
+        #[cfg(windows)]
         assert!(validate_and_canonicalize("C:\\Windows").is_err());
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(validate_and_canonicalize("/System").is_err());
+            assert!(validate_and_canonicalize("/Library").is_err());
+            assert!(validate_and_canonicalize("/private/var").is_err());
+        }
+
         // a *deep* folder named windows is not a system path — validated via components logic
         let tmp = std::env::temp_dir().join("tm_sec_test").join("windows");
         std::fs::create_dir_all(&tmp).unwrap();
@@ -1019,6 +1098,63 @@ mod tests {
             "deep 'windows' folder should be allowed"
         );
         let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+    }
+
+    #[test]
+    fn macos_system_path_policy_is_precise() {
+        for blocked in [
+            "/",
+            "/System",
+            "/System/Library",
+            "/Library",
+            "/usr/local",
+            "/private",
+            "/private/var",
+            "/Users",
+            "/Volumes",
+            "/Applications",
+        ] {
+            assert!(
+                is_blocked_macos_path(Path::new(blocked)),
+                "expected blocked: {blocked}"
+            );
+        }
+
+        for allowed in [
+            "/Users/alice/project",
+            "/Volumes/ExternalSSD/project",
+            "/private/tmp/turbomerger-clone",
+            "/private/var/folders/zz/session/T/turbomerger-clone",
+        ] {
+            assert!(
+                !is_blocked_macos_path(Path::new(allowed)),
+                "expected allowed: {allowed}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_temp_directory_validates() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(validate_and_canonicalize(temp.path().to_str().unwrap()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_symlink_root_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("selected-link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(matches!(
+            validate_and_canonicalize(link.to_str().unwrap()),
+            Err(SecurityError::ReparsePointDetected)
+        ));
     }
 
     #[test]
@@ -1032,17 +1168,37 @@ mod tests {
         // Prose-quoted credentials (the changelog/session-note leak class).
         let input = "Rotated the login.\npassword: Vr7wKp2walKotwica91\nnew token = q8Zt3xNv7Rb2Lm9Dw4Ys\nSupabase secret: 4f2a91c3-77b2-4f0e-9a01-2b8cd91e55aa\n";
         let (out, events) = redact_secrets(input);
-        assert!(!out.contains("Vr7wKp2walKotwica91"), "password leaked: {}", out);
-        assert!(!out.contains("q8Zt3xNv7Rb2Lm9Dw4Ys"), "token leaked: {}", out);
+        assert!(
+            !out.contains("Vr7wKp2walKotwica91"),
+            "password leaked: {}",
+            out
+        );
+        assert!(
+            !out.contains("q8Zt3xNv7Rb2Lm9Dw4Ys"),
+            "token leaked: {}",
+            out
+        );
         assert!(!out.contains("4f2a91c3"), "uuid secret leaked: {}", out);
         assert!(events.iter().any(|e| e.rule.contains("labeled value")));
 
         // Compound labels — the shapes credential files actually use.
         let compound = "DB_PASSWORD: Xk2mQv9rT4w\nSUPABASE_SERVICE_TOKEN=ab12CD34ef56GH78\nconst userPassword = 'Vb3nM8qL2wZ'\n";
         let (out3, _) = redact_secrets(compound);
-        assert!(!out3.contains("Xk2mQv9rT4w"), "compound label leaked: {}", out3);
-        assert!(!out3.contains("ab12CD34ef56GH78"), "compound label leaked: {}", out3);
-        assert!(!out3.contains("Vb3nM8qL2wZ"), "single-quoted value leaked: {}", out3);
+        assert!(
+            !out3.contains("Xk2mQv9rT4w"),
+            "compound label leaked: {}",
+            out3
+        );
+        assert!(
+            !out3.contains("ab12CD34ef56GH78"),
+            "compound label leaked: {}",
+            out3
+        );
+        assert!(
+            !out3.contains("Vb3nM8qL2wZ"),
+            "single-quoted value leaked: {}",
+            out3
+        );
 
         // Ordinary code must stay intact: identifier references, env lookups,
         // type annotations, short values, and placeholders.
@@ -1067,12 +1223,36 @@ mod tests {
         // Dense-file token harvest: arbitrary grammar, tokens gated.
         let dense = "RENDER api (dashboard -> settings): svcKey-Zx9Kq2Mv7Rt4Lp\nsee https://dash.render.com/x and C:\\Users\\admin\\keys\nlogin zbig@wp-post.org on v7.4.0 at 2026-07-03T1950Z\n";
         let toks = harvest_dense_file_tokens(dense);
-        assert!(toks.contains(&"svcKey-Zx9Kq2Mv7Rt4Lp".to_string()), "{:?}", toks);
-        assert!(!toks.iter().any(|t| t.contains("render.com")), "url harvested: {:?}", toks);
-        assert!(!toks.iter().any(|t| t.contains("Users")), "path harvested: {:?}", toks);
-        assert!(!toks.contains(&"zbig@wp-post.org".to_string()), "email harvested: {:?}", toks);
-        assert!(!toks.contains(&"v7.4.0".to_string()), "version harvested: {:?}", toks);
-        assert!(!toks.contains(&"2026-07-03T1950Z".to_string()), "timestamp harvested: {:?}", toks);
+        assert!(
+            toks.contains(&"svcKey-Zx9Kq2Mv7Rt4Lp".to_string()),
+            "{:?}",
+            toks
+        );
+        assert!(
+            !toks.iter().any(|t| t.contains("render.com")),
+            "url harvested: {:?}",
+            toks
+        );
+        assert!(
+            !toks.iter().any(|t| t.contains("Users")),
+            "path harvested: {:?}",
+            toks
+        );
+        assert!(
+            !toks.contains(&"zbig@wp-post.org".to_string()),
+            "email harvested: {:?}",
+            toks
+        );
+        assert!(
+            !toks.contains(&"v7.4.0".to_string()),
+            "version harvested: {:?}",
+            toks
+        );
+        assert!(
+            !toks.contains(&"2026-07-03T1950Z".to_string()),
+            "timestamp harvested: {:?}",
+            toks
+        );
 
         // Glued `KEY=value` yields the tail; base64-with-slash is a key, not a path.
         let glued = "SUPABASE_JWT_SECRET=4f2a91c3-77b2-4f0e-9a01-2b8cd91e55aa\nkey b64+Q2v/9KtLm4Pz7Bw1x= end\n";

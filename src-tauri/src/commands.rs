@@ -310,7 +310,10 @@ pub async fn scan_folder(app: AppHandle, options: MergeOptions) -> Result<ScanRe
 
 /// Build an aider-style repo map (tags → PageRank → budgeted signatures).
 #[tauri::command]
-pub async fn repo_map(options: MergeOptions, token_budget: Option<usize>) -> Result<String, String> {
+pub async fn repo_map(
+    options: MergeOptions,
+    token_budget: Option<usize>,
+) -> Result<String, String> {
     let job = resolve_job(&options)?;
     let scan = scanner::scan_text_files(&job.root, &job.scan_options)
         .map_err(|e| format!("Scan failed: {}", e))?;
@@ -502,14 +505,18 @@ pub struct WatchState {
     debouncer: Option<notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>>,
 }
 
-/// Filesystem events that must NOT retrigger a watch merge: anything under
-/// .git (index churn on every git command) and our own outputs.
+/// Filesystem events that must NOT retrigger a watch merge: VCS/app state,
+/// Finder metadata, and our own outputs.
 fn watch_event_is_relevant(path: &std::path::Path) -> bool {
-    if path.components().any(|c| c.as_os_str() == ".git") {
+    if path
+        .components()
+        .any(|c| matches!(c.as_os_str().to_str(), Some(".git" | ".turbomerger")))
+    {
         return false;
     }
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        if name.to_ascii_lowercase().contains("_merged.") {
+        if name.eq_ignore_ascii_case(".DS_Store") || name.to_ascii_lowercase().contains("_merged.")
+        {
             return false;
         }
     }
@@ -518,7 +525,10 @@ fn watch_event_is_relevant(path: &std::path::Path) -> bool {
 
 /// One watch-triggered merge to a fixed output path (no timestamp — the
 /// point is a stable file that overwrites in place).
-fn run_watch_merge(options: &MergeOptions, output: &std::path::Path) -> Result<MergeResult, String> {
+fn run_watch_merge(
+    options: &MergeOptions,
+    output: &std::path::Path,
+) -> Result<MergeResult, String> {
     let start = std::time::Instant::now();
     let job = resolve_job(options)?;
     let scan = scanner::scan_text_files(&job.root, &job.scan_options)
@@ -677,8 +687,8 @@ pub fn preview_apply(
     root: String,
     reply: String,
 ) -> Result<crate::applyback::Preview, String> {
-    let root = security::validate_and_canonicalize(&root)
-        .map_err(|e| format!("Security error: {}", e))?;
+    let root =
+        security::validate_and_canonicalize(&root).map_err(|e| format!("Security error: {}", e))?;
     if !root.is_dir() {
         return Err("Target root is not a folder".to_string());
     }
@@ -712,8 +722,8 @@ pub fn apply_accepted(
         .pending
         .take()
         .ok_or("Nothing parsed — paste a reply and preview it first")?;
-    let root = security::validate_and_canonicalize(&root)
-        .map_err(|e| format!("Security error: {}", e))?;
+    let root =
+        security::validate_and_canonicalize(&root).map_err(|e| format!("Security error: {}", e))?;
     if root != pending.root {
         return Err("Preview is for a different folder — re-parse the reply".to_string());
     }
@@ -732,8 +742,8 @@ pub fn apply_accepted(
 /// Reverse the most recent apply for `root` from its backup manifest.
 #[tauri::command]
 pub fn restore_backup(root: String) -> Result<crate::applyback::RestoreOutcome, String> {
-    let root = security::validate_and_canonicalize(&root)
-        .map_err(|e| format!("Security error: {}", e))?;
+    let root =
+        security::validate_and_canonicalize(&root).map_err(|e| format!("Security error: {}", e))?;
     crate::applyback::restore_last(&root)
 }
 
@@ -753,7 +763,16 @@ pub fn open_folder(path: String) -> Result<(), String> {
             .map_err(|e| format!("Failed to open folder: {}", e))?;
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open folder in Finder: {}", e))?;
+        Ok(())
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         let pb = PathBuf::from(&path);
         let folder = pb.parent().unwrap_or(&pb);
@@ -1134,8 +1153,12 @@ impl ApplyArgs {
             }
         }
         if a.root.is_empty() {
-            eprintln!("usage: turbomerger apply <root> --from reply.md [--yes]   (dry-run without --yes)");
-            eprintln!("       turbomerger apply <root> --restore                 (undo the last apply)");
+            eprintln!(
+                "usage: turbomerger apply <root> --from reply.md [--yes]   (dry-run without --yes)"
+            );
+            eprintln!(
+                "       turbomerger apply <root> --restore                 (undo the last apply)"
+            );
         }
         Some(a)
     }
@@ -1261,6 +1284,12 @@ mod tests {
         )));
         assert!(!watch_event_is_relevant(Path::new(
             "C:/repo/myrepo_2026-07-09_merged.part1-of-2.md"
+        )));
+        assert!(!watch_event_is_relevant(Path::new(
+            "/Users/me/repo/.turbomerger/backups/manifest.json"
+        )));
+        assert!(!watch_event_is_relevant(Path::new(
+            "/Users/me/repo/.DS_Store"
         )));
         assert!(watch_event_is_relevant(Path::new("C:/repo/src/main.rs")));
         assert!(watch_event_is_relevant(Path::new("C:/repo/.gitignore")));

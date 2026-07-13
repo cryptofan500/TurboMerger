@@ -7,109 +7,53 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  check:
-    name: Check
-    runs-on: windows-latest
+  validate:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+          - name: macOS Apple Silicon
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: '22'
-          cache: 'npm'
+          node-version: "22"
+          cache: npm
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
 
-      - name: Install dependencies
+      - name: Confirm native Apple Silicon runner
+        if: runner.os == 'macOS'
+        shell: bash
+        run: test "$(rustc --print host-tuple)" = "aarch64-apple-darwin"
+
+      - name: Install locked JavaScript dependencies
         run: npm ci
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
+      - name: Run static checks and tests
+        run: npm run verify
 
-      - name: Check Rust formatting
-        working-directory: src-tauri
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        working-directory: src-tauri
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: TypeScript type check
-        run: npm run typecheck
-
-      - name: ESLint
-        run: npm run lint
-
-  test:
-    name: Test
-    runs-on: windows-latest
-    needs: check
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-
-      - name: Run Rust tests
-        working-directory: src-tauri
-        run: cargo test --all-features
-
-  build:
-    name: Build
-    runs-on: windows-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-
-      - name: Build frontend
-        run: npm run build
-
-      - name: Build Tauri app (debug)
-        run: npm run tauri build -- --debug
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-build
-          path: |
-            src-tauri/target/debug/turbomerger.exe
-          retention-days: 7
+      - name: Validate the Tauri application build
+        run: npm run tauri:build -- --debug --no-bundle

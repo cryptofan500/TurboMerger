@@ -1,19 +1,40 @@
 {
   "name": "turbomerger",
-  "version": "7.5.0",
+  "version": "7.6.0",
   "description": "One-click codebase merger",
   "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cryptofan500/TurboMerger.git"
+  },
+  "homepage": "https://github.com/cryptofan500/TurboMerger#readme",
+  "bugs": {
+    "url": "https://github.com/cryptofan500/TurboMerger/issues"
+  },
+  "engines": {
+    "node": ">=22.12 <25",
+    "npm": ">=10"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "npm run typecheck && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
+    "tauri:build:mac": "tauri build --target aarch64-apple-darwin",
+    "tauri:build:windows": "tauri build --bundles nsis",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "format:check": "cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check",
+    "clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features --locked -- -D warnings",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --all-features --locked",
+    "version:check": "node scripts/check-version.mjs",
+    "check": "npm run version:check && npm run lint && npm run build",
+    "verify": "npm run check && npm run format:check && npm run clippy && npm run test:rust"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
@@ -24,6 +45,7 @@
   "devDependencies": {
     "@eslint/js": "^9.0.0",
     "@tauri-apps/cli": "^2.11.4",
+    "@types/node": "^22.0.0",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^5.0.0",

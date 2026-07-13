@@ -224,7 +224,10 @@ mod tests {
     fn ts_methods_and_arrows_elide_but_expression_arrows_survive() {
         let src = "export const inc = (x: number) => x + 1;\n\nexport function big(a: number): number {\n  const b = a * 2;\n  return b;\n}\n\nclass S {\n  run(): void {\n    console.log('hi');\n  }\n}\n";
         let out = compress_signatures(src, "ts").expect("changed");
-        assert!(out.contains("(x: number) => x + 1"), "expression arrow kept");
+        assert!(
+            out.contains("(x: number) => x + 1"),
+            "expression arrow kept"
+        );
         assert!(out.contains("export function big(a: number): number { ... }"));
         assert!(out.contains("run(): void { ... }"));
         assert!(!out.contains("console.log"));
@@ -269,9 +272,15 @@ mod tests {
         assert!(!out.contains("inner note"));
         assert!(!out.contains("trailing"));
         assert!(!out.contains("block"));
-        assert!(out.contains("let x = 1;\n"), "code after trailing comment removal intact: {out}");
+        assert!(
+            out.contains("let x = 1;\n"),
+            "code after trailing comment removal intact: {out}"
+        );
         assert!(out.contains("let y = 2;"));
-        assert!(!out.contains("\n\n    let x"), "whole-line comment must not leave a blank line");
+        assert!(
+            !out.contains("\n\n    let x"),
+            "whole-line comment must not leave a blank line"
+        );
         assert_eq!(out.matches("fn main()").count(), 1);
     }
 

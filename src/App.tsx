@@ -180,12 +180,16 @@ function App() {
   // Drag-and-drop a folder onto the window.
   useEffect(() => {
     const p = getCurrentWebview().onDragDropEvent((event) => {
-      if (event.payload.type === "drop" && event.payload.paths.length > 0) {
+      if (
+        !watching &&
+        event.payload.type === "drop" &&
+        event.payload.paths.length > 0
+      ) {
         setSourcePath(event.payload.paths[0]);
       }
     });
     return () => { p.then((f) => f()); };
-  }, []);
+  }, [watching]);
 
   const applyPreset = (p: Preset) => {
     setPreset(p);
@@ -655,7 +659,7 @@ function App() {
             !sourcePath || isRemote ? (
               <p className="hint">Pick a local source folder above first — apply-back writes into it.</p>
             ) : (
-              <ApplyPanel root={sourcePath} disabled={isWorking || watching} />
+              <ApplyPanel key={sourcePath} root={sourcePath} disabled={isWorking || watching} />
             )
           )}
         </section>

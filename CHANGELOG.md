@@ -2,6 +2,47 @@
 
 All notable changes to TurboMerger will be documented in this file.
 
+## [7.6.0] - 2026-07-13
+
+macOS release — TurboMerger runs natively on Apple Silicon (M1–M4).
+
+### Added
+- **macOS Apple Silicon support**: native `aarch64-apple-darwin` build on the
+  system WKWebView, ad-hoc-signed `.app` + `.dmg` bundle (macOS 12+), an
+  `icon.icns` generated from the original TM logo, and platform-split bundle
+  configs (`tauri.windows.conf.json` / `tauri.macos.conf.json`).
+- **macOS path policy**: protected system roots (`/`, `/System`, `/Library`,
+  `/usr`, `/private`, and broad `/Users` / `/Volumes` / `/Applications` roots)
+  are rejected as scan roots, while real projects under `/Users/<name>/…`,
+  external volumes, and safe temp descendants (`/private/tmp`,
+  `/private/var/folders`) validate normally. Darwin's symlinked `/tmp`/`/var`
+  aliases are handled: the selected root is rejected only if it is itself a
+  symlink, then policy runs on the canonical path.
+- **Open in Finder** (`open -R`) behind Show in Folder on macOS.
+- **CI on real Apple hardware**: GitHub Actions matrix (Windows x64 + macOS
+  Apple Silicon) running the full verify suite plus a no-bundle Tauri build on
+  every push; the release workflow builds the NSIS installer and a verified DMG
+  (arm64 slice + ad-hoc signature + `hdiutil` checks) and publishes a draft
+  release with a single `SHA256SUMS.txt`.
+- Onboarding + docs: `docs/MACOS.md` (M4 runbook, Gatekeeper guidance, smoke
+  test), `docs/RELEASING.md`, `SECURITY.md`, a `scripts/macos-check.sh`
+  prerequisite checker, and a `scripts/check-version.mjs` version-agreement gate.
+
+### Fixed
+- Frontend build target now follows the platform (WKWebView `safari13` on macOS
+  instead of always Chromium `chrome105`); the broad `TAURI_*` env namespace is
+  no longer exposed to client code.
+- Watch mode ignores Finder metadata (`.DS_Store`) and TurboMerger's own
+  `.turbomerger/` backup writes; drag/drop can no longer switch the source
+  folder mid-watch; the Apply panel remounts when the selected root changes.
+
+### Internal
+- Rust pinned to `1.92.0` via `rust-toolchain.toml` (identical rustfmt/clippy
+  locally, in CI, and on contributor Macs); `.nvmrc` Node 22; `.gitattributes`
+  line-ending rules; Dependabot for actions/npm/cargo; GitHub Actions pinned to
+  commit SHAs; `npm run verify` aggregate gate; new cross-platform path-policy
+  and watch-filter tests.
+
 ## [7.5.0] - 2026-07-10
 
 Apply-back release (T3-3) — the merge → chat → **apply the reply** loop closes.
@@ -71,7 +112,7 @@ Apply-back release (T3-3) — the merge → chat → **apply the reply** loop cl
   +27 tests → 94 total (76 unit, 8 apply-back integration, 10 core integration).
   Mixed-line-ending round-trips (LF file with stray CRLF lines) are byte-exact — caught
   by release-exe E2E, locked in by tests. Credential safety verified end-to-end against
-  the real `[private-repo-A]` (+ Support) repos by a counts-only differential
+  two real credential-heavy production repos (app + support) by a counts-only differential
   source-vs-output containment harness: 0 of 36 source-extracted secret candidates
   survive into the default-mode output; no secret value ever printed.
 

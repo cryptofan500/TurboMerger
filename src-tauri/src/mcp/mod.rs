@@ -181,7 +181,9 @@ fn tool_definitions() -> Value {
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
-    args.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
 }
 fn arg_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
@@ -281,7 +283,11 @@ fn tool_repo_map(args: &Value) -> Result<String, String> {
     let job = resolve_job(&options)?;
     let scan = crate::scanner::scan_text_files(&job.root, &job.scan_options)
         .map_err(|e| format!("scan failed: {}", e))?;
-    Ok(crate::repomap::build_repo_map(&job.root, &scan.files, tokens))
+    Ok(crate::repomap::build_repo_map(
+        &job.root,
+        &scan.files,
+        tokens,
+    ))
 }
 
 /// Guard: read/grep serve TurboMerger outputs only, not arbitrary files.
@@ -377,8 +383,9 @@ mod tests {
         assert!(resp["result"]["capabilities"]["tools"].is_object());
 
         // notifications get no response
-        assert!(handle_message(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
-            .is_none());
+        assert!(
+            handle_message(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none()
+        );
 
         let pong = call(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#);
         assert!(pong["result"].is_object());

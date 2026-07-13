@@ -23,9 +23,37 @@ const MAX_SIG_CHARS: usize = 120;
 
 /// Method-name noise that would connect everything to everything.
 const NAME_STOPWORDS: &[&str] = &[
-    "new", "from", "default", "main", "init", "get", "set", "len", "fmt", "clone", "drop",
-    "next", "run", "build", "to_string", "into", "index", "iter", "test", "setup", "call",
-    "close", "open", "read", "write", "update", "render", "value", "data", "self", "this",
+    "new",
+    "from",
+    "default",
+    "main",
+    "init",
+    "get",
+    "set",
+    "len",
+    "fmt",
+    "clone",
+    "drop",
+    "next",
+    "run",
+    "build",
+    "to_string",
+    "into",
+    "index",
+    "iter",
+    "test",
+    "setup",
+    "call",
+    "close",
+    "open",
+    "read",
+    "write",
+    "update",
+    "render",
+    "value",
+    "data",
+    "self",
+    "this",
 ];
 
 struct FileTags {
@@ -101,7 +129,10 @@ fn signature_of(src: &str, def: tree_sitter::Node) -> String {
         .map(|b| b.start_byte())
         .unwrap_or_else(|| def.end_byte())
         .max(start);
-    let sig: String = src[start..end].split_whitespace().collect::<Vec<_>>().join(" ");
+    let sig: String = src[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let sig = sig.trim_end_matches(['{', ':']).trim_end().to_string();
     if sig.chars().count() > MAX_SIG_CHARS {
         let cut: String = sig.chars().take(MAX_SIG_CHARS).collect();
@@ -348,7 +379,9 @@ mod tests {
         let tags = extract_tags(src, "rs").expect("parsed");
         let names: Vec<&str> = tags.defs.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["widget_alpha", "WidgetBeta"]);
-        assert!(tags.defs[0].1.contains("pub fn widget_alpha(v: u32) -> u32"));
+        assert!(tags.defs[0]
+            .1
+            .contains("pub fn widget_alpha(v: u32) -> u32"));
         assert!(tags.refs.iter().any(|r| r == "helper_call"));
     }
 
@@ -396,7 +429,10 @@ mod tests {
             "expected truncation note:\n{}",
             map
         );
-        assert!(crate::tokens::count(&map) < 200, "map must stay near budget");
+        assert!(
+            crate::tokens::count(&map) < 200,
+            "map must stay near budget"
+        );
     }
 
     #[test]

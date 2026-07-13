@@ -1,123 +1,120 @@
 # TurboMerger
 
-A fast Windows desktop app that merges a codebase into a single, LLM-ready markdown
-file — gitignore-aware, secret-redacting, with a per-file merge report. Built with
-Rust + Tauri 2 and a React/TypeScript UI (WebView2).
+[![CI](https://github.com/cryptofan500/TurboMerger/actions/workflows/ci.yml/badge.svg)](https://github.com/cryptofan500/TurboMerger/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20Apple%20Silicon%20%7C%20Windows-lightgrey.svg)
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
+TurboMerger turns a codebase into one structured, LLM-ready file. It is a
+local Rust + Tauri 2 desktop app with a React/TypeScript interface, gitignore-aware
+scanning, secret redaction, exact token counts, repository maps, and reviewed
+apply-back of an LLM response.
 
-## What it does
-
-Point it at a folder; it produces `<folder>_<timestamp>_merged.md` in your Downloads
-(or a location you pick) containing a directory tree, a linked table of contents, every
-text file wrapped in a collision-proof code fence, and a **Merge Report** listing exactly
-what was skipped and why. Designed for pasting a whole project into ChatGPT / Claude /
-Gemini.
-
-## Features
-
-- **Gitignore-aware scanning** — honors `.gitignore`, `.ignore`, `.git/info/exclude`, and
-  a highest-precedence `.turbomergerignore` (via the `ignore` crate, ripgrep's walker).
-  Works even outside a git repo. Toggle off if you want everything.
-- **Real token counting** — exact `o200k_base` (tiktoken) counts per file and per merge, a
-  Claude estimate, and a fit hint against GPT 128k / Claude 200k / Gemini 1M.
-- **Output formats** — Markdown, **Claude XML (cxml)**, XML, JSON, or Plain text.
-- **Token-budget splitting** — cap tokens and the output splits at file boundaries into
-  `…part1-of-N` files, each labelled "Part N/M".
-- **Ordering** — alphabetical, entry-points-first, or important-last (README/entry files at
-  the end, where LLMs weight context most).
-- **Include/exclude globs** — UI + `turbomerger.toml [filter]`; plus content slimming
-  (remove empty lines, truncate long base64 blobs). **Presets**: LLM-review-lean,
-  Claude-cxml, Full archive, Docs only.
-- **Compress to signatures** — tree-sitter elides function bodies (`{ ... }` / `...`)
-  across rs/js/jsx/ts/tsx/py/go/java/c/cpp, keeping signatures, types, imports, and class
-  structure (~60–80% token cut); separate strip-comments toggle. Unparseable files pass
-  through unchanged.
-- **Repo map** — `turbomerger map <src>` builds an aider-style ranked signature map
-  (tree-sitter def/ref tags → PageRank → token budget) for repos that won't fit whole.
-- **Curate before merging** — **Scan & curate** opens a tri-state checkbox file tree with
-  per-file token counts and a selected-vs-budget bar, a click-to-exclude token **treemap**,
-  and a skip-report drill-in with per-file "include anyway" rescue. Selection persists per
-  project.
-- **Watch mode** — re-merges (debounced) into a stable `<repo>_watch_merged.*` file on
-  every change; `.git` churn and own outputs ignored.
-- **Git context** — optionally append the working-tree diff (`--git-diff`) and recent
-  commits (`--git-log N`) as final, redacted sections.
-- **Remote repos** — paste `owner/repo` or a GitHub/GitLab URL: shallow clone to a
-  self-cleaning temp dir → normal pipeline; PAT held in memory only.
-- **MCP server** — `turbomerger mcp` serves `pack_directory` / `repo_map` / `read_output` /
-  `grep_output` to Claude Desktop/Code over stdio (redaction forced on).
-- **Claude skill** — optional `.claude/skills/<repo>/SKILL.md` emission describing the
-  snapshot and how to regenerate it.
-- **Apply-back with visual diffs** — paste the LLM's reply (fenced blocks under `## path`
-  headers, cxml documents, or unified diffs) into the **Apply** panel: per-file
-  side-by-side diff review with accept/reject, then one click writes the accepted files.
-  Dry-run by default; originals are backed up to `.turbomerger/backups/<UTC>/` with a
-  one-click **Restore last apply**. Proposals can never escape the source folder, binary
-  targets are refused, deletions are shown but never executed, and a file that changed on
-  disk since the preview fails safe. CLI twin: `turbomerger apply`.
-- **Secret redaction** — API keys, tokens, private keys, and DB connection strings
-  (AWS, GitHub, GitLab, OpenAI, Anthropic, Google, Stripe, Slack, JWTs, …) are replaced
-  with `[REDACTED]` before writing (entropy gate + placeholder stopwords). Labeled
-  values (`password: X`, `token = Y`) are redacted contextually even in prose — the
-  changelog/session-note leak class — while identifier references and env lookups in
-  code stay intact. Credential *data files* and *credential-dense* files are excluded
-  wholesale (see *Security*). On by default; counted in the report.
-- **Nothing dropped silently** — every excluded file appears in the Merge Report with a
-  reason (binary, too large, gitignored, sensitive, credential-dense, unreadable, …).
-- **Headless CLI** — `turbomerger merge <src> [out] [--flags]` for scripting/CI; drag a
-  folder onto the window; settings persist; open-in-chat links.
-- **Sensible dotfile handling** — well-known config dotfiles (`.gitignore`, `.mcp.json`,
-  `.github/`, `.env.example`, `.eslintrc*`, …) are included; sensitive ones (`.env`,
-  `*.pem`, `id_rsa`) are excluded-with-reason. "Include hidden dotfiles" opts in to the rest.
-- **Content-based text detection** — files with unknown extensions are classified by
-  sniffing the first 8 KB (magic bytes, null/control/non-ASCII ratios, line length).
-- **Collision-proof fences** — a file containing ```` ``` ```` gets a longer wrapper fence,
-  so markdown-heavy repos don't scramble the output.
-- **Token estimate + fit hint** — reports approximate tokens and whether the result fits
-  common context windows (GPT 128k / Claude 200k / Gemini 1M).
-- **Parallel + memory-bounded** — parallel directory walk (ripgrep walker) and parallel,
-  chunked file processing (Rayon); output is streamed in batches rather than held whole.
-- **Safe by construction** — symlinks/junctions never followed; system roots blocked;
-  cloud-placeholder files skipped rather than force-downloaded.
+The macOS build runs natively on Apple Silicon (`arm64`, including M1–M4) using
+WKWebView. The Windows build uses WebView2.
 
 ## Install
 
-Grab the latest `.msi` or `-setup.exe` from
-[Releases](https://github.com/cryptofan500/TurboMerger/releases), or build from source.
+### macOS Apple Silicon (M1–M4)
 
-### Build from source
+The easiest route is the Apple Silicon `.dmg` attached to the latest
+[GitHub Release](https://github.com/cryptofan500/TurboMerger/releases).
 
-Requirements: Windows 10/11, Node.js 20+, Rust (stable, MSVC target), Visual Studio Build
-Tools with the "Desktop development with C++" workload.
+1. Download the `.dmg` and `SHA256SUMS.txt` from the same release.
+2. In Terminal, run `shasum -a 256 ~/Downloads/TurboMerger*.dmg` and compare it
+   with the published checksum.
+3. Open the DMG and drag TurboMerger into Applications.
+4. Launch TurboMerger.
+
+The friend build is ad-hoc signed but not Apple-notarized. If Gatekeeper blocks a
+download you trust, try to open it once, then use **System Settings → Privacy &
+Security → Open Anyway**. No blanket quarantine-removal command is required.
+
+If a current DMG is not available yet, build it from source:
+
+```bash
+git clone https://github.com/cryptofan500/TurboMerger.git
+cd TurboMerger
+
+# One-time prerequisites: Xcode Command Line Tools, Node 22/24, Git, Rust stable
+xcode-select --install
+# Install Node + Git with your preferred package manager, then install Rust from:
+# https://rustup.rs
+
+bash scripts/macos-check.sh
+rustup target add aarch64-apple-darwin
+npm ci
+npm run verify
+npm run tauri:build:mac
+```
+
+Build outputs:
+
+```text
+src-tauri/target/aarch64-apple-darwin/release/bundle/macos/TurboMerger.app
+src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+```
+
+See [docs/MACOS.md](docs/MACOS.md) for the full M4 runbook, validation commands,
+Gatekeeper details, smoke tests, and troubleshooting.
+
+### Windows 10/11
+
+Download the latest `-setup.exe` from
+[Releases](https://github.com/cryptofan500/TurboMerger/releases), or build from
+source with Node 22/24, stable Rust (MSVC), and Visual Studio Build Tools with
+the **Desktop development with C++** workload:
 
 ```powershell
 git clone https://github.com/cryptofan500/TurboMerger.git
 cd TurboMerger
-npm install
-npm run tauri:build   # exe + NSIS/MSI installers under src-tauri/target/release/
+npm ci
+npm run verify
+npm run tauri:build:windows
 ```
 
-> Build from a PowerShell / Developer prompt, **not** Git Bash — Git Bash's `link.exe`
-> shadows the MSVC linker and breaks the build.
+Use PowerShell or a Developer prompt; Git Bash can put its unrelated `link.exe`
+ahead of the MSVC linker.
 
-## Usage
+## What it produces
 
-1. Launch TurboMerger.
-2. **Browse** to a source folder — or type `owner/repo` / a GitHub URL to pack a remote
-   repo (optional PAT field appears; it stays in memory only).
-3. Adjust options (respect gitignore, redact secrets, tree/TOC, formats, compression,
-   git context, hidden files, virtual environments).
-4. Optionally **Scan & curate** first: untick files/folders in the tree, click tiles in
-   the token treemap, or rescue skipped files ("include anyway"). The Merge button then
-   merges the selection.
-5. Optionally **Change** the output path (a folder auto-names the file; a file path is used
-   verbatim).
-6. **Merge** (or toggle **Watch** to re-merge on every change), then **Open File** or
-   **Show in Folder**.
+Select a local folder or enter a public repository URL. TurboMerger writes a
+timestamped Markdown, Claude XML, XML, JSON, or plain-text snapshot containing:
 
-### CLI
+- a directory tree and linked contents;
+- every included text file in collision-safe fences;
+- exact `o200k_base` token counts and context-window hints;
+- optional token-budget splitting and signature-only compression;
+- optional Git diff and recent-commit context; and
+- a merge report explaining every included, skipped, unreadable, or redacted file.
+
+## Highlights
+
+- **Gitignore-aware scanning** — honors `.gitignore`, `.ignore`,
+  `.git/info/exclude`, and the higher-priority `.turbomergerignore`.
+- **Secret safeguards** — excludes credential/key material, detects
+  credential-dense documents, and redacts known token formats and labeled values.
+- **Curate before merge** — tri-state file tree, token treemap, saved per-project
+  selections, and explicit rescue of skipped files.
+- **Remote repository packing** — shallow-clones GitHub/GitLab URLs or
+  `owner/repo` shorthand into a self-cleaning temporary directory.
+- **Compression and repo maps** — tree-sitter signatures plus a ranked,
+  budget-aware Aider-style repository map.
+- **Watch mode** — debounced regeneration while ignoring Git state, Finder
+  metadata, TurboMerger backups, and TurboMerger's own output.
+- **Apply-back** — paste a fenced-file response, cxml response, or unified diff;
+  preview per-file changes, accept only what you want, create backups, and restore.
+- **CLI and MCP** — headless merge/map/apply commands and an MCP stdio server.
+
+## Use the desktop app
+
+1. Select a source folder, or enter a remote repository URL.
+2. Keep **Redact secrets** and **Respect .gitignore** enabled for the safest default.
+3. Choose a format, ordering, and optional token limit.
+4. Optionally use **Scan & curate** before merging.
+5. Merge, then open the output or reveal it in Finder/File Explorer.
+6. To apply an LLM response, open the **Apply** panel, preview, review, and accept.
+
+## CLI
 
 ```text
 turbomerger merge <src|owner/repo|URL> [out]
@@ -126,125 +123,81 @@ turbomerger merge <src|owner/repo|URL> [out]
     [--compress] [--strip-comments] [--git-diff] [--git-log N] [--emit-skill]
     [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--quiet]
 turbomerger map <src|owner/repo|URL> [out] [--tokens N]
-turbomerger mcp     # stdio MCP server
-turbomerger apply <root> --from reply.md [--yes]   # dry-run without --yes
-turbomerger apply <root> --restore                 # undo the last apply
+turbomerger mcp
+turbomerger apply <root> --from reply.md [--yes]
+turbomerger apply <root> --restore
 ```
 
-Remote refs shallow-clone to a temp dir (private repos: set `TURBOMERGER_PAT`).
+After a source build on Apple Silicon, the binary is at
+`src-tauri/target/aarch64-apple-darwin/release/turbomerger`. Private remote
+repositories can use `TURBOMERGER_PAT`; the desktop PAT field remains in memory
+and is never persisted.
 
-### Apply-back (paste the LLM's answer back)
+## Optional project configuration
 
-Merge → paste into a chat → ask for changes → paste the reply into **Apply an LLM reply
-back to this folder** → *Preview changes* → review each file's side-by-side diff →
-*Apply*. Recognized reply shapes:
-
-- a file header — `## path/to/file.rs`, `**path**`, `File: path`, or a backticked path
-  (backticks also allow paths with spaces) — followed by a fenced code block
-  (whole-file replacement; unknown paths create new files);
-- TurboMerger's own cxml output (`<source>path</source>` documents) pasted back;
-- unified diffs (`--- a/x` / `+++ b/x` / `@@` hunks), fenced or bare — tolerant of the
-  drifted line numbers and lost trailing whitespace typical of chat replies.
-
-Every apply first copies originals to `.turbomerger/backups/<UTC>/` (manifest included)
-— *Restore last apply* (or `turbomerger apply <root> --restore`) reverses it, deleting
-files the apply created. CRLF files stay CRLF even when the reply is LF-only.
-
-### MCP (Claude Desktop / Claude Code)
-
-```json
-{ "mcpServers": { "turbomerger": { "command": "C:/path/to/turbomerger.exe", "args": ["mcp"] } } }
-```
-
-Tools: `pack_directory` (merge → file, summary returned), `repo_map` (map text inline),
-`read_output` / `grep_output` (sliced access to `*_merged.*` outputs only).
-
-## Configuration — `turbomerger.toml` (optional)
-
-Drop a `turbomerger.toml` in the scanned folder's root to override behavior per project:
+Place `turbomerger.toml` in the scanned root:
 
 ```toml
 [extensions]
-include = ["myformat", "custom1"]  # extra extensions to treat as text
-exclude = ["log", "tmp"]           # extensions to always skip
-binary  = ["dat"]                  # extra extensions to treat as binary
+include = ["myformat"]
+exclude = ["log", "tmp"]
+binary = ["dat"]
 
 [scanning]
-include_hidden   = false
-include_venvs    = false
-max_file_size_mb = 2               # absolute per-file cap
-content_sniff    = true
+include_hidden = false
+include_venvs = false
+max_file_size_mb = 2
+content_sniff = true
 ```
 
-UI checkboxes take precedence; the config file can additionally force inclusions and
-supplies the extension overrides + size cap. For path-level control, add a
-`.turbomergerignore` (gitignore syntax, highest precedence).
+UI values take precedence. Use `.turbomergerignore` for path rules.
 
-## How detection works
+## Security model
 
-Each candidate file runs through: config exclude list → known binary extension → known text
-extension → content sniff (magic bytes → null-byte ratio → control-char ratio → non-ASCII
-ratio → max line length). Directories in the always-skip set (`.git`, `node_modules`,
-`target`, build/cache dirs, credential dirs) and gitignored paths are pruned before descent.
-Lock files, minified bundles, and previous TurboMerger outputs are skipped by name.
+- The walker does not follow symlinks/junctions, and broad operating-system roots
+  are rejected. Normal macOS projects under `/Users`, external volumes, and safe
+  temporary descendants remain usable.
+- Sensitive files and credential-dense data files are never merged. Selected
+  credential documents may be read harvest-only so their values can be redacted
+  if echoed elsewhere; their contents are discarded.
+- Apply-back is dry-run first, confines paths to the selected root, refuses binary
+  targets and deletions, checks for on-disk changes, and creates restorable backups.
+- The WebView has a strict Content Security Policy and no generic filesystem plugin.
 
-## Security
-
-- Symlinks and reparse points (junctions) are never followed.
-- Windows system roots (`C:\Windows`, `Program Files`, `ProgramData`, …) are blocked as
-  scan roots.
-- Sensitive files (`.env`, key/cert material, SSH keys, credential stores) are excluded and
-  listed in the report.
-- **Credential data files** (e.g. `*_CREDENTIALS_*.md`, `passwords.csv`, `vault.txt`,
-  `*.secrets.yaml`) and **credential-dense files** (content with multiple inline logins,
-  Google app-passwords, or key blocks) are excluded wholesale — never partially redacted.
-  Source files that merely mention the words (`password_reset.py`, `useApiKey.ts`) are not
-  affected.
-- Detected secrets are redacted from file contents before writing, including context-gated
-  Google app-passwords, `email:password` values, and labeled values (`password: …`,
-  `token = …`) whose contents look like real secrets.
-- **Known-secret propagation.** Values learned from labeled lines and from credential
-  files are redacted in *every* merged file — so a password quoted in a changelog or
-  session note (with no label on that line) is scrubbed even though it's just prose. To
-  make this work, credential documents (`.env`, `*_CREDENTIALS_*.md`, `credentials.json`)
-  are read *harvest-only* — **even when gitignored** — purely to learn their values; their
-  contents are **never merged** (the file itself stays excluded). Verified end-to-end by a
-  differential source-vs-output containment test on real credential-heavy repos: no
-  source-extracted secret survives into default-mode output.
-- **Limitation:** no redactor catches every credential embedded in free-form prose (a
-  never-labeled, never-in-a-credential-file value can still slip). Default
-  (gitignore-respecting) mode is safest. The **Full archive / `--no-gitignore`** mode
-  deliberately includes everything and may surface prose-embedded secrets; review the
-  output before uploading.
-- Strict Content-Security-Policy on the WebView.
+No automatic redactor is perfect. Review generated output before uploading it,
+especially when disabling gitignore handling or redaction. See [SECURITY.md](SECURITY.md)
+for reporting and safe-use guidance.
 
 ## Development
 
-```powershell
-npm install
-npm run tauri:dev     # hot-reload GUI
-npm run typecheck     # tsc --noEmit
-npm run lint          # eslint
-cargo test --manifest-path src-tauri/Cargo.toml   # Rust unit + integration tests
+```bash
+npm ci
+npm run check          # versions, ESLint, both TypeScript configs, frontend build
+npm run format:check   # rustfmt check
+npm run clippy         # warnings are errors
+npm run test:rust      # 94+ Rust unit/integration tests
+npm run tauri:dev      # desktop development mode
 ```
+
+`npm run verify` runs the complete non-GUI check suite. GitHub CI runs that suite
+and a no-bundle Tauri build on Windows and an ARM64 macOS runner. Tagged releases
+produce a draft release through a single publisher job; see
+[docs/RELEASING.md](docs/RELEASING.md).
 
 ## Architecture
 
-```
-src/                     React/TypeScript UI (App.tsx + components/CuratePanel.tsx)
-src-tauri/src/
-  lib.rs                 Tauri entry point + command registration
-  main.rs                CLI dispatch (merge / map / mcp) before the GUI starts
-  commands.rs            IPC handlers (merge, scan, watch, remote, repo-map) + CLI
-  config.rs              turbomerger.toml loader
-  scanner/mod.rs         gitignore-aware walk + text/binary classification
-  security/mod.rs        path validation, binary detection, secret redaction
-  merger/mod.rs          parallel read/decode/redact + multi-format writer + report
-  compress/mod.rs        tree-sitter signatures-only compression + comment strip
-  repomap/mod.rs         def/ref tags → PageRank → budgeted signature map
-  remote/mod.rs          owner/repo & URL parsing + shallow clone (temp, self-cleaning)
-  mcp/mod.rs             stdio MCP server (pack/map/read/grep tools)
-src-tauri/tests/         end-to-end fixture-tree tests
+```text
+src/                         React/TypeScript UI
+src-tauri/src/commands.rs    Tauri commands, CLI, watch mode
+src-tauri/src/scanner/       gitignore-aware classification
+src-tauri/src/security/      path policy, sensitive-file rules, redaction
+src-tauri/src/merger/        decode/redact/format/report pipeline
+src-tauri/src/compress/      tree-sitter signature compression
+src-tauri/src/repomap/       definition/reference ranking
+src-tauri/src/remote/        shallow remote clones
+src-tauri/src/applyback/     preview/apply/backup/restore
+src-tauri/src/mcp/           MCP stdio server
+src-tauri/tests/             end-to-end Rust fixtures
 ```
 
 ## License

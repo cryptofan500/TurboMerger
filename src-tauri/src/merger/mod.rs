@@ -140,7 +140,11 @@ type MergeSkip = (String, String);
 /// A processed file plus harvested secrets: `.1` = labeled values (high
 /// confidence, propagate unconditionally), `.2` = whole-file opaque tokens
 /// from a credential-dense exclusion (propagate behind a frequency guard).
-type ProcessedFile = (std::result::Result<Block, MergeSkip>, Vec<String>, Vec<String>);
+type ProcessedFile = (
+    std::result::Result<Block, MergeSkip>,
+    Vec<String>,
+    Vec<String>,
+);
 
 /// A dense-file token seen in more than this many blocks is a common term
 /// (project name, hostname), not a secret — the frequency guard drops it.
@@ -352,7 +356,11 @@ fn write_skill(root: &Path, blocks: &[Block], outcome: &MergeOutcome) -> Result<
         .collect::<String>()
         .trim_matches('-')
         .to_string();
-    let slug = if slug.is_empty() { "project".into() } else { slug };
+    let slug = if slug.is_empty() {
+        "project".into()
+    } else {
+        slug
+    };
 
     let dir = root
         .join(".claude")
@@ -493,7 +501,10 @@ fn process_file_inner(
             .unwrap_or("")
             .to_ascii_lowercase();
         if cfg.redact
-            && matches!(ext.as_str(), "md" | "markdown" | "txt" | "text" | "csv" | "log" | "")
+            && matches!(
+                ext.as_str(),
+                "md" | "markdown" | "txt" | "text" | "csv" | "log" | ""
+            )
         {
             *dense = crate::security::harvest_dense_file_tokens(&content);
         }
@@ -583,7 +594,9 @@ fn run_git(root: &Path, args: &[&str]) -> std::result::Result<String, String> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = cmd.output().map_err(|e| format!("git not runnable: {}", e))?;
+    let out = cmd
+        .output()
+        .map_err(|e| format!("git not runnable: {}", e))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(err.lines().next().unwrap_or("git failed").to_string());
@@ -681,7 +694,10 @@ fn decode_text(
         } else {
             let (text, had_errors) = enc.decode_without_bom_handling(&buffer[bom_len..]);
             let note = if had_errors {
-                format!("decoded from {} (BOM) with replacement characters", enc.name())
+                format!(
+                    "decoded from {} (BOM) with replacement characters",
+                    enc.name()
+                )
             } else {
                 format!("decoded from {} (BOM)", enc.name())
             };

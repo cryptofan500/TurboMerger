@@ -1,13 +1,13 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import { resolve } from "path";
+import { fileURLToPath, URL } from "node:url";
 
 // https://vitejs.dev/config/
-export default defineConfig(async () => ({
+export default defineConfig(() => ({
   plugins: [react()],
   resolve: {
     alias: {
-      "@": resolve(__dirname, "src"),
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
     },
   },
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
@@ -22,15 +22,13 @@ export default defineConfig(async () => ({
       ignored: ["**/src-tauri/**"],
     },
   },
-  // to make use of `TAURI_DEBUG` and other env variables
-  // https://tauri.app/v1/api/config#buildconfig.beforedevcommand
-  envPrefix: ["VITE_", "TAURI_"],
   build: {
-    // Windows-only app rendering in WebView2 (Chromium) — Tauri 2 renamed the
-    // v1 TAURI_PLATFORM/TAURI_DEBUG env vars to TAURI_ENV_*, so the old
-    // conditional silently always chose the safari13 fallback.
-    target: "chrome105",
-    minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
+    // Tauri renders with Chromium/WebView2 on Windows and WKWebView on macOS.
+    target:
+      process.env.TAURI_ENV_PLATFORM === "windows"
+        ? "chrome105"
+        : "safari13",
+    minify: !process.env.TAURI_ENV_DEBUG ? ("esbuild" as const) : false,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
   },
   // Use relative paths for Tauri custom protocol

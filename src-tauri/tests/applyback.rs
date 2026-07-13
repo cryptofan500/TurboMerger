@@ -24,9 +24,15 @@ fn build_fixture() -> Fixture {
         fs::write(p, content).unwrap();
     };
     write("src/main.rs", b"fn main() {\n    println!(\"one\");\n}\n");
-    write("src/lib.rs", b"pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n");
+    write(
+        "src/lib.rs",
+        b"pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    );
     write("README.md", b"# Fixture\n\ndocs\n");
-    write("data/img.png", &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0]);
+    write(
+        "data/img.png",
+        &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0],
+    );
     write("win.txt", b"alpha\r\nbeta\r\n");
     // Mixed endings (LF body, one CRLF line): must round-trip byte-exact.
     write("mixed.md", b"## heading-ish content\n\n```\nnope\n```\r\n");
@@ -57,7 +63,9 @@ fn markdown_reply_applies_creates_and_restores() {
     assert_eq!(guide.action, "create");
 
     // Preview wrote NOTHING (dry-run default).
-    assert!(fs::read_to_string(fx.root.join("src/main.rs")).unwrap().contains("one"));
+    assert!(fs::read_to_string(fx.root.join("src/main.rs"))
+        .unwrap()
+        .contains("one"));
     assert!(!fx.root.join("docs/new_guide.md").exists());
     assert!(!fx.root.join(".turbomerger").exists());
 
@@ -65,7 +73,9 @@ fn markdown_reply_applies_creates_and_restores() {
     let outcome = apply_files(&fx.root, &built.ready).expect("apply");
     assert_eq!(outcome.applied.len(), 2);
     assert!(outcome.failed.is_empty());
-    assert!(fs::read_to_string(fx.root.join("src/main.rs")).unwrap().contains("two"));
+    assert!(fs::read_to_string(fx.root.join("src/main.rs"))
+        .unwrap()
+        .contains("two"));
     assert_eq!(
         fs::read_to_string(fx.root.join("docs/new_guide.md")).unwrap(),
         "# Guide\n\nfresh file\n"
@@ -80,7 +90,9 @@ fn markdown_reply_applies_creates_and_restores() {
     let restore = restore_last(&fx.root).expect("restore");
     assert_eq!(restore.restored, vec!["src/main.rs".to_string()]);
     assert_eq!(restore.deleted, vec!["docs/new_guide.md".to_string()]);
-    assert!(fs::read_to_string(fx.root.join("src/main.rs")).unwrap().contains("one"));
+    assert!(fs::read_to_string(fx.root.join("src/main.rs"))
+        .unwrap()
+        .contains("one"));
     assert!(!fx.root.join("docs/new_guide.md").exists());
 }
 
@@ -119,7 +131,10 @@ fn own_markdown_output_round_trips_as_identical() {
             f.rel_path, f.adds, f.dels
         );
     }
-    assert!(built.ready.is_empty(), "identical files are never re-written");
+    assert!(
+        built.ready.is_empty(),
+        "identical files are never re-written"
+    );
 }
 
 #[test]
@@ -145,14 +160,23 @@ fn own_cxml_output_round_trips_as_identical() {
 
     let merged = fs::read_to_string(&out).unwrap();
     let changes = parse_reply(&merged);
-    assert!(changes.len() >= 4, "cxml sections should parse: {}", changes.len());
+    assert!(
+        changes.len() >= 4,
+        "cxml sections should parse: {}",
+        changes.len()
+    );
     assert!(
         !changes.iter().any(|c| c.path.contains("MERGE_INFO")),
         "synthetic MERGE_INFO document must be skipped"
     );
     let built = build_preview(&fx.root, &changes).expect("preview");
     for f in &built.preview.files {
-        assert!(f.ok && f.identical, "{} not identical: {}", f.rel_path, f.note);
+        assert!(
+            f.ok && f.identical,
+            "{} not identical: {}",
+            f.rel_path,
+            f.note
+        );
     }
 }
 
@@ -176,7 +200,11 @@ fn unified_diff_modifies_and_dev_null_creates() {
     let changes = parse_reply(reply);
     assert_eq!(changes.len(), 2);
     let built = build_preview(&fx.root, &changes).expect("preview");
-    assert!(built.preview.files.iter().all(|f| f.ok), "{:?}", built.preview.files);
+    assert!(
+        built.preview.files.iter().all(|f| f.ok),
+        "{:?}",
+        built.preview.files
+    );
 
     let outcome = apply_files(&fx.root, &built.ready).expect("apply");
     assert_eq!(outcome.applied.len(), 2);
@@ -229,7 +257,10 @@ fn safety_rails_traversal_binary_delete() {
     assert!(!img.ok && img.note.contains("binary"), "{:?}", img.note);
     let del = by_path("src/lib.rs");
     assert!(!del.ok && del.action == "delete", "{:?}", del.note);
-    assert!(built.ready.is_empty(), "nothing unsafe may become appliable");
+    assert!(
+        built.ready.is_empty(),
+        "nothing unsafe may become appliable"
+    );
 
     // Nothing was created outside or inside the root.
     assert!(!fx.root.parent().unwrap().join("escape.md").exists());

@@ -227,7 +227,11 @@ pub fn parse_reply(text: &str) -> Vec<ParsedChange> {
             i += 1;
             continue;
         }
-        if pending_path.is_some() && !pending_prose_used && line.trim_end().ends_with(':') && line.len() < 120 {
+        if pending_path.is_some()
+            && !pending_prose_used
+            && line.trim_end().ends_with(':')
+            && line.len() < 120
+        {
             pending_prose_used = true;
             i += 1;
             continue;
@@ -263,9 +267,7 @@ fn fence_open(line: &str) -> Option<(char, usize, String)> {
 
 fn fence_close(line: &str, fence_char: char, fence_len: usize) -> bool {
     let t = line.trim();
-    !t.is_empty()
-        && t.chars().all(|c| c == fence_char)
-        && t.len() >= fence_len
+    !t.is_empty() && t.chars().all(|c| c == fence_char) && t.len() >= fence_len
 }
 
 /// Extract a file path from a header line (`## path`, `**path**`, `File: path`,
@@ -286,7 +288,10 @@ fn header_path(line: &str) -> Option<String> {
         t // clean_header_path strips the backticks
     } else {
         let lower = t.to_ascii_lowercase();
-        if lower.starts_with("file:") || lower.starts_with("path:") || lower.starts_with("filename:") {
+        if lower.starts_with("file:")
+            || lower.starts_with("path:")
+            || lower.starts_with("filename:")
+        {
             t.split_once(':').map(|(_, rest)| rest.trim()).unwrap_or("")
         } else {
             return None;
@@ -308,7 +313,9 @@ fn clean_header_path(raw: &str) -> Option<String> {
     if s.is_empty() || s.len() > 300 {
         return None;
     }
-    if s.chars().any(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*')) {
+    if s.chars()
+        .any(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*'))
+    {
         return None;
     }
     // Unbackticked paths must look path-like: no spaces, and a dot or slash.
@@ -502,9 +509,8 @@ fn parse_cxml(
         if k >= lines.len() {
             break;
         }
-        let synthetic = path == "MERGE_INFO"
-            || path.starts_with("GIT DIFF")
-            || path.starts_with("GIT LOG");
+        let synthetic =
+            path == "MERGE_INFO" || path.starts_with("GIT DIFF") || path.starts_with("GIT LOG");
         if !synthetic && clean_header_path(&format!("`{}`", path)).is_some() {
             let body: &[&str] = if uniform_crlf {
                 &lines[body_start..k]
@@ -585,7 +591,11 @@ pub fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, String> {
     let mut res = out.join("\n");
     // The original's trailing newline wins unless the last hunk rewrote the
     // end of the file and flagged no-newline.
-    let ends_nl = if trailing { orig_ends_nl } else { !no_eol && (orig_ends_nl || orig.is_empty()) };
+    let ends_nl = if trailing {
+        orig_ends_nl
+    } else {
+        !no_eol && (orig_ends_nl || orig.is_empty())
+    };
     if ends_nl && !res.is_empty() {
         res.push('\n');
     }
@@ -725,12 +735,15 @@ pub fn build_preview(root: &Path, changes: &[ParsedChange]) -> Result<BuiltPrevi
         }
         // (Re)resolve the base: prior proposed content, else disk.
         let base = match &slot.result {
-            Ok((content, disk)) => Ok((content.clone(), DiskState {
-                exists: disk.exists,
-                binary: disk.binary,
-                content: disk.content.clone(),
-                hash: disk.hash,
-            })),
+            Ok((content, disk)) => Ok((
+                content.clone(),
+                DiskState {
+                    exists: disk.exists,
+                    binary: disk.binary,
+                    content: disk.content.clone(),
+                    hash: disk.hash,
+                },
+            )),
             Err(_) => match safe_join(root, &rel) {
                 Ok(target) => match read_disk(&target) {
                     Ok(disk) => {
@@ -812,7 +825,11 @@ pub fn build_preview(root: &Path, changes: &[ParsedChange]) -> Result<BuiltPrevi
                     rel_path: rel,
                     action: action.into(),
                     ok: true,
-                    note: if identical { "no changes — already matches disk".into() } else { String::new() },
+                    note: if identical {
+                        "no changes — already matches disk".into()
+                    } else {
+                        String::new()
+                    },
                     identical,
                     adds,
                     dels,
@@ -1021,7 +1038,9 @@ pub fn restore_last(root: &Path) -> Result<RestoreOutcome, String> {
         .filter(|p| p.is_dir() && p.join("manifest.json").exists())
         .collect();
     dirs.sort();
-    let latest = dirs.pop().ok_or_else(|| "no backups found for this folder".to_string())?;
+    let latest = dirs
+        .pop()
+        .ok_or_else(|| "no backups found for this folder".to_string())?;
 
     let manifest: Manifest = serde_json::from_str(
         &std::fs::read_to_string(latest.join("manifest.json"))
@@ -1070,9 +1089,18 @@ mod tests {
         assert_eq!(header_path("### `src/app.tsx`"), Some("src/app.tsx".into()));
         assert_eq!(header_path("**lib/util.py**"), Some("lib/util.py".into()));
         assert_eq!(header_path("**lib/util.py**:"), Some("lib/util.py".into()));
-        assert_eq!(header_path("File: docs/notes.md"), Some("docs/notes.md".into()));
-        assert_eq!(header_path("`My Dir/file name.rs`"), Some("My Dir/file name.rs".into()));
-        assert_eq!(header_path("`src\\win\\path.rs`"), Some("src/win/path.rs".into()));
+        assert_eq!(
+            header_path("File: docs/notes.md"),
+            Some("docs/notes.md".into())
+        );
+        assert_eq!(
+            header_path("`My Dir/file name.rs`"),
+            Some("My Dir/file name.rs".into())
+        );
+        assert_eq!(
+            header_path("`src\\win\\path.rs`"),
+            Some("src/win/path.rs".into())
+        );
         assert_eq!(header_path("## Summary"), None);
         assert_eq!(header_path("## What changed in src/main.rs"), None);
         assert_eq!(header_path("plain prose line"), None);

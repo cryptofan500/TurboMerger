@@ -39,7 +39,10 @@ pub fn parse_remote(input: &str) -> Option<(String, String)> {
         }
     };
 
-    if let Some(rest) = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")) {
+    if let Some(rest) = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+    {
         // host/owner/repo at minimum
         let (host, path) = rest.trim_end_matches('/').split_once('/')?;
         if host.is_empty() || !host.contains('.') || path.split('/').count() < 2 {
@@ -232,7 +235,10 @@ mod tests {
             "git@github.com:o/r.git"
         );
         assert_eq!(
-            scrub("fatal: repo 'https://x-access-token:TOKEN123@x/y'", Some("TOKEN123")),
+            scrub(
+                "fatal: repo 'https://x-access-token:TOKEN123@x/y'",
+                Some("TOKEN123")
+            ),
             "fatal: repo 'https://x-access-token:***@x/y'"
         );
     }
@@ -266,7 +272,10 @@ mod tests {
 
         let url = format!(
             "file:///{}",
-            origin.to_string_lossy().replace('\\', "/").trim_start_matches('/')
+            origin
+                .to_string_lossy()
+                .replace('\\', "/")
+                .trim_start_matches('/')
         );
         let checkout_path;
         {
@@ -279,10 +288,7 @@ mod tests {
                 .to_string_lossy()
                 .contains("origin_repo"));
         }
-        assert!(
-            !checkout_path.exists(),
-            "checkout must self-clean on drop"
-        );
+        assert!(!checkout_path.exists(), "checkout must self-clean on drop");
     }
 
     #[test]

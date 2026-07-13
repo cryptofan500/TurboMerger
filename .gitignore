@@ -33,11 +33,16 @@ id_rsa*
 id_dsa*
 id_ed25519*
 
+# Safe environment templates may be committed
+!.env.example
+!.env.*.example
+
 # Logs and temp
 *.log
 *.tmp
 *.temp
 npm-debug.log*
+mac_env_report.txt
 
 # Python (if any)
 *.pyc
@@ -53,6 +58,7 @@ coverage/
 # Caches
 .cache/
 .parcel-cache/
+*.tsbuildinfo
 
 # Rust specific
 **/*.rs.bk
@@ -61,6 +67,10 @@ Cargo.lock.bak
 # Tauri generated
 src-tauri/target/
 src-tauri/gen/
+
+# TurboMerger's own local state and generated outputs
+.turbomerger/
+*_merged.*
 
 # Development handoff and AI notes
 CLAUDE_CODE_MASTER_HANDOFF*.md
