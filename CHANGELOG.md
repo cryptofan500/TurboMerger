@@ -2,6 +2,39 @@
 
 All notable changes to TurboMerger will be documented in this file.
 
+## [7.7.0] - 2026-08-06
+
+Linux release — TurboMerger runs natively on Linux x64 (Debian/Ubuntu/Mint and
+compatible distros), joining Windows and macOS Apple Silicon under one version.
+
+### Added
+- **Linux x64 support**: native `x86_64-unknown-linux-gnu` build on the system
+  WebKitGTK webview, packaged as a `.deb` (primary install path for
+  Debian/Ubuntu/Mint) and a portable `.AppImage`, plus a platform-split bundle
+  config (`tauri.linux.conf.json`) alongside the existing Windows/macOS ones.
+- **Linux path policy**: reuses the existing `unix`-but-not-`macOS` system-root
+  block list (`/usr`, `/bin`, `/sbin`, `/dev`, `/etc`, `/proc`, `/sys`, `/run`,
+  `/boot`, `/lib`, `/lib64`) and the generic non-Windows symlink/reparse-point
+  check; no code changes were needed here — it was already in place.
+- **Open in file manager** (`xdg-open` via the `open` crate) behind Show in
+  Folder on Linux; unlike Windows/macOS this opens the containing folder
+  rather than pre-selecting the file, a documented `xdg-open` limitation.
+- **CI on a real Linux runner**: GitHub Actions matrix extended to Windows x64 +
+  macOS Apple Silicon + Linux x64 (`ubuntu-24.04`, matching the glibc/WebKitGTK
+  baseline of current Debian/Ubuntu/Mint), running the full verify suite plus a
+  no-bundle Tauri build on every push; the release workflow builds the `.deb`
+  and `.AppImage` and folds them into the single-publisher draft release
+  alongside the existing `SHA256SUMS.txt`.
+- Onboarding + docs: `docs/LINUX.md` (install, build-from-source, smoke test,
+  troubleshooting including the Ubuntu 24.04 `libfuse2t64` AppImage rename) and
+  a `scripts/linux-check.sh` prerequisite checker mirroring the macOS one.
+
+### Internal
+- `docs/RELEASING.md` updated for a three-platform release checklist.
+- `package.json` gains `tauri:build:linux`; version bumped to `7.7.0` across
+  `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`
+  per the existing version-agreement gate.
+
 ## [7.6.0] - 2026-07-13
 
 macOS release — TurboMerger runs natively on Apple Silicon (M1–M4).

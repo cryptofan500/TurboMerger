@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/cryptofan500/TurboMerger/actions/workflows/ci.yml/badge.svg)](https://github.com/cryptofan500/TurboMerger/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Platforms](https://img.shields.io/badge/platforms-macOS%20Apple%20Silicon%20%7C%20Windows-lightgrey.svg)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20Apple%20Silicon%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)
 
 TurboMerger turns a codebase into one structured, LLM-ready file. It is a
 local Rust + Tauri 2 desktop app with a React/TypeScript interface, gitignore-aware
@@ -10,7 +10,7 @@ scanning, secret redaction, exact token counts, repository maps, and reviewed
 apply-back of an LLM response.
 
 The macOS build runs natively on Apple Silicon (`arm64`, including M1–M4) using
-WKWebView. The Windows build uses WebView2.
+WKWebView. The Windows build uses WebView2. The Linux build uses WebKitGTK.
 
 ## Install
 
@@ -74,6 +74,41 @@ npm run tauri:build:windows
 
 Use PowerShell or a Developer prompt; Git Bash can put its unrelated `link.exe`
 ahead of the MSVC linker.
+
+### Linux (Debian/Ubuntu/Mint x64)
+
+Download the latest `.deb` from
+[Releases](https://github.com/cryptofan500/TurboMerger/releases) and install it
+with `sudo apt install ./TurboMerger_*.deb`, or use the portable `.AppImage` on
+other distros. Verify `SHA256SUMS.txt` from the same release first.
+
+To build from source:
+
+```bash
+git clone https://github.com/cryptofan500/TurboMerger.git
+cd TurboMerger
+
+# One-time prerequisites (Debian/Ubuntu/Mint):
+sudo apt update
+sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
+  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+# Install Node 22/24 and Rust from https://rustup.rs
+
+bash scripts/linux-check.sh
+npm ci
+npm run verify
+npm run tauri:build:linux
+```
+
+Build outputs:
+
+```text
+src-tauri/target/release/bundle/deb/*.deb
+src-tauri/target/release/bundle/appimage/*.AppImage
+```
+
+See [docs/LINUX.md](docs/LINUX.md) for the full runbook, the AppImage/FUSE
+note, and troubleshooting.
 
 ## What it produces
 

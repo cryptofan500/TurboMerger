@@ -1,6 +1,6 @@
 {
   "name": "turbomerger",
-  "version": "7.6.0",
+  "version": "7.7.0",
   "description": "One-click codebase merger",
   "private": true,
   "license": "MIT",
@@ -26,6 +26,7 @@
     "tauri:build": "tauri build",
     "tauri:build:mac": "tauri build --target aarch64-apple-darwin",
     "tauri:build:windows": "tauri build --bundles nsis",
+    "tauri:build:linux": "tauri build",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
