@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tm-core", "apps/tm-cli", "apps/tm-mcp", "src-tauri"]
+members = ["crates/tm-core", "crates/tm-worker", "apps/tm-cli", "apps/tm-mcp", "src-tauri"]
 
 [workspace.package]
 version = "7.7.0"
@@ -14,6 +14,7 @@ rust-version = "1.92"
 tm-core = { path = "crates/tm-core" }
 tm-cli = { path = "apps/tm-cli" }
 tm-mcp = { path = "apps/tm-mcp" }
+tm-worker = { path = "crates/tm-worker" }
 
 aho-corasick = "1.1"
 anyhow = "1"
