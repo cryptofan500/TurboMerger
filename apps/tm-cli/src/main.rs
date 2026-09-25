@@ -8,6 +8,8 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
+    // Token counts of unchanged files come from the per-device cache.
+    tm_core::cache::enable(None);
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let code = match tm_cli::run(&argv) {
         Some(code) => code,

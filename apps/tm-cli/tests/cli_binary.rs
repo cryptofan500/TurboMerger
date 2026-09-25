@@ -13,6 +13,7 @@ fn tm(args: &[&str], cwd: &Path) -> Output {
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
         .env("TURBOMERGER_STATE_DIR", cwd.join("state"))
+        .env("TURBOMERGER_CACHE_DIR", cwd.join("cache"))
         .output()
         .expect("binary runs")
 }
@@ -210,4 +211,40 @@ fn reproducible_outputs_do_not_depend_on_line_ends_or_name_normalization() {
     assert!(fs::read(tmp.path().join("raw.md"))
         .unwrap()
         .contains(&b'\r'));
+}
+
+#[test]
+fn the_token_cache_changes_nothing_but_speed() {
+    // Plan 2.8: a second run reuses cached counts; the bytes are identical.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    for i in 0..30 {
+        fs::write(
+            src.join(format!("f{i}.rs")),
+            format!(
+                "// file {i}\n{}",
+                "fn body() { let x = 1 + 2; }\n".repeat(20)
+            ),
+        )
+        .unwrap();
+    }
+    let o = tm(&["merge", "src", "one.md", "-q"], tmp.path());
+    assert_eq!(o.status.code(), Some(0));
+    let cache = tmp.path().join("cache").join("token-counts-v1.bin");
+    assert!(cache.is_file(), "the first run saves the cache");
+    let o = tm(&["merge", "src", "two.md", "-q"], tmp.path());
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(
+        fs::read(tmp.path().join("one.md")).unwrap(),
+        fs::read(tmp.path().join("two.md")).unwrap()
+    );
+    // A damaged cache is ignored, never trusted.
+    fs::write(&cache, b"garbage").unwrap();
+    let o = tm(&["merge", "src", "three.md", "-q"], tmp.path());
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(
+        fs::read(tmp.path().join("one.md")).unwrap(),
+        fs::read(tmp.path().join("three.md")).unwrap()
+    );
 }

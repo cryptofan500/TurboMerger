@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    tm_core::cache::enable(None);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(commands::Jobs::default())

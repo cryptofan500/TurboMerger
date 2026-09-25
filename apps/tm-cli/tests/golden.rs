@@ -331,6 +331,7 @@ fn run(run: &Run, src: &Path, work: &Path) -> BTreeMap<String, Vec<u8>> {
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
         .env("TURBOMERGER_STATE_DIR", work.join("state"))
+        .env("TURBOMERGER_CACHE_DIR", work.join("cache"))
         .output()
         .expect("binary runs");
     let version = format!("TurboMerger v{}", env!("CARGO_PKG_VERSION"));

@@ -620,7 +620,7 @@ fn mask_known_values(
             .map(|b| {
                 spool.read(b.span).map(|text| {
                     masker.mask(&text, "[REDACTED]").map(|(m, n)| {
-                        let t = tokens::count(&m);
+                        let t = crate::cache::count(&m);
                         (m, n, t)
                     })
                 })

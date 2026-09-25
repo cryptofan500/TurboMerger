@@ -3,6 +3,7 @@
 //! (`apps/tm-mcp`) and the desktop app (`src-tauri`) are thin shells over it.
 
 pub mod applyback;
+pub mod cache;
 pub mod cancel;
 pub mod compress;
 pub mod config;

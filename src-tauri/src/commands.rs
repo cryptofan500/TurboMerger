@@ -242,7 +242,7 @@ pub async fn scan_folder(
                 }
                 let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
                 let tokens = std::fs::read(path)
-                    .map(|bytes| tm_core::tokens::count(&String::from_utf8_lossy(&bytes)))
+                    .map(|bytes| tm_core::cache::count(&String::from_utf8_lossy(&bytes)))
                     .unwrap_or(0);
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let rel = scanner::relative_display(&resolved.root, path);
@@ -264,6 +264,7 @@ pub async fn scan_folder(
         if token.is_cancelled() {
             return Err(JobError::Cancelled.to_string());
         }
+        let _ = tm_core::cache::save();
         let mut included: Vec<ScanEntry> = included.into_iter().flatten().collect();
         included.sort_by(|a, b| a.path.cmp(&b.path));
         let total_tokens = included.iter().map(|e| e.tokens).sum();

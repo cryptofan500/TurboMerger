@@ -9,7 +9,6 @@ use regex::Regex;
 
 use super::{relative_display, Block, MergeConfig, MergeSkip};
 use crate::scanner::SkipKind;
-use crate::tokens;
 
 static BASE64_RUN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z0-9+/]{200,}={0,2}").expect("base64 run regex"));
@@ -172,7 +171,7 @@ fn process_file_inner(
         Vec::new()
     };
 
-    let tokens = tokens::count(&content);
+    let tokens = crate::cache::count(&content);
 
     Ok((
         Block {

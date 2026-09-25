@@ -500,6 +500,8 @@ pub fn run_merge(
             .map(|p| p.to_string_lossy().to_string()),
         not_captured: count_not_captured(&skipped, &outcome.skipped),
     };
+    // Best effort: a cache that cannot be written only costs time next run.
+    let _ = crate::cache::save();
     Ok(MergeRun {
         result,
         outcome,

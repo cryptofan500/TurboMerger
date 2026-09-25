@@ -13,6 +13,7 @@ fn tm(args: &[&str], cwd: &Path, slow_ms: u64) -> Output {
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
         .env("TURBOMERGER_STATE_DIR", cwd.join("state"))
+        .env("TURBOMERGER_CACHE_DIR", cwd.join("cache"))
         .env("TM_TEST_SLOW_FILE_MS", slow_ms.to_string())
         .output()
         .expect("binary runs")
