@@ -428,8 +428,11 @@ function Treemap({
               return;
             }
             const rect = canvasRef.current!.getBoundingClientRect();
+            // Clamp here, in the handler: reading the wrapper's width during
+            // render would use a stale ref (react-hooks/refs).
+            const width = wrapRef.current?.clientWidth || 300;
             setTip({
-              x: e.clientX - rect.left,
+              x: Math.min(e.clientX - rect.left + 12, width - 240),
               y: e.clientY - rect.top,
               text: `${t.path || "."}${t.isDir ? "/" : ""} — ~${fmtTokens(t.tokens)} tokens${t.excluded ? " (excluded)" : ""}`,
             });
@@ -439,7 +442,7 @@ function Treemap({
         {tip && (
           <div
             className="treemap-tip"
-            style={{ left: Math.min(tip.x + 12, (wrapRef.current?.clientWidth || 300) - 240), top: tip.y + 14 }}
+            style={{ left: tip.x, top: tip.y + 14 }}
           >
             {tip.text}
           </div>
