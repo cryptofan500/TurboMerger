@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -27,14 +27,27 @@ interface MergeResult {
   skill_path: string | null;
 }
 
-interface ProgressUpdate {
-  current: number;
+/** One progress report from a running job (tm_core::progress snapshot). */
+interface JobProgress {
+  stage: "scan" | "classify" | "merge";
+  done: number;
+  /** 0 while unknown. */
   total: number;
-  current_file: string;
-  percentage: number;
+  current: string;
+  elapsed_ms: number;
+  /** Shown only after the job has run for a minute. */
+  eta_ms: number | null;
+  eta_band_ms: number | null;
+  /** Set when nothing has moved for a while. */
+  stalled_ms: number | null;
 }
 
-type Status = "ready" | "scanning" | "merging" | "done" | "error" | "cancelled";
+type Status = "ready" | "scanning" | "merging" | "cancelling" | "done" | "error" | "cancelled";
+
+const newJobId = () =>
+  typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `job-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 type Preset = "custom" | "lean" | "archive" | "docs" | "claude";
 
 const SETTINGS_KEY = "turbomerger.settings.v1";
@@ -118,7 +131,9 @@ function App() {
 
   const [result, setResult] = useState<MergeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [progress, setProgress] = useState<ProgressUpdate | null>(null);
+  const [progress, setProgress] = useState<JobProgress | null>(null);
+  // The running merge/scan, so Cancel reaches exactly that job.
+  const [jobId, setJobId] = useState<string | null>(null);
 
   const isRemote =
     /^(https?:\/\/|git@)/.test(sourcePath.trim()) ||
@@ -166,15 +181,8 @@ function App() {
     } catch { /* quota */ }
   }, [excluded, forceInclude, scanReport]);
 
-  // Progress + watch listeners.
+  // Watch-mode results arrive as events; job progress comes over channels.
   useEffect(() => {
-    const unlistenMerge = listen<ProgressUpdate>("merge-progress", (event) => {
-      setProgress(event.payload);
-      if (event.payload.total > 0) setStatus("merging");
-    });
-    const unlistenScan = listen<ProgressUpdate>("scan-progress", (event) => {
-      setProgress(event.payload);
-    });
     const unlistenWatch = listen<MergeResult>("watch-merged", (event) => {
       setResult(event.payload);
       setStatus("done");
@@ -184,12 +192,22 @@ function App() {
       setStatus("error");
     });
     return () => {
-      unlistenMerge.then((f) => f());
-      unlistenScan.then((f) => f());
       unlistenWatch.then((f) => f());
       unlistenWatchErr.then((f) => f());
     };
   }, []);
+
+  /** A channel that shows a job's progress; merges switch the status once files flow. */
+  const progressChannel = (merging: boolean) => {
+    const ch = new Channel<JobProgress>();
+    ch.onmessage = (p) => {
+      setProgress(p);
+      if (merging && p.stage === "merge") {
+        setStatus((s) => (s === "scanning" ? "merging" : s));
+      }
+    };
+    return ch;
+  };
 
   // Drag-and-drop a folder onto the window.
   useEffect(() => {
@@ -239,10 +257,11 @@ function App() {
     if (selected) setOutputPath(selected);
   };
 
+  // Ask the running job to stop; its promise settling is the acknowledgement.
   const handleCancel = async () => {
-    await invoke("cancel_merge");
-    setStatus("cancelled");
-    setProgress(null);
+    if (!jobId) return;
+    setStatus("cancelling");
+    await invoke<boolean>("cancel_job", { job: jobId }).catch(console.error);
   };
 
   const buildOptions = () => {
@@ -281,37 +300,50 @@ function App() {
 
   const handleMerge = async () => {
     if (!sourcePath) return;
+    const job = newJobId();
     try {
-      await invoke("reset_cancel");
+      setJobId(job);
       setStatus("scanning");
       setError(null);
       setResult(null);
       setProgress(null);
 
       const options = buildOptions();
+      const progress = progressChannel(true);
       const mergeResult = isRemote
         ? await invoke<MergeResult>("pack_remote", {
             url: sourcePath.trim(),
             pat: pat || null,
             options,
+            job,
+            progress,
           })
-        : await invoke<MergeResult>("merge_folder", { options });
+        : await invoke<MergeResult>("merge_folder", { options, job, progress });
       setResult(mergeResult);
       setStatus("done");
     } catch (err) {
       const msg = String(err);
       if (msg.includes("cancelled")) setStatus("cancelled");
       else { setError(msg); setStatus("error"); }
+    } finally {
+      setJobId(null);
+      setProgress(null);
     }
   };
 
   const handleScan = async () => {
     if (!sourcePath || isRemote) return;
+    const job = newJobId();
     try {
+      setJobId(job);
       setStatus("scanning");
       setError(null);
       setProgress(null);
-      const report = await invoke<ScanReport>("scan_folder", { options: buildOptions() });
+      const report = await invoke<ScanReport>("scan_folder", {
+        options: buildOptions(),
+        job,
+        progress: progressChannel(false),
+      });
       setScanReport(report);
       // Restore this project's saved curation, dropping stale paths.
       try {
@@ -328,10 +360,13 @@ function App() {
       } catch { /* corrupt selection */ }
       setCurateOpen(true);
       setStatus("ready");
-      setProgress(null);
     } catch (err) {
-      setError(String(err));
-      setStatus("error");
+      const msg = String(err);
+      if (msg.includes("cancelled")) setStatus("cancelled");
+      else { setError(msg); setStatus("error"); }
+    } finally {
+      setJobId(null);
+      setProgress(null);
     }
   };
 
@@ -356,6 +391,8 @@ function App() {
 
   const openThing = (path: string) => invoke("open_file", { path }).catch(console.error);
   const openFolder = (path: string) => invoke("open_folder", { path }).catch(console.error);
+  const openWeb = (site: "claude" | "chatgpt" | "gemini") =>
+    invoke("open_web", { site }).catch(console.error);
 
   const formatBytes = (b: number) =>
     b < 1024 ? `${b} B` : b < 1048576 ? `${(b / 1024).toFixed(1)} KB` : `${(b / 1048576).toFixed(1)} MB`;
@@ -369,7 +406,13 @@ function App() {
     : claude <= 1000000 ? "over Claude 200k — split or use Gemini 1M"
     : "over 1M — splitting required";
 
-  const isWorking = status === "scanning" || status === "merging";
+  const isWorking = status === "scanning" || status === "merging" || status === "cancelling";
+  const formatClock = (ms: number) => {
+    const s = Math.round(ms / 1000);
+    return s >= 60 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s` : `${s}s`;
+  };
+  const stageLabel = (p: JobProgress) =>
+    p.stage === "scan" ? "Scanning directory..." : p.stage === "classify" ? "Classifying files..." : p.current;
 
   return (
     <div className="app">
@@ -545,7 +588,9 @@ function App() {
 
         <section className="section">
           {isWorking ? (
-            <button className="btn btn-danger btn-full" onClick={handleCancel}>CANCEL</button>
+            <button className="btn btn-danger btn-full" onClick={handleCancel} disabled={status === "cancelling" || !jobId}>
+              {status === "cancelling" ? "CANCELLING…" : "CANCEL"}
+            </button>
           ) : (
             <div className="merge-row">
               <button className="btn btn-primary merge-main" onClick={handleMerge} disabled={!sourcePath || watching}>
@@ -609,14 +654,28 @@ function App() {
         {isWorking && (
           <section className="section">
             <div className="progress-container">
-              <div className="progress-bar" style={{ width: `${progress?.percentage || 0}%` }} />
+              <div
+                className="progress-bar"
+                style={{ width: `${progress && progress.total > 0 ? (progress.done / progress.total) * 100 : 0}%` }}
+              />
             </div>
             <p className="status-text">
-              {status === "scanning" ? "Scanning directory..." : progress?.current_file}
+              {status === "cancelling" ? "Cancelling…" : progress ? stageLabel(progress) : "Scanning directory..."}
             </p>
-            {progress && progress.total > 0 && (
+            {progress && (
               <p className="progress-text">
-                {progress.current.toLocaleString()} / {progress.total.toLocaleString()} files ({progress.percentage.toFixed(1)}%)
+                {progress.total > 0
+                  ? `${progress.done.toLocaleString()} / ${progress.total.toLocaleString()} files (${((progress.done / progress.total) * 100).toFixed(1)}%)`
+                  : `${progress.done.toLocaleString()} entries`}
+                {` · ${formatClock(progress.elapsed_ms)}`}
+                {progress.eta_ms !== null && ` · ETA ${formatClock(progress.eta_ms)}`}
+                {progress.eta_ms !== null && progress.eta_band_ms !== null && progress.eta_band_ms >= 1000 &&
+                  ` ± ${formatClock(progress.eta_band_ms)}`}
+              </p>
+            )}
+            {progress && progress.stalled_ms !== null && (
+              <p className="progress-text" style={{ color: "var(--warning)" }}>
+                Stalled on {progress.current || "the scan"} for {formatClock(progress.stalled_ms)} — Cancel stops it
               </p>
             )}
           </section>
@@ -663,9 +722,9 @@ function App() {
               <button className="btn btn-secondary" onClick={() => openFolder(result.output_path)}>Show in Folder</button>
             </div>
             <div className="action-buttons">
-              <button className="btn btn-secondary" onClick={() => openThing("https://claude.ai/new")}>claude.ai</button>
-              <button className="btn btn-secondary" onClick={() => openThing("https://chatgpt.com")}>chatgpt.com</button>
-              <button className="btn btn-secondary" onClick={() => openThing("https://gemini.google.com/app")}>gemini</button>
+              <button className="btn btn-secondary" onClick={() => openWeb("claude")}>claude.ai</button>
+              <button className="btn btn-secondary" onClick={() => openWeb("chatgpt")}>chatgpt.com</button>
+              <button className="btn btn-secondary" onClick={() => openWeb("gemini")}>gemini</button>
             </div>
             {result.output_paths.map((p) => <p className="output-path" key={p}>{p}</p>)}
           </section>

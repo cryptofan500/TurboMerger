@@ -67,6 +67,18 @@ jobs:
       - name: Validate the Tauri application build
         run: npm run tauri:build -- --debug --no-bundle
 
+      # Plan §6 L6: the desktop app clicked through in a virtual display
+      # (merge, curate, apply-back confirmations + restore, cancel, watch).
+      - name: GUI smoke (Linux, virtual display)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y webkit2gtk-driver xvfb
+          cargo install tauri-driver --version 2.0.6 --locked
+          python3 -m venv "$RUNNER_TEMP/gui-venv"
+          "$RUNNER_TEMP/gui-venv/bin/pip" install --quiet selenium==4.49.0
+          xvfb-run -a -s "-screen 0 1280x1024x24" "$RUNNER_TEMP/gui-venv/bin/python" \
+            fixtures/gui-smoke/gui_smoke.py target/debug/turbomerger-gui "$RUNNER_TEMP/gui"
+
       # Phase 2 gate: the Windows CLI is a console program — it prints and a
       # shell gets its exit code (N-29; v7 was a GUI-subsystem binary).
       - name: CLI prints and returns exit codes (Windows)
