@@ -3,7 +3,7 @@
 
 ## L0 — npm run verify
 cargo test --workspace: 190 passed, 0 failed (last full local run, 35a36c0); clippy (Linux, Windows gnu) and fmt clean.
-A fresh `npm run verify` after `cargo clean` was still compiling at handoff; CI ran the full verify green on d6b0ac3.
+npm run verify (clean build, a057488): exit 0 — 190 passed, 0 failed; CI ran the full verify green on d6b0ac3.
 
 ## L1 — Windows static check
 cargo clippy --workspace --target x86_64-pc-windows-gnu --all-targets --all-features -- -D warnings: clean
