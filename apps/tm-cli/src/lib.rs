@@ -15,30 +15,40 @@
 //!   or anything at all was skipped under `--fail-on-skip`; apply: some
 //!   proposals were held or refused
 //!
-//! 4 (partial/cancelled) and 5 (verification failed) are reserved for the
-//! v8 job model and the Phase 5 verifier.
+//! - 4 cancelled (Ctrl-C, `--deadline`, `--on-stall fail`: nothing written)
+//!   or partial (`--on-deadline partial`, `--keep-partial`: what was done is
+//!   written, the rest is reported as not captured)
+//!
+//! 5 (verification failed) is reserved for the Phase 5 verifier.
+
+mod report;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
-use tm_core::job::{resolve_job, MergeOptions};
+use report::{DeadlineAction, ProgressMode, Reporter, ReporterConfig, StallAction};
+use tm_core::job::{resolve_job, JobError, MergeOptions};
+use tm_core::progress::Tracker;
 use tm_core::scanner::{self, SkipEntry, SkipKind};
-use tm_core::security;
+use tm_core::{security, CancelToken};
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_ERROR: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_SKIPS: i32 = 3;
+/// Cancelled (Ctrl-C, deadline, stall) or a partial output.
+pub const EXIT_PARTIAL: i32 = 4;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "turbomerger",
     version,
     about = "Merge a codebase or document folder into LLM-ready files; apply LLM replies back safely.",
-    after_help = "Run without arguments to open the desktop app. Exit codes: 0 complete, 1 error, 2 usage, 3 completed with content not captured."
+    after_help = "Run without arguments to open the desktop app. Exit codes: 0 complete, 1 error, 2 usage, 3 completed with content not captured, 4 cancelled or partial."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -180,6 +190,31 @@ pub struct MergeCmd {
     /// Print nothing on success
     #[arg(short, long)]
     pub quiet: bool,
+    /// Progress on stderr
+    #[arg(long, value_enum, default_value_t = ProgressMode::Auto, env = "TURBOMERGER_PROGRESS")]
+    pub progress: ProgressMode,
+    /// Show an ETA once the run is this old (e.g. 60s, 2m)
+    #[arg(long, value_name = "DURATION", default_value = "60s", value_parser = duration_arg)]
+    pub eta_after: Duration,
+    /// Report a stall when nothing moves for this long
+    #[arg(long, value_name = "DURATION", default_value = "10s", value_parser = duration_arg)]
+    pub stall_after: Duration,
+    /// What to do on a stall
+    #[arg(long, value_enum, default_value_t = StallAction::Wait)]
+    pub on_stall: StallAction,
+    /// Time limit for the whole run (e.g. 10m, 1h30m)
+    #[arg(long, value_name = "DURATION", value_parser = duration_arg)]
+    pub deadline: Option<Duration>,
+    /// What to do at the deadline
+    #[arg(long, value_enum, default_value_t = DeadlineAction::Cancel, requires = "deadline")]
+    pub on_deadline: DeadlineAction,
+    /// On Ctrl-C, write what is done (exit 4) instead of nothing
+    #[arg(long)]
+    pub keep_partial: bool,
+}
+
+fn duration_arg(s: &str) -> Result<Duration, String> {
+    tm_core::progress::parse_duration(s)
 }
 
 #[derive(Args, Debug)]
@@ -401,52 +436,86 @@ fn run_merge(a: MergeCmd) -> i32 {
     options.remote = remote_label.is_some();
     options.source_label = remote_label;
 
-    let job = match resolve_job(&options) {
-        Ok(j) => j,
-        Err(e) => {
+    // Ctrl-C cancels the job (temp files are cleaned up); a second one quits.
+    let token = CancelToken::new();
+    let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let token = token.clone();
+        let keep = a.keep_partial;
+        let pressed = interrupted.clone();
+        let _ = ctrlc::set_handler(move || {
+            if pressed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                std::process::exit(130);
+            }
+            if keep {
+                token.finish_early();
+            } else {
+                token.cancel();
+            }
+        });
+    }
+    let tracker = Arc::new(Tracker::new(a.eta_after, a.stall_after));
+    let reporter = Reporter::start(
+        tracker.clone(),
+        token.clone(),
+        ReporterConfig {
+            mode: a.progress,
+            quiet: a.quiet,
+            deadline: a.deadline,
+            on_deadline: a.on_deadline,
+            on_stall: a.on_stall,
+        },
+    );
+    let run = tm_core::job::run_merge(&options, None, &token, &|p| tracker.update(&p));
+    let stopped_by = reporter.finish().or_else(|| {
+        interrupted
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then_some("Ctrl-C")
+    });
+
+    let run = match run {
+        Ok(r) => r,
+        Err(JobError::Cancelled) => {
+            eprintln!(
+                "cancelled{} — nothing was written",
+                stopped_by.map(|w| format!(" ({})", w)).unwrap_or_default()
+            );
+            return EXIT_PARTIAL;
+        }
+        Err(JobError::Empty) => {
+            eprintln!("no files found");
+            return EXIT_ERROR;
+        }
+        Err(JobError::Invalid(e)) => {
             eprintln!("error: {}", e);
             return EXIT_ERROR;
         }
-    };
-    let scan = match scanner::scan_text_files(&job.root, &job.scan_options) {
-        Ok(s) => s,
-        Err(e) => {
+        Err(JobError::Scan(e)) => {
             eprintln!("scan failed: {}", e);
             return EXIT_ERROR;
         }
-    };
-    if scan.files.is_empty() && scan.skipped.is_empty() {
-        eprintln!("no files found");
-        return EXIT_ERROR;
-    }
-    let cancel = AtomicBool::new(false);
-    let o = match tm_core::merger::merge_files_with_progress(
-        &job.root,
-        &scan.files,
-        &job.output_path,
-        &job.merge_config,
-        &cancel,
-        |_, _, _| {},
-        &scan.skipped,
-    ) {
-        Ok(o) => o,
-        Err(e) => {
+        Err(JobError::Merge(e)) => {
             eprintln!("merge failed: {}", e);
             return EXIT_ERROR;
         }
     };
-    let all: Vec<&SkipEntry> = scan.skipped.iter().chain(o.skipped.iter()).collect();
+    let o = &run.outcome;
+    let all: Vec<&SkipEntry> = run.all_skips().collect();
     let not_captured = all
         .iter()
         .filter(|s| s.kind == SkipKind::NotCaptured)
         .count();
-    let code = merge_exit_code(o.files_processed, &all, a.fail_on_skip);
+    let code = if o.partial {
+        EXIT_PARTIAL
+    } else {
+        merge_exit_code(o.files_processed, &all, a.fail_on_skip)
+    };
     if !a.quiet || code != EXIT_OK {
         // Aggregate, non-secret output only.
         println!(
             "merged={} scan_skipped={} merge_skipped={} redacted={} tokens_o200k={} parts={} not_captured={}",
             o.files_processed,
-            scan.skipped.len(),
+            run.scan_skipped.len(),
             o.files_skipped,
             o.secrets_redacted,
             o.tokens_o200k,
@@ -463,7 +532,12 @@ fn run_merge(a: MergeCmd) -> i32 {
     for note in &o.notes {
         eprintln!("warning: {}", note);
     }
-    if o.files_processed == 0 {
+    if o.partial {
+        eprintln!(
+            "warning: partial output — files not processed before the {} are listed as not captured",
+            stopped_by.unwrap_or("stop")
+        );
+    } else if o.files_processed == 0 {
         eprintln!("warning: nothing was merged — the output holds only the report of what was skipped and why");
     } else if not_captured > 0 {
         eprintln!(

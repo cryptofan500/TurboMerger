@@ -145,19 +145,22 @@ pub struct MergeOutcome {
     pub skipped: Vec<SkipEntry>,
     /// Remarks about the output itself (e.g. a part over its budget).
     pub notes: Vec<String>,
+    /// The merge finished early (`MergeCtl::finish`): files it did not get to
+    /// are in `skipped` as not captured.
+    pub partial: bool,
+}
+
+/// Runtime control of one merge.
+#[derive(Clone, Copy)]
+pub struct MergeCtl<'a> {
+    /// Stop and write nothing (`Err(Cancelled)`).
+    pub cancel: &'a AtomicBool,
+    /// Stop taking new files, then write what is done.
+    pub finish: Option<&'a AtomicBool>,
 }
 
 /// The merge stopped because its cancel flag was set; nothing was written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Cancelled;
-
-impl std::fmt::Display for Cancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("cancelled")
-    }
-}
-
-impl std::error::Error for Cancelled {}
+pub use crate::cancel::Cancelled;
 
 /// One merged file's metadata; its text lives in the spool at `span`.
 pub(crate) struct Block {
@@ -193,12 +196,35 @@ pub fn merge_files_with_progress<F>(
     output: &Path,
     cfg: &MergeConfig,
     cancel_flag: &AtomicBool,
+    progress_callback: F,
+    scan_skips: &[SkipEntry],
+) -> Result<MergeOutcome>
+where
+    F: FnMut(usize, usize, &str),
+{
+    let ctl = MergeCtl {
+        cancel: cancel_flag,
+        finish: None,
+    };
+    merge_files_ctl(root, files, output, cfg, ctl, progress_callback, scan_skips)
+}
+
+/// `merge_files_with_progress` with finish-early support (`MergeCtl`).
+#[allow(clippy::too_many_arguments)]
+pub fn merge_files_ctl<F>(
+    root: &Path,
+    files: &[PathBuf],
+    output: &Path,
+    cfg: &MergeConfig,
+    ctl: MergeCtl,
     mut progress_callback: F,
     scan_skips: &[SkipEntry],
 ) -> Result<MergeOutcome>
 where
     F: FnMut(usize, usize, &str),
 {
+    let cancel_flag = ctl.cancel;
+    let finishing = || ctl.finish.is_some_and(|f| f.load(AtomicOrd::Relaxed));
     let total_files = files.len();
 
     // Order files (a stable copy so the caller's slice is untouched).
@@ -221,9 +247,29 @@ where
 
     // Process in parallel, a bounded chunk at a time; each chunk's texts go
     // to the spool in order before the next chunk is read.
+    let mut partial = false;
     for chunk in chunk_by_size(&ordered) {
         if cancelled(cancel_flag) {
             return Err(Cancelled.into());
+        }
+        if partial || finishing() {
+            // Finishing early: what is left is reported, never dropped.
+            partial = true;
+            for path in chunk {
+                done += 1;
+                let rel = relative_display(root, path);
+                progress_callback(done, total_files, &rel);
+                merge_skips.push(SkipEntry::new(
+                    rel,
+                    "not processed — the run was finished early (deadline)",
+                    SkipKind::NotCaptured,
+                ));
+            }
+            continue;
+        }
+        // Say which chunk is in flight: a stall report can then name a file.
+        if let Some(first) = chunk.first() {
+            progress_callback(done, total_files, &relative_display(root, first));
         }
         let processed: Vec<process::Processed> = chunk
             .par_iter()
@@ -301,6 +347,7 @@ where
     // Aggregate stats.
     let mut outcome = MergeOutcome {
         files_skipped: merge_skips.len(),
+        partial,
         ..Default::default()
     };
     for b in &blocks {

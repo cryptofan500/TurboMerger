@@ -1,6 +1,8 @@
-//! MCP server sidecar (T3-2): `turbomerger mcp` speaks Model Context
-//! Protocol over stdio (newline-delimited JSON-RPC 2.0) so Claude
-//! Desktop/Code and other MCP clients can pull repo context on demand.
+//! MCP server (T3-2): `turbomerger mcp` speaks the Model Context Protocol
+//! over stdio so Claude Desktop/Code and other MCP clients can pull repo
+//! context on demand. Built on the official Rust SDK, `rmcp` (N-19, ADR
+//! 0014): protocol-version negotiation, progress notifications and
+//! request cancellation come from it.
 //!
 //! Tools: pack_directory (full merge → file, summary returned),
 //! repo_map (map text returned inline), read_output / grep_output
@@ -17,24 +19,32 @@
 //! - Remote repositories need `--allow-remote`.
 //! - Secret redaction is forced on.
 //!
-//! Protocol versions (N-19): the server answers with the client's version
-//! when it supports it, otherwise with its latest — v7.7.0 echoed anything,
-//! including `2099-01-01`.
+//! Long calls report `notifications/progress` when the client sends a
+//! progress token, and `notifications/cancelled` stops them (nothing is
+//! written for a cancelled pack).
 
-use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    JsonObject, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+    ServerCapabilities, ServerConfig, Tool,
+};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use serde_json::{json, Value};
 
-use tm_core::job::{resolve_job, MergeOptions, ResolvedSource};
+use tm_core::job::{run_merge, JobError, MergeOptions, Progress, ResolvedSource, Stage};
+use tm_core::CancelToken;
 
-/// Newest first; the server's answer when the client asks for anything else.
-const SUPPORTED_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const READ_DEFAULT_LINES: usize = 200;
 const READ_MAX_LINES: usize = 1000;
 const READ_MAX_BYTES: usize = 200 * 1024;
 const GREP_MAX_MATCHES: usize = 100;
+/// At most this often per call; the last report is always sent.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 
 /// How the server was started (`turbomerger mcp --root … --output-dir …
 /// --allow-remote`).
@@ -157,9 +167,27 @@ impl McpServer {
         }
         Ok(canon)
     }
+
+    /// Run one tool call to completion (blocking). Tool-level failures are
+    /// `Err` text the client sees as an `isError` result.
+    pub fn call(
+        &self,
+        name: &str,
+        args: &Value,
+        cancel: &CancelToken,
+        progress: &(dyn Fn(Progress) + Sync),
+    ) -> Result<String, String> {
+        match name {
+            "pack_directory" => self.tool_pack_directory(args, cancel, progress),
+            "repo_map" => self.tool_repo_map(args),
+            "read_output" => self.tool_read_output(args),
+            "grep_output" => self.tool_grep_output(args),
+            other => Err(format!("unknown tool: {}", other)),
+        }
+    }
 }
 
-/// Blocking stdio loop. Returns the process exit code.
+/// Blocking stdio server. Returns the process exit code.
 pub fn run_mcp(args: McpConfig) -> i32 {
     let server = match McpServer::from_config(&args) {
         Ok(s) => s,
@@ -171,108 +199,147 @@ pub fn run_mcp(args: McpConfig) -> i32 {
     if server.roots.is_empty() {
         eprintln!("warning: no --root given and the working directory is / or your home folder; pack_directory and repo_map will refuse local paths");
     }
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
         }
-        if let Some(resp) = server.handle_message(&line) {
-            if out.write_all(resp.as_bytes()).is_err()
-                || out.write_all(b"\n").is_err()
-                || out.flush().is_err()
-            {
-                break;
+    };
+    runtime.block_on(async move {
+        let service = match server.serve(rmcp::transport::stdio()).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: MCP handshake failed: {}", e);
+                return 1;
+            }
+        };
+        match service.waiting().await {
+            Ok(_) => 0,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                1
             }
         }
-    }
-    0
+    })
 }
 
-impl McpServer {
-    /// Handle one JSON-RPC message; `None` = nothing to send (notification).
-    /// Pure function of the message so the protocol is unit-testable.
-    pub fn handle_message(&self, line: &str) -> Option<String> {
-        let msg: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(e) => {
-                return Some(
-                    json!({"jsonrpc":"2.0","id":null,
-                           "error":{"code":-32700,"message":format!("parse error: {}", e)}})
-                    .to_string(),
-                )
-            }
-        };
-        let id = msg.get("id").cloned();
-        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        // Notifications (no id) get no response, per JSON-RPC.
-        let id = id?;
+impl ServerHandler for McpServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "turbomerger",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "Pack a folder into LLM-ready files with pack_directory (secrets are always redacted), \
+                 then read or search the output with read_output / grep_output. repo_map gives a ranked \
+                 overview within a token budget.",
+            )
+    }
 
-        let result: Result<Value, (i64, String)> = match method {
-            "initialize" => {
-                let requested = msg
-                    .pointer("/params/protocolVersion")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let version = SUPPORTED_VERSIONS
-                    .iter()
-                    .find(|v| **v == requested)
-                    .copied()
-                    .unwrap_or(SUPPORTED_VERSIONS[0]);
-                Ok(json!({
-                    "protocolVersion": version,
-                    "capabilities": { "tools": {} },
-                    "serverInfo": {
-                        "name": "turbomerger",
-                        "version": env!("CARGO_PKG_VERSION")
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult::with_all_items(tools()))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let name = request.name.to_string();
+        let args = Value::Object(request.arguments.unwrap_or_default());
+        let progress_token = request
+            .meta
+            .as_ref()
+            .and_then(|m| m.get_progress_token())
+            .or_else(|| context.meta.get_progress_token());
+
+        // notifications/cancelled → the job's cancel token.
+        let token = CancelToken::new();
+        let watcher = {
+            let (ct, token) = (context.ct.clone(), token.clone());
+            tokio::spawn(async move {
+                ct.cancelled().await;
+                token.cancel();
+            })
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Progress>();
+        let server = self.clone();
+        let job_token = token.clone();
+        let mut work = tokio::task::spawn_blocking(move || {
+            server.call(&name, &args, &job_token, &|p| {
+                let _ = tx.send(p);
+            })
+        });
+
+        let mut last_sent: Option<Instant> = None;
+        let mut pending: Option<Progress> = None;
+        let result = loop {
+            tokio::select! {
+                r = &mut work => break r,
+                Some(p) = rx.recv() => {
+                    let Some(tok) = &progress_token else { continue };
+                    if last_sent.is_some_and(|t| t.elapsed() < PROGRESS_EVERY) {
+                        pending = Some(p);
+                        continue;
                     }
-                }))
-            }
-            "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-            "tools/call" => {
-                let name = msg
-                    .pointer("/params/name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let default_args = json!({});
-                let args = msg.pointer("/params/arguments").unwrap_or(&default_args);
-                let outcome = match name {
-                    "pack_directory" => self.tool_pack_directory(args),
-                    "repo_map" => self.tool_repo_map(args),
-                    "read_output" => self.tool_read_output(args),
-                    "grep_output" => self.tool_grep_output(args),
-                    other => Err(format!("unknown tool: {}", other)),
-                };
-                // Tool-level failures are results with isError, not protocol errors.
-                Ok(match outcome {
-                    Ok(text) => json!({"content":[{"type":"text","text":text}],"isError":false}),
-                    Err(e) => json!({"content":[{"type":"text","text":e}],"isError":true}),
-                })
-            }
-            other => Err((-32601, format!("method not found: {}", other))),
-        };
-
-        Some(
-            match result {
-                Ok(res) => json!({"jsonrpc":"2.0","id":id,"result":res}),
-                Err((code, message)) => {
-                    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+                    last_sent = Some(Instant::now());
+                    pending = None;
+                    let _ = context.peer.notify_progress(progress_param(tok.clone(), &p)).await;
                 }
             }
-            .to_string(),
-        )
+        };
+        if let (Some(tok), Some(p)) = (&progress_token, pending) {
+            let _ = context
+                .peer
+                .notify_progress(progress_param(tok.clone(), &p))
+                .await;
+        }
+        watcher.abort();
+
+        let outcome = result.map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(match outcome {
+            Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+            Err(e) => CallToolResult::error(vec![ContentBlock::text(e)]),
+        }
+        .into())
     }
 }
 
-fn tool_definitions() -> Value {
-    json!([
-        {
-            "name": "pack_directory",
-            "description": "Merge a folder under the server's shared roots (or, with --allow-remote, a repo URL / gh:owner/repo) into one LLM-ready file (gitignore-aware, secrets always redacted). Returns a summary plus the output path(s); use read_output/grep_output to access the content.",
-            "inputSchema": {
+fn progress_param(token: rmcp::model::ProgressToken, p: &Progress) -> ProgressNotificationParam {
+    let what = match p.stage {
+        Stage::Scan => format!("scanning ({} entries)", p.done),
+        Stage::Classify => "classifying files".to_string(),
+        Stage::Merge => format!("merging {}", p.current),
+    };
+    let mut param = ProgressNotificationParam::new(token, p.done as f64).with_message(what);
+    if p.total > 0 {
+        param = param.with_total(p.total as f64);
+    }
+    param
+}
+
+fn schema(v: Value) -> Arc<JsonObject> {
+    match v {
+        Value::Object(m) => Arc::new(m),
+        _ => unreachable!("tool schemas are objects"),
+    }
+}
+
+fn tools() -> Vec<Tool> {
+    vec![
+        Tool::new(
+            "pack_directory",
+            "Merge a folder under the server's shared roots (or, with --allow-remote, a repo URL / gh:owner/repo) into one LLM-ready file (gitignore-aware, secrets always redacted). Returns a summary plus the output path(s); use read_output/grep_output to access the content.",
+            schema(json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Folder under the server's shared roots, or (with --allow-remote) a repo URL / gh:owner/repo" },
@@ -289,24 +356,24 @@ fn tool_definitions() -> Value {
                     "no_gitignore": { "type": "boolean", "description": "Ignore .gitignore rules (default false)" }
                 },
                 "required": ["path"]
-            }
-        },
-        {
-            "name": "repo_map",
-            "description": "Aider-style repo map: ranked file signatures (tree-sitter tags + PageRank) rendered to a token budget. The best first look at a repo that won't fit in context.",
-            "inputSchema": {
+            })),
+        ),
+        Tool::new(
+            "repo_map",
+            "Aider-style repo map: ranked file signatures (tree-sitter tags + PageRank) rendered to a token budget. The best first look at a repo that won't fit in context.",
+            schema(json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Folder under the server's shared roots, or (with --allow-remote) a repo URL / gh:owner/repo" },
                     "tokens": { "type": "integer", "description": "Token budget (default 1024)" }
                 },
                 "required": ["path"]
-            }
-        },
-        {
-            "name": "read_output",
-            "description": "Read a slice of a TurboMerger output (a path returned by pack_directory) by line offset/limit.",
-            "inputSchema": {
+            })),
+        ),
+        Tool::new(
+            "read_output",
+            "Read a slice of a TurboMerger output (a path returned by pack_directory) by line offset/limit.",
+            schema(json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
@@ -314,12 +381,12 @@ fn tool_definitions() -> Value {
                     "limit": { "type": "integer", "description": "Lines to return (default 200, max 1000)" }
                 },
                 "required": ["path"]
-            }
-        },
-        {
-            "name": "grep_output",
-            "description": "Regex-search a TurboMerger output (a path returned by pack_directory); returns matching lines with line numbers (max 100).",
-            "inputSchema": {
+            })),
+        ),
+        Tool::new(
+            "grep_output",
+            "Regex-search a TurboMerger output (a path returned by pack_directory); returns matching lines with line numbers (max 100).",
+            schema(json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
@@ -327,9 +394,9 @@ fn tool_definitions() -> Value {
                     "max_matches": { "type": "integer" }
                 },
                 "required": ["path", "pattern"]
-            }
-        }
-    ])
+            })),
+        ),
+    ]
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -345,7 +412,12 @@ fn arg_usize(args: &Value, key: &str) -> Option<usize> {
 }
 
 impl McpServer {
-    fn tool_pack_directory(&self, args: &Value) -> Result<String, String> {
+    fn tool_pack_directory(
+        &self,
+        args: &Value,
+        cancel: &CancelToken,
+        progress: &(dyn Fn(Progress) + Sync),
+    ) -> Result<String, String> {
         let src = arg_str(args, "path").ok_or("path is required")?;
         let source = self.resolve_source(src)?;
         let format = arg_str(args, "format").map(|s| s.to_string());
@@ -375,40 +447,28 @@ impl McpServer {
         options.emit_skill = arg_bool(args, "emit_skill");
         options.remote = source.remote_label.is_some();
         options.source_label = source.remote_label.clone();
-        let job = resolve_job(&options)?;
+        let job = tm_core::job::resolve_job(&options)?;
         if !job.output_path.starts_with(&self.output_dir) {
             return Err("output must stay in the outputs folder".into());
         }
-        let scan = tm_core::scanner::scan_text_files(&job.root, &job.scan_options)
-            .map_err(|e| format!("scan failed: {}", e))?;
-        let cancel = AtomicBool::new(false);
-        let outcome = tm_core::merger::merge_files_with_progress(
-            &job.root,
-            &scan.files,
-            &job.output_path,
-            &job.merge_config,
-            &cancel,
-            |_, _, _| {},
-            &scan.skipped,
-        )
-        .map_err(|e| format!("merge failed: {}", e))?;
-        let not_captured = scan
-            .skipped
-            .iter()
-            .chain(outcome.skipped.iter())
-            .filter(|s| s.kind == tm_core::scanner::SkipKind::NotCaptured)
-            .count();
+        let run = run_merge(&options, None, cancel, progress).map_err(|e| match e {
+            JobError::Scan(m) => format!("scan failed: {}", m),
+            JobError::Merge(m) => format!("merge failed: {}", m),
+            JobError::Cancelled => "cancelled — nothing was written".to_string(),
+            other => other.to_string(),
+        })?;
+        let o = &run.outcome;
         let mut text = format!(
-        "merged={} skipped={} not_captured={} secrets_redacted={} tokens_o200k={} (~{} Claude est.) parts={}\n",
-        outcome.files_processed,
-        outcome.files_skipped + scan.skipped.len(),
-        not_captured,
-        outcome.secrets_redacted,
-        outcome.tokens_o200k,
-        tm_core::tokens::claude_estimate(outcome.tokens_o200k),
-        outcome.outputs.len()
-    );
-        for p in &outcome.outputs {
+            "merged={} skipped={} not_captured={} secrets_redacted={} tokens_o200k={} (~{} Claude est.) parts={}\n",
+            o.files_processed,
+            o.files_skipped + run.scan_skipped.len(),
+            run.result.not_captured,
+            o.secrets_redacted,
+            o.tokens_o200k,
+            tm_core::tokens::claude_estimate(o.tokens_o200k),
+            o.outputs.len()
+        );
+        for p in &o.outputs {
             text.push_str(&format!("output: {}\n", p.display()));
         }
         Ok(text)
@@ -420,7 +480,7 @@ impl McpServer {
         let source = self.resolve_source(src)?;
         let mut options = MergeOptions::for_folder(source.root.clone());
         options.include_tree = false;
-        let job = resolve_job(&options)?;
+        let job = tm_core::job::resolve_job(&options)?;
         let scan = tm_core::scanner::scan_text_files(&job.root, &job.scan_options)
             .map_err(|e| format!("scan failed: {}", e))?;
         Ok(tm_core::repomap::build_repo_map(
@@ -491,218 +551,4 @@ impl McpServer {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct Env {
-        server: McpServer,
-        tmp: tempfile::TempDir,
-    }
-
-    fn env() -> Env {
-        let tmp = tempfile::tempdir().unwrap();
-        let shared = tmp.path().join("shared");
-        std::fs::create_dir_all(&shared).unwrap();
-        let args = McpConfig {
-            roots: vec![shared],
-            output_dir: Some(tmp.path().join("outs")),
-            allow_remote: false,
-        };
-        Env {
-            server: McpServer::from_config(&args).unwrap(),
-            tmp,
-        }
-    }
-
-    fn call(server: &McpServer, line: &str) -> Value {
-        serde_json::from_str(&server.handle_message(line).expect("response")).unwrap()
-    }
-
-    #[test]
-    fn initialize_negotiates_a_supported_version() {
-        let e = env();
-        let resp = call(
-            &e.server,
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
-        );
-        assert_eq!(resp["id"], 1);
-        assert_eq!(resp["result"]["protocolVersion"], "2025-03-26");
-        assert_eq!(resp["result"]["serverInfo"]["name"], "turbomerger");
-        assert!(resp["result"]["capabilities"]["tools"].is_object());
-        // v1 A.9: an unknown version is answered with ours, never echoed.
-        let resp = call(
-            &e.server,
-            r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}"#,
-        );
-        assert_eq!(resp["result"]["protocolVersion"], SUPPORTED_VERSIONS[0]);
-
-        // notifications get no response
-        assert!(e
-            .server
-            .handle_message(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
-            .is_none());
-        let pong = call(&e.server, r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#);
-        assert!(pong["result"].is_object());
-    }
-
-    #[test]
-    fn tools_list_names_all_four() {
-        let e = env();
-        let resp = call(
-            &e.server,
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
-        );
-        let names: Vec<&str> = resp["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            names,
-            vec!["pack_directory", "repo_map", "read_output", "grep_output"]
-        );
-    }
-
-    #[test]
-    fn unknown_method_and_unknown_tool() {
-        let e = env();
-        let resp = call(
-            &e.server,
-            r#"{"jsonrpc":"2.0","id":4,"method":"bogus/thing"}"#,
-        );
-        assert_eq!(resp["error"]["code"], -32601);
-        let resp = call(
-            &e.server,
-            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#,
-        );
-        assert_eq!(resp["result"]["isError"], true);
-    }
-
-    fn tool(server: &McpServer, name: &str, args: Value) -> (bool, String) {
-        let req = json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":name,"arguments":args}});
-        let resp = call(server, &req.to_string());
-        (
-            resp["result"]["isError"] == false,
-            resp["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap_or("")
-                .to_string(),
-        )
-    }
-
-    #[test]
-    fn pack_repo_map_read_grep_roundtrip() {
-        let e = env();
-        let root = e.tmp.path().join("shared").join("mcp_repo");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("src/alpha.rs"),
-            "pub fn alpha_one(v: u32) -> u32 {\n    v + 1\n}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("src/beta.rs"),
-            "pub fn beta_two() -> u32 {\n    crate::alpha::alpha_one(1)\n}\n",
-        )
-        .unwrap();
-
-        let (ok, text) = tool(
-            &e.server,
-            "pack_directory",
-            json!({"path": root.to_string_lossy()}),
-        );
-        assert!(ok, "{text}");
-        assert!(text.contains("merged=2"), "summary: {}", text);
-        let out_path = text
-            .lines()
-            .find_map(|l| l.strip_prefix("output: "))
-            .expect("output path in summary")
-            .to_string();
-        assert!(
-            Path::new(&out_path).starts_with(&e.server.output_dir),
-            "{out_path}"
-        );
-
-        let (_, map) = tool(
-            &e.server,
-            "repo_map",
-            json!({"path": root.to_string_lossy(), "tokens": 500}),
-        );
-        assert!(map.contains("alpha_one"), "map: {}", map);
-
-        let (_, slice) = tool(
-            &e.server,
-            "read_output",
-            json!({"path": out_path, "offset": 0, "limit": 5}),
-        );
-        assert!(slice.contains("lines 1..5"), "slice: {}", slice);
-
-        let (_, hits) = tool(
-            &e.server,
-            "grep_output",
-            json!({"path": out_path, "pattern": "alpha_one"}),
-        );
-        assert!(hits.contains("alpha_one"), "grep: {}", hits);
-
-        // Arbitrary files are refused, even ones named like outputs.
-        let secret = e.tmp.path().join("x_merged.md");
-        std::fs::write(&secret, "nope\n").unwrap();
-        let (ok, _) = tool(
-            &e.server,
-            "read_output",
-            json!({"path": secret.to_string_lossy()}),
-        );
-        assert!(!ok);
-    }
-
-    #[test]
-    fn a9_outputs_never_leave_the_outputs_folder() {
-        // v1 A.9: output = ".../.bashrc_probe" was written verbatim.
-        let e = env();
-        let root = e.tmp.path().join("shared").join("r");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
-        let probe = e.tmp.path().join("mcp_any").join(".bashrc_probe");
-        let (ok, text) = tool(
-            &e.server,
-            "pack_directory",
-            json!({"path": root.to_string_lossy(), "output": probe.to_string_lossy()}),
-        );
-        assert!(ok, "{text}");
-        assert!(!probe.exists(), "must not write where the client says");
-        let out = text
-            .lines()
-            .find_map(|l| l.strip_prefix("output: "))
-            .unwrap();
-        assert!(Path::new(out).starts_with(&e.server.output_dir));
-        assert!(out.ends_with("bashrc_probe"), "{out}");
-    }
-
-    #[test]
-    fn sources_outside_the_shared_roots_are_refused() {
-        let e = env();
-        let outside = e.tmp.path().join("private");
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("k.rs"), "fn k() {}\n").unwrap();
-        let (ok, text) = tool(
-            &e.server,
-            "pack_directory",
-            json!({"path": outside.to_string_lossy()}),
-        );
-        assert!(!ok && text.contains("outside"), "{text}");
-        let (ok, _) = tool(
-            &e.server,
-            "repo_map",
-            json!({"path": outside.to_string_lossy()}),
-        );
-        assert!(!ok);
-        // Remote sources need --allow-remote.
-        let (ok, text) = tool(
-            &e.server,
-            "pack_directory",
-            json!({"path": "gh:rust-lang/cargo"}),
-        );
-        assert!(!ok && text.contains("--allow-remote"), "{text}");
-    }
-}
+mod tests;

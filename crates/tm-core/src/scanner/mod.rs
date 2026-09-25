@@ -28,6 +28,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrd};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -353,6 +354,15 @@ pub struct ScanResult {
     pub files: Vec<PathBuf>,
     pub stats: ScanStats,
     pub skipped: Vec<SkipEntry>,
+}
+
+/// What a running scan reports (see `scan_with`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanProgress {
+    /// Entries seen by the walk so far (the total is unknown until it ends).
+    Walked(usize),
+    /// Candidate files classified so far, of `total`.
+    Classified { done: usize, total: usize },
 }
 
 // ============================================================================
@@ -833,13 +843,16 @@ const COUNT_CAP_TOTAL: usize = 100_000;
 
 /// Files and bytes under `dir`, without following links. `None` when the
 /// global budget is spent; `capped` when this directory hit its own cap.
-fn count_tree(dir: &Path, budget: &mut usize) -> Option<(usize, u64, bool)> {
+fn count_tree(dir: &Path, budget: &mut usize, cancel: &AtomicBool) -> Option<(usize, u64, bool)> {
     if *budget == 0 {
         return None;
     }
     let (mut files, mut bytes, mut visited) = (0usize, 0u64, 0usize);
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
+        if cancel.load(AtomicOrd::Relaxed) {
+            return None;
+        }
         let Ok(rd) = std::fs::read_dir(&d) else {
             continue;
         };
@@ -991,6 +1004,18 @@ impl IgnoreAttribution {
 /// unrecorded: pruned directories, hidden files, symlinks and ignored
 /// entries all land in `skipped` (N-01/N-02/N-03).
 pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult> {
+    scan_with(root, options, &AtomicBool::new(false), &|_| {})
+}
+
+/// `scan_text_files` for a job: reports progress, and stops with
+/// `Err(Cancelled)` soon after `cancel` is set (checked per entry).
+pub fn scan_with(
+    root: &Path,
+    options: &ScanOptions,
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(ScanProgress) + Sync),
+) -> Result<ScanResult> {
+    let stop = || -> Result<ScanResult> { Err(crate::cancel::Cancelled.into()) };
     if has_reparse_point_in_path(root).unwrap_or(true) {
         anyhow::bail!("Root path contains junction points or symlinks");
     }
@@ -1059,7 +1084,15 @@ pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult>
     let mut stats = ScanStats::default();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
+    let mut walked = 0usize;
     for result in builder.build() {
+        if cancel.load(AtomicOrd::Relaxed) {
+            return stop();
+        }
+        walked += 1;
+        if walked.is_multiple_of(512) {
+            progress(ScanProgress::Walked(walked));
+        }
         let entry = match result {
             Ok(e) => e,
             Err(err) => {
@@ -1103,6 +1136,7 @@ pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult>
         }
         candidates.push((path, meta.len()));
     }
+    progress(ScanProgress::Walked(walked));
 
     // What the walk filter left out: directories (with counts), hidden files,
     // and symlinks (resolved below).
@@ -1149,7 +1183,7 @@ pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult>
             let counted = if p.reason == "version-control metadata" {
                 None
             } else {
-                count_tree(&p.path, &mut budget)
+                count_tree(&p.path, &mut budget, cancel)
             };
             let reason = if p.reason == "version-control metadata" {
                 format!("{} — not scanned", p.reason)
@@ -1166,9 +1200,16 @@ pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult>
         }
     }
 
+    if cancel.load(AtomicOrd::Relaxed) {
+        return stop();
+    }
+
     // Walk 2: everything ignore rules or user globs hid, counted per rule.
     if options.respect_gitignore || overrides.is_some() {
-        let ignored = find_ignored(root, &seen, include_venv, include_hidden);
+        let ignored = find_ignored(root, &seen, include_venv, include_hidden, cancel);
+        if cancel.load(AtomicOrd::Relaxed) {
+            return stop();
+        }
         stats.ignored_entries = ignored.len();
         let mut attribution = IgnoreAttribution::new(root, use_ancestors);
         // (source, pattern) -> (files, dirs, bytes, capped)
@@ -1194,7 +1235,7 @@ pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult>
             let slot = per_rule.entry(key).or_insert((0, 0, 0, false));
             if is_dir {
                 slot.1 += 1;
-                if let Some((f, b, capped)) = count_tree(&path, &mut budget) {
+                if let Some((f, b, capped)) = count_tree(&path, &mut budget, cancel) {
                     slot.0 += f;
                     slot.2 += b;
                     slot.3 |= capped;
@@ -1226,14 +1267,30 @@ pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult>
         }
     }
 
+    if cancel.load(AtomicOrd::Relaxed) {
+        return stop();
+    }
+
     // Phase 2 (parallel): classify candidates (includes content sniffing).
+    let total = candidates.len();
+    let classified = AtomicUsize::new(0);
     let verdicts: Vec<(PathBuf, Verdict)> = candidates
         .into_par_iter()
         .map(|(path, len)| {
+            if cancel.load(AtomicOrd::Relaxed) {
+                return (path, Verdict::Unreadable);
+            }
             let v = classify(&path, len, options);
+            let done = classified.fetch_add(1, AtomicOrd::Relaxed) + 1;
+            if done.is_multiple_of(256) || done == total {
+                progress(ScanProgress::Classified { done, total });
+            }
             (path, v)
         })
         .collect();
+    if cancel.load(AtomicOrd::Relaxed) {
+        return stop();
+    }
 
     let mut files = Vec::new();
     for (path, verdict) in verdicts {
@@ -1316,6 +1373,7 @@ fn find_ignored(
     seen: &HashSet<PathBuf>,
     include_venv: bool,
     include_hidden: bool,
+    cancel: &AtomicBool,
 ) -> Vec<(PathBuf, bool)> {
     let seen = Arc::new(seen.clone());
     let found: Arc<Mutex<Vec<(PathBuf, bool)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1347,7 +1405,11 @@ fn find_ignored(
         }
         false
     });
-    for _ in b.build() {}
+    for _ in b.build() {
+        if cancel.load(AtomicOrd::Relaxed) {
+            break;
+        }
+    }
     let mut out = std::mem::take(&mut *found.lock().expect("ignored sink"));
     out.sort();
     out

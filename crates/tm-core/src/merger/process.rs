@@ -29,6 +29,15 @@ pub(super) struct Processed {
 /// BEFORE the credential-density exclusion, so an excluded credential file
 /// still teaches the propagation pass its values.
 pub(super) fn process_file(path: &Path, root: &Path, cfg: &MergeConfig) -> Processed {
+    // Test hook, debug builds only: make every file slow so the deadline,
+    // partial-output and stall paths can be exercised end to end.
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("TM_TEST_SLOW_FILE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     let mut harvested: Vec<String> = Vec::new();
     let mut dense: Vec<String> = Vec::new();
     let result = process_file_inner(path, root, cfg, &mut harvested, &mut dense);

@@ -23,6 +23,8 @@ chardetng = "1.0.0"
 chrono = "0.4"
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 clap_complete = "4.5"
+# Graceful Ctrl-C for the CLI (cancel the job, clean up temp files).
+ctrlc = "3.5"
 dirs = "6"
 encoding_rs = "0.8.35"
 globset = "0.4"

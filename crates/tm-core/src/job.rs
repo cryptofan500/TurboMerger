@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::Local;
 
-use crate::merger::{MergeConfig, Ordering as MergeOrdering, OutputFormat};
-use crate::scanner::{self, ScanOptions};
+use crate::cancel::{CancelToken, Cancelled};
+use crate::merger::{MergeConfig, MergeOutcome, Ordering as MergeOrdering, OutputFormat};
+use crate::scanner::{self, ScanOptions, ScanProgress, ScanStats, SkipEntry};
 use crate::security;
 
 #[derive(Debug, Clone, Serialize)]
@@ -275,6 +276,194 @@ pub fn apply_selection(
     files.sort();
 }
 
+/// Where a running job is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    /// Walking the folder (`done` = entries seen; the total is unknown).
+    Scan,
+    /// Deciding what each candidate file is (`done` of `total`).
+    Classify,
+    /// Reading, redacting and counting files, then writing (`done` of `total`).
+    Merge,
+}
+
+/// One progress report from a running job.
+#[derive(Debug, Clone, Serialize)]
+pub struct Progress {
+    pub stage: Stage,
+    pub done: usize,
+    /// 0 when not known yet.
+    pub total: usize,
+    /// The file being worked on, when there is one.
+    pub current: String,
+}
+
+/// Why a job produced no output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobError {
+    /// Bad options or source (message from `resolve_job`).
+    Invalid(String),
+    Scan(String),
+    Merge(String),
+    /// The folder holds nothing at all (no file, and nothing skipped).
+    Empty,
+    /// The job's cancel token was set; nothing was written.
+    Cancelled,
+}
+
+impl std::fmt::Display for JobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JobError::Invalid(m) => f.write_str(m),
+            JobError::Scan(m) => write!(f, "Scan failed: {}", m),
+            JobError::Merge(m) => write!(f, "Merge failed: {}", m),
+            JobError::Empty => f.write_str("No files found in directory"),
+            JobError::Cancelled => f.write_str("Operation cancelled by user"),
+        }
+    }
+}
+
+impl std::error::Error for JobError {}
+
+/// A finished merge: the summary the shells show, plus the details.
+pub struct MergeRun {
+    pub result: MergeResult,
+    pub outcome: MergeOutcome,
+    /// What the scan left out (the merge's own skips are in `outcome`).
+    pub scan_skipped: Vec<SkipEntry>,
+    pub stats: ScanStats,
+}
+
+impl MergeRun {
+    /// Every skip, scan first.
+    pub fn all_skips(&self) -> impl Iterator<Item = &SkipEntry> {
+        self.scan_skipped.iter().chain(self.outcome.skipped.iter())
+    }
+}
+
+/// Resolve, scan, curate and merge one job — the path every shell (CLI,
+/// MCP, desktop, watch mode) takes. `output` overrides the resolved output
+/// path (watch mode writes to a stable name). Checks `cancel` per file.
+pub fn run_merge(
+    options: &MergeOptions,
+    output: Option<&Path>,
+    cancel: &CancelToken,
+    progress: &(dyn Fn(Progress) + Sync),
+) -> Result<MergeRun, JobError> {
+    let start = std::time::Instant::now();
+    let mut job = resolve_job(options).map_err(JobError::Invalid)?;
+    if let Some(o) = output {
+        job.output_path = o.to_path_buf();
+    }
+    progress(Progress {
+        stage: Stage::Scan,
+        done: 0,
+        total: 0,
+        current: String::new(),
+    });
+    let on_scan = |p: ScanProgress| {
+        progress(match p {
+            ScanProgress::Walked(n) => Progress {
+                stage: Stage::Scan,
+                done: n,
+                total: 0,
+                current: String::new(),
+            },
+            ScanProgress::Classified { done, total } => Progress {
+                stage: Stage::Classify,
+                done,
+                total,
+                current: String::new(),
+            },
+        })
+    };
+    let scan =
+        scanner::scan_with(&job.root, &job.scan_options, cancel.flag(), &on_scan).map_err(|e| {
+            if e.is::<Cancelled>() {
+                JobError::Cancelled
+            } else {
+                JobError::Scan(e.to_string())
+            }
+        })?;
+    let stats = scan.stats;
+    let mut skipped = scan.skipped;
+    let mut files = scan.files;
+    apply_selection(
+        &job.root,
+        &mut files,
+        &mut skipped,
+        &options.selected_paths,
+        &options.force_include,
+    );
+    if files.is_empty() && skipped.is_empty() {
+        return Err(JobError::Empty);
+    }
+
+    let ctl = crate::merger::MergeCtl {
+        cancel: cancel.flag(),
+        finish: Some(cancel.finish_flag()),
+    };
+    let outcome = crate::merger::merge_files_ctl(
+        &job.root,
+        &files,
+        &job.output_path,
+        &job.merge_config,
+        ctl,
+        |done, total, file| {
+            progress(Progress {
+                stage: Stage::Merge,
+                done,
+                total,
+                current: file.to_string(),
+            })
+        },
+        &skipped,
+    )
+    .map_err(|e| {
+        if e.is::<Cancelled>() {
+            JobError::Cancelled
+        } else {
+            JobError::Merge(e.to_string())
+        }
+    })?;
+
+    let result = MergeResult {
+        output_path: outcome
+            .outputs
+            .first()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        output_paths: outcome
+            .outputs
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect(),
+        files_processed: outcome.files_processed,
+        files_skipped: outcome.files_skipped + skipped.len(),
+        total_bytes: outcome.total_bytes,
+        duration_ms: start.elapsed().as_millis() as u64,
+        files_by_extension: stats.by_extension,
+        files_by_content: stats.by_content,
+        files_skipped_binary: stats.skipped_binary,
+        files_unreadable: stats.unreadable,
+        secrets_redacted: outcome.secrets_redacted,
+        tokens_o200k: outcome.tokens_o200k,
+        tokens_claude_est: crate::tokens::claude_estimate(outcome.tokens_o200k),
+        skill_path: outcome
+            .skill
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
+        not_captured: count_not_captured(&skipped, &outcome.skipped),
+    };
+    Ok(MergeRun {
+        result,
+        outcome,
+        scan_skipped: skipped,
+        stats,
+    })
+}
+
 /// A source the shells were given, ready to scan.
 pub struct ResolvedSource {
     /// The folder to merge (a temporary clone for remote sources).
@@ -319,6 +508,57 @@ pub fn resolve_source(src: &str, on_clone: impl FnOnce(&str)) -> Result<Resolved
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_merge_reports_progress_and_honours_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("r");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for i in 0..40 {
+            std::fs::write(
+                root.join(format!("src/f{i}.rs")),
+                format!("fn f{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let out = tmp.path().join("out.md");
+        let options = MergeOptions::for_folder(root.to_string_lossy());
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let run = run_merge(&options, Some(&out), &CancelToken::new(), &|p| {
+            seen.lock().unwrap().push(p.stage)
+        })
+        .unwrap();
+        assert_eq!(run.result.files_processed, 40);
+        assert!(out.is_file());
+        let stages = seen.into_inner().unwrap();
+        assert_eq!(stages.first(), Some(&Stage::Scan));
+        assert!(stages.contains(&Stage::Classify) && stages.contains(&Stage::Merge));
+
+        // Cancelled mid-merge: an error, and no output.
+        let out2 = tmp.path().join("out2.md");
+        let cancel = CancelToken::new();
+        let err = run_merge(&options, Some(&out2), &cancel, &|p| {
+            if p.stage == Stage::Merge {
+                cancel.cancel();
+            }
+        })
+        .err();
+        assert_eq!(err, Some(JobError::Cancelled));
+        assert!(!out2.exists());
+
+        // Empty folder.
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let err = run_merge(
+            &MergeOptions::for_folder(empty.to_string_lossy()),
+            Some(&out2),
+            &CancelToken::new(),
+            &|_| {},
+        )
+        .err();
+        assert_eq!(err, Some(JobError::Empty));
+    }
 
     #[test]
     fn selection_filters_and_force_include_rescues() {
