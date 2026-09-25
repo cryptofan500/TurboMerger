@@ -66,3 +66,32 @@ jobs:
 
       - name: Validate the Tauri application build
         run: npm run tauri:build -- --debug --no-bundle
+
+      # Phase 2 gate: the Windows CLI is a console program — it prints and a
+      # shell gets its exit code (N-29; v7 was a GUI-subsystem binary).
+      - name: CLI prints and returns exit codes (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tm = "target\debug\turbomerger.exe"
+          $v = & $tm --version
+          if ($LASTEXITCODE -ne 0 -or $v -notmatch '^turbomerger ') { throw "--version: '$v' exit $LASTEXITCODE" }
+          New-Item -ItemType Directory -Path smoke\src -Force | Out-Null
+          Set-Content -Path smoke\src\main.rs -Value 'fn main() {}'
+          $out = & $tm merge smoke\src smoke\out.md
+          if ($LASTEXITCODE -ne 0 -or -not ($out -match '^merged=1 ')) { throw "merge: '$out' exit $LASTEXITCODE" }
+          & $tm merge smoke\missing smoke\x.md 2>$null
+          if ($LASTEXITCODE -ne 1) { throw "missing source should exit 1, got $LASTEXITCODE" }
+          & $tm merge smoke\src --no-such-flag 2>$null
+          if ($LASTEXITCODE -ne 2) { throw "usage error should exit 2, got $LASTEXITCODE" }
+          exit 0  # the runner otherwise exits with the last $LASTEXITCODE (2)
+
+      - name: Static musl CLI runs in Alpine (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --target x86_64-unknown-linux-musl -p tm-cli
+          bin=target/x86_64-unknown-linux-musl/release/turbomerger
+          file "$bin" | grep -q 'static'
+          docker run --rm -v "$PWD/target/x86_64-unknown-linux-musl/release:/w:ro" alpine:3 /w/turbomerger --version

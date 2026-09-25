@@ -28,6 +28,8 @@ encoding_rs = "0.8.35"
 globset = "0.4"
 ignore = "0.4"
 libc = "0.2"
+# The CLI's allocator: musl's malloc serializes threads (ADR 0002, plan §16).
+mimalloc = { version = "0.1.52", default-features = false }
 notify = "8.2.0"
 notify-debouncer-mini = "0.7.0"
 open = "5"
