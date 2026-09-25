@@ -35,6 +35,8 @@ notify-debouncer-mini = "0.7.0"
 open = "5"
 phf = { version = "0.13", features = ["macros"] }
 rayon = "1.10"
+# MCP SDK (N-19, ADR 0014): protocol versions, progress and cancellation.
+rmcp = { version = "=3.4.1", default-features = false, features = ["server", "macros", "transport-io"] }
 regex = "1"
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
@@ -44,6 +46,7 @@ tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros", "io-std", "sync", "time"] }
 tiktoken-rs = "0.12"
 toml = "1"
 tree-sitter = "0.26.11"

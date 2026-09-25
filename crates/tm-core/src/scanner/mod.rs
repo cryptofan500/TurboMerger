@@ -643,6 +643,10 @@ fn not_yet_extractable(ext_lower: &str) -> Option<&'static str> {
 }
 
 /// Decide whether a single candidate file is merged. Runs on rayon threads.
+///
+/// Order matters for the exit code: what a file *is* comes before how big it
+/// is. A 100 MB `.zip` or a large file of zeros is binary — excluded on
+/// purpose — not text that was "too large" to capture (which exits 3).
 fn classify(path: &Path, len: u64, options: &ScanOptions) -> Verdict {
     let name = match path.file_name().and_then(|n| n.to_str()) {
         Some(n) => n,
@@ -672,76 +676,59 @@ fn classify(path: &Path, len: u64, options: &ScanOptions) -> Verdict {
     if let Some(reason) = ext_lower.as_deref().and_then(not_yet_extractable) {
         return Verdict::Skip(reason.into(), SkipKind::NotCaptured);
     }
+
+    // Known by name or extension: user overrides, binary types, text types.
+    let known_text = match ext_lower.as_deref() {
+        Some(ext) => {
+            // Step 1: Config exclude list (highest priority user override)
+            if options.extra_skip_exts.iter().any(|e| e == ext) {
+                return Verdict::Skip("excluded by turbomerger.toml".into(), SkipKind::Excluded);
+            }
+            // Step 2: Known binary extension → skip, whatever its size
+            if BINARY_EXTENSIONS.contains(ext) || options.extra_binary_exts.iter().any(|e| e == ext)
+            {
+                return Verdict::Skip("binary extension".into(), SkipKind::Binary);
+            }
+            TEXT_EXTENSIONS.contains(ext) || options.extra_text_exts.iter().any(|e| e == ext)
+        }
+        None => is_known_extensionless_file(&name_lower),
+    };
+
+    // Unknown type: the first 8 KB decide text vs binary, whatever its size.
+    let mut by_content = false;
+    if !known_text {
+        if !options.content_sniff {
+            let why = if ext_lower.is_some() {
+                "unknown extension (content detection off)"
+            } else {
+                "no extension (content detection off)"
+            };
+            return Verdict::Skip(why.into(), SkipKind::NotCaptured);
+        }
+        match sniff_file_content(path) {
+            Ok(true) => by_content = true,
+            Ok(false) => return Verdict::Skip("binary content".into(), SkipKind::Binary),
+            Err(_) => return Verdict::Unreadable,
+        }
+    }
+
+    // Text that is too big to capture.
     if len > options.max_file_size {
         return Verdict::Skip(
             format!("too large ({} KB)", len / 1024),
             SkipKind::NotCaptured,
         );
     }
-
-    if let Some(ext_lower) = ext_lower {
-        // Step 1: Config exclude list (highest priority user override)
-        if options.extra_skip_exts.iter().any(|e| e == &ext_lower) {
-            return Verdict::Skip("excluded by turbomerger.toml".into(), SkipKind::Excluded);
-        }
-
-        // Step 2: Known binary extension → skip
-        if BINARY_EXTENSIONS.contains(ext_lower.as_str())
-            || options.extra_binary_exts.iter().any(|e| e == &ext_lower)
-        {
-            return Verdict::Skip("binary extension".into(), SkipKind::Binary);
-        }
-
-        let known_text = TEXT_EXTENSIONS.contains(ext_lower.as_str())
-            || options.extra_text_exts.iter().any(|e| e == &ext_lower);
-
-        // Large files must be known text extensions
-        if len > LARGE_FILE_UNKNOWN_EXT && !known_text {
-            return Verdict::Skip(
-                "large file with unknown extension".into(),
-                SkipKind::NotCaptured,
-            );
-        }
-
-        // Step 3: Known text extension → include
-        if known_text {
-            return Verdict::TextByExt;
-        }
-
-        // Step 4: Unknown extension → content sniff if enabled
-        if options.content_sniff {
-            return match sniff_file_content(path) {
-                Ok(true) => Verdict::TextByContent,
-                Ok(false) => Verdict::Skip("binary content".into(), SkipKind::Binary),
-                Err(_) => Verdict::Unreadable,
-            };
-        }
-        Verdict::Skip(
-            "unknown extension (content detection off)".into(),
+    if by_content && len > LARGE_FILE_UNKNOWN_EXT {
+        return Verdict::Skip(
+            "large file with unknown extension".into(),
             SkipKind::NotCaptured,
-        )
+        );
+    }
+    if by_content {
+        Verdict::TextByContent
     } else {
-        // Extensionless files — known names, then optional sniff
-        if len > LARGE_FILE_UNKNOWN_EXT && !is_known_extensionless_file(&name_lower) {
-            return Verdict::Skip(
-                "large file with unknown extension".into(),
-                SkipKind::NotCaptured,
-            );
-        }
-        if is_known_extensionless_file(&name_lower) {
-            Verdict::TextByExt
-        } else if options.content_sniff {
-            match sniff_file_content(path) {
-                Ok(true) => Verdict::TextByContent,
-                Ok(false) => Verdict::Skip("binary content".into(), SkipKind::Binary),
-                Err(_) => Verdict::Unreadable,
-            }
-        } else {
-            Verdict::Skip(
-                "no extension (content detection off)".into(),
-                SkipKind::NotCaptured,
-            )
-        }
+        Verdict::TextByExt
     }
 }
 
@@ -1517,6 +1504,42 @@ mod tests {
         let data: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8 | 0x80).collect();
         std::fs::write(&bin, [&[0x01u8, 0x02, 0x03][..], &data].concat()).unwrap();
         assert!(!sniff_file_content(&bin).unwrap());
+    }
+
+    #[test]
+    fn binary_type_comes_before_the_size_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ScanOptions {
+            max_file_size: 1024,
+            ..Default::default()
+        };
+        // A big asset with a binary extension is binary, not "too large".
+        let bin = dir.path().join("asset.bin");
+        std::fs::File::create(&bin).unwrap().set_len(4096).unwrap();
+        assert!(matches!(
+            classify(&bin, 4096, &opts),
+            Verdict::Skip(_, SkipKind::Binary)
+        ));
+        // A big file of zeros with an unknown extension is sniffed as binary.
+        let raw = dir.path().join("dump.dat");
+        std::fs::File::create(&raw).unwrap().set_len(4096).unwrap();
+        assert!(matches!(
+            classify(&raw, 4096, &opts),
+            Verdict::Skip(_, SkipKind::Binary)
+        ));
+        // Text over the cap is content that was not captured (exit 3).
+        let txt = dir.path().join("notes.txt");
+        std::fs::write(&txt, "word ".repeat(1000)).unwrap();
+        assert!(matches!(
+            classify(&txt, 5000, &opts),
+            Verdict::Skip(r, SkipKind::NotCaptured) if r.starts_with("too large")
+        ));
+        let odd = dir.path().join("notes.xyz");
+        std::fs::write(&odd, "word ".repeat(1000)).unwrap();
+        assert!(matches!(
+            classify(&odd, 5000, &opts),
+            Verdict::Skip(r, SkipKind::NotCaptured) if r.starts_with("too large")
+        ));
     }
 
     #[test]
