@@ -14,9 +14,12 @@
   - Remote repositories need `--allow-remote`.
   - `initialize` answers with the client's version when supported
     (2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05), otherwise with 2025-11-25.
-  - **Deferred:** migrating to the official `rmcp` SDK (3.4.1) moves to Phase 2,
-    together with the `tm-mcp` crate. rmcp 3.4.1 knows the 2026-07-28 spec but its own
-    default (`ProtocolVersion::LATEST`) is still 2025-11-25, and the migration brings an
-    async runtime into the MCP path; the Phase-1 gate (repro A.9) is met without it.
+  - **Done in Phase 2:** `apps/tm-mcp` runs on the official SDK, `rmcp` =3.4.1
+    (current-thread tokio runtime). Negotiation is the SDK's: a known version is
+    accepted, anything else gets 2025-11-25 (tested: `2099-01-01` is never echoed).
+    Long calls send `notifications/progress` when the client passes a progress token;
+    `notifications/cancelled` stops a pack through its `CancelToken` and nothing is
+    written. The policy above is unchanged and tested against the real service over an
+    in-memory transport.
 - **Consequences:** existing MCP client configs must add `--root <DIR>` when the
   server starts in `/` or the home folder; tools report the fix in their error text.

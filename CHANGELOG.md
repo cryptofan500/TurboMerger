@@ -2,7 +2,7 @@
 
 All notable changes to TurboMerger will be documented in this file.
 
-## [Unreleased] — Phase 1 of the v8 refactor (targets 7.8.0)
+## [Unreleased] — v8 refactor, Phases 1–2 (targets 7.8.0)
 
 Stops the silent content loss, corruption and write-anywhere paths found in the
 2026-09-24 audit (`TURBOMERGER_refactor_september24_2026_v2.md`, findings N-xx).
@@ -89,6 +89,81 @@ Every fix ships with its repro turned into a test (96 → 156 Rust tests).
 - `fixtures/` (audit repros with the v7.7.0 baseline, apply-back poisoning,
   pinned arXiv and photo corpora with local-only payloads), `prototypes/`
   (reference oracles), `docs/adr/` (0001–0014).
+
+### Phase 2 — workspace, two binaries, streaming, jobs
+
+#### Added
+- **Two binaries (N-29, ADR 0015):** `turbomerger` is a console program on
+  every OS (Windows scripts now see its output and exit codes);
+  `turbomerger-gui` is the desktop app. Installers ship both (the `.deb` puts
+  both in `/usr/bin`). `turbomerger` without arguments opens the app when it is
+  installed and a display is available, else prints help. The app still runs
+  a CLI subcommand it is given (old scripts, the AppImage).
+- **Static Linux CLI:** `cargo build --release --target
+  x86_64-unknown-linux-musl -p tm-cli` gives a static binary (mimalloc) that
+  runs on any distribution, Alpine included; CI checks it.
+- **Progress, ETA, stalls and deadlines (plan §10):** `--progress
+  auto|json|none` (a status line every 5 s on a terminal; JSON lines for
+  scripts), ETA shown after `--eta-after` (default 60 s), a stall report after
+  `--stall-after` (default 10 s) naming the file, `--on-stall wait|fail`,
+  `--deadline 10m` with `--on-deadline cancel|partial`, `--keep-partial`.
+  Ctrl-C cancels cleanly (temp files removed; a second Ctrl-C quits).
+- **Exit code 4:** cancelled (nothing written) or partial (what was done is
+  written; the rest is listed as not captured).
+- **`--reproducible` (N-16):** LF line ends, NFC paths and order, no timestamps
+  — a CRLF/NFD checkout and an LF/NFC one merge to the same bytes.
+- **`--hydrate` (N-10, N-11):** OneDrive and iCloud files that are not on this
+  device are now listed as not captured instead of being downloaded; the flag
+  downloads and reads them.
+- **Token-count cache (plan 2.8):** unchanged files are not re-tokenized
+  (warm re-merges ~35 % faster); `TURBOMERGER_CACHE_DIR`,
+  `TURBOMERGER_NO_CACHE`.
+- **MCP progress and cancellation:** on the official Rust SDK (rmcp 3.4.1);
+  `notifications/progress` for clients that send a progress token, and
+  `notifications/cancelled` stops a pack.
+- **Worker host (`crates/tm-worker`):** the subprocess host for the coming PDF
+  and OCR workers — JSON-lines protocol, stall reports, per-item time budget,
+  memory cap (prlimit / setrlimit / Job Object), kill on cancel.
+
+#### Changed
+- **Desktop jobs (N-32, N-33):** each merge or scan has its own cancel token;
+  Cancel waits for the job to acknowledge; heavy work runs off the async
+  runtime with progress (elapsed, ETA, stalls) over a channel. Watch mode
+  re-merges after a change that arrives during a merge instead of dropping it.
+- **Opening files (N-28):** the app opens and reveals only outputs it wrote
+  this session; the chat-site buttons use a fixed allowlist; Explorer gets a
+  correctly quoted `/select`; Linux file managers select the file via D-Bus.
+- **Outputs (N-45):** generated names never overwrite an earlier output
+  (`…-2_merged.md`); `out/` names a folder, created when missing (v7 wrote a
+  file called `out`); the default folder falls back Downloads → home → cwd.
+- **Classification:** what a file is comes before how big it is — a large
+  binary or zero-filled file is "binary", not "too large" (which exits 3).
+- **Token counts** use tiktoken's ordinary encoding: `<|endoftext|>` in a file
+  is text, as in a chat window (ADR 0016).
+- **Windows paths (N-41):** no `\\?\` prefixes (dunce); **links (N-10):** only
+  symlinks and junctions are links — OneDrive folders are no longer pruned or
+  refused as roots.
+- **Linux + NVIDIA + Wayland (N-42):** the app disables WebKit's DMA-BUF
+  renderer there (blank window), unless you set it yourself.
+- Build output moved from `src-tauri/target` to `target/`; the version lives
+  once in the root `Cargo.toml`.
+
+#### Performance (release, Ryzen 5 5500U)
+- Streaming merge (D4, N-36, N-37): texts go to a spool file; memory holds
+  metadata only — a 3.4 GiB, 65,367-entry tree merges at 119 MB peak RSS with
+  every entry accounted for.
+- `opt-level = 3` (ADR 0016) and no exit delay: A.6 0.58 s (was 0.75),
+  A.10 0.65 s (0.95), the 3.4 GiB tree 3.5 s (4.7–5.8).
+
+#### Internal
+- Cargo workspace: `crates/tm-core` (engine, no GUI), `crates/tm-worker`,
+  `apps/tm-cli`, `apps/tm-mcp`, `src-tauri` (`tm-gui`).
+- Golden outputs (`fixtures/golden/`) pin the merged bytes of 17 runs; CI
+  compares them on Windows, macOS and Linux.
+- GUI smoke test (`fixtures/gui-smoke`): the app driven through WebDriver in a
+  virtual display, 18 checks, in Linux CI. Scale fixture `fixtures/big-tree`.
+- Dependencies: React 19, Vite 8, ESLint 10, actions/checkout 7,
+  actions/setup-node 7, toml 1, similar 3, dirs 6, phf 0.13.
 
 ## [7.7.0] - 2026-08-06
 

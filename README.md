@@ -169,8 +169,10 @@ turbomerger merge <folder|URL|gh:owner/repo> [out]
     [--format markdown|xml|cxml|json|plain] [--ordering path|entry-first|important-last]
     [--max-tokens N] [--include GLOB] [--exclude GLOB] [--config FILE] [--max-file-size MB]
     [--compress] [--strip-comments] [--git-diff] [--git-log [N]] [--emit-skill]
-    [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv]
-    [--show-source-path] [--fail-on-skip] [--quiet]
+    [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--hydrate]
+    [--show-source-path] [--reproducible] [--fail-on-skip] [--quiet]
+    [--progress auto|json|none] [--eta-after DUR] [--stall-after DUR] [--on-stall wait|fail]
+    [--deadline DUR] [--on-deadline cancel|partial] [--keep-partial]
 turbomerger map <folder|URL|gh:owner/repo> [out] [--tokens N]
 turbomerger explain <folder> <path>          # why is this path (not) in the merge?
 turbomerger apply <root> --from reply.md [--yes]
@@ -191,6 +193,13 @@ Arguments are validated strictly: a typo or a bad number is a usage error
 | 1 | error |
 | 2 | usage error |
 | 3 | completed, but some content was **not captured** (or nothing merged, or any skip with `--fail-on-skip`); `apply`: some proposals were held or refused |
+| 4 | cancelled (Ctrl-C, `--deadline`, `--on-stall fail`: nothing written) or partial (`--on-deadline partial`, `--keep-partial`: what was done is written, the rest is listed as not captured) |
+
+Progress goes to stderr: a status line every 5 s on a terminal, JSON lines
+with `--progress json` (`{"event":"progress"|"stall"|"deadline", "stage", "done",
+"total", "current", "elapsed_ms", "eta_ms", …}`). Durations are `90s`, `10m`,
+`1h30m`. Token counts of unchanged files come from a per-device cache
+(`TURBOMERGER_CACHE_DIR` moves it, `TURBOMERGER_NO_CACHE=1` turns it off).
 
 The one-line summary on stdout is
 `merged=N scan_skipped=N merge_skipped=N redacted=N tokens_o200k=N parts=N not_captured=N`

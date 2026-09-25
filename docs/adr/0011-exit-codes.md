@@ -17,7 +17,7 @@
   | 1 | error (no output) |
   | 2 | usage error (nothing written) |
   | 3 | completed, but something was not captured — or nothing was merged at all, or (with `--fail-on-skip`) any file was skipped; `apply`: some proposals were held or refused |
-  | 4 | reserved: partial / cancelled (v8 job model) |
+  | 4 | cancelled (Ctrl-C, `--deadline`, `--on-stall fail`; nothing written) or partial (`--on-deadline partial`, `--keep-partial`; what was done is written and the rest is listed as not captured) — implemented in Phase 2 |
   | 5 | reserved: verification failed (Phase 5 verifier) |
 
   When nothing can be merged but inputs were found, the output is still written and
