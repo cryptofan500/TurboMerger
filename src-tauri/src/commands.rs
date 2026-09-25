@@ -62,13 +62,13 @@ impl Outputs {
         if let Ok(mut set) = self.0.lock() {
             for p in result.output_paths.iter().chain(result.skill_path.iter()) {
                 let p = PathBuf::from(p);
-                set.insert(std::fs::canonicalize(&p).unwrap_or(p));
+                set.insert(dunce::canonicalize(&p).unwrap_or(p));
             }
         }
     }
     fn allows(&self, path: &str) -> bool {
         let p = PathBuf::from(path);
-        let p = std::fs::canonicalize(&p).unwrap_or(p);
+        let p = dunce::canonicalize(&p).unwrap_or(p);
         self.0.lock().map(|set| set.contains(&p)).unwrap_or(false)
     }
 }

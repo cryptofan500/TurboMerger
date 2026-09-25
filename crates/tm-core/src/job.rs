@@ -108,6 +108,12 @@ pub struct MergeOptions {
     /// Per-file size cap in MB, overriding the config file (CLI --max-file-size).
     #[serde(default)]
     pub max_file_size_mb: Option<u64>,
+    /// Same bytes on every OS (N-16).
+    #[serde(default)]
+    pub reproducible: bool,
+    /// Read (download) cloud files that are not on this device (N-10/N-11).
+    #[serde(default)]
+    pub hydrate: bool,
 }
 
 impl MergeOptions {
@@ -142,6 +148,8 @@ impl MergeOptions {
             remote: false,
             config_path: None,
             max_file_size_mb: None,
+            reproducible: false,
+            hydrate: false,
         }
     }
 }
@@ -170,31 +178,34 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
     }
     let format = OutputFormat::from_str_lenient(options.format.as_deref().unwrap_or("markdown"));
 
-    // Output naming in one place, at merge time.
+    // Output naming in one place, at merge time (N-45). A path that ends in
+    // a separator names a directory, created when missing (v7 wrote a file
+    // called `out` for `out/`). Generated names never overwrite an earlier
+    // output: two merges in the same second get `-2`, `-3`, ….
     let folder_name = root
         .file_name()
         .and_then(|n| n.to_str())
         .map(security::sanitize_filename)
         .unwrap_or_else(|| "merged".to_string());
-    let timestamp = Local::now().format("%Y-%m-%dT%H-%M-%S");
-    let output_name = format!(
-        "{}_{}_merged.{}",
+    let stem = format!(
+        "{}_{}",
         folder_name,
-        timestamp,
-        format.extension()
+        Local::now().format("%Y-%m-%dT%H-%M-%S")
     );
     let output_path = match &options.output_path {
         Some(p) if !p.is_empty() => {
             let pb = PathBuf::from(p);
+            if p.ends_with('/') || p.ends_with(std::path::MAIN_SEPARATOR) {
+                std::fs::create_dir_all(&pb)
+                    .map_err(|e| format!("cannot create output folder {}: {}", pb.display(), e))?;
+            }
             if pb.is_dir() {
-                pb.join(&output_name)
+                unique_output(&pb, &stem, format.extension())
             } else {
                 pb
             }
         }
-        _ => dirs::download_dir()
-            .unwrap_or_else(|| root.parent().unwrap_or(&root).to_path_buf())
-            .join(&output_name),
+        _ => unique_output(&default_output_dir(&root), &stem, format.extension()),
     };
 
     let mut include_globs = options.include_globs.clone();
@@ -213,6 +224,7 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         extra_binary_exts: config.extensions.binary,
         include_globs,
         exclude_globs,
+        hydrate: options.hydrate,
     };
 
     let merge_config = MergeConfig {
@@ -231,6 +243,7 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         source_label: options.source_label.clone(),
         show_source_path: options.show_source_path,
         remote: options.remote,
+        reproducible: options.reproducible,
     };
 
     Ok(ResolvedJob {
@@ -239,6 +252,37 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         scan_options,
         merge_config,
     })
+}
+
+/// Where outputs go when none is named: Downloads, else the home folder,
+/// else the working directory (else next to the source).
+fn default_output_dir(root: &Path) -> PathBuf {
+    dirs::download_dir()
+        .filter(|d| d.is_dir())
+        .or_else(|| dirs::home_dir().filter(|d| d.is_dir()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| root.parent().unwrap_or(root).to_path_buf())
+}
+
+/// `<dir>/<stem>_merged.<ext>`, or `<stem>-2_merged.<ext>`, `-3`, … when
+/// that name (or a split part of it) exists. The counter sits before
+/// `_merged` so the scanner still recognises the file as an output.
+fn unique_output(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+    let taken = |s: &str| {
+        dir.join(format!("{}_merged.{}", s, ext)).exists()
+            || std::fs::read_dir(dir).is_ok_and(|rd| {
+                let prefix = format!("{}_merged.part", s);
+                rd.flatten()
+                    .any(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            })
+    };
+    let mut candidate = stem.to_string();
+    let mut n = 1;
+    while taken(&candidate) {
+        n += 1;
+        candidate = format!("{}-{}", stem, n);
+    }
+    dir.join(format!("{}_merged.{}", candidate, ext))
 }
 
 /// Apply force-include rescues and the curated selection to a scan result.
@@ -253,12 +297,12 @@ pub fn apply_selection(
 ) {
     for rel in force_include {
         let candidate = root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let Ok(canon) = candidate.canonicalize() else {
+        let Ok(canon) = dunce::canonicalize(&candidate) else {
             continue;
         };
         // std canonicalize yields \\?\-prefixed paths on Windows; compare
         // against the canonicalized root the same way.
-        let Ok(root_canon) = root.canonicalize() else {
+        let Ok(root_canon) = dunce::canonicalize(root) else {
             continue;
         };
         if !canon.starts_with(&root_canon) || !candidate.is_file() {
@@ -561,9 +605,30 @@ mod tests {
     }
 
     #[test]
+    fn generated_names_never_overwrite_and_trailing_slash_makes_a_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert_eq!(unique_output(dir, "r_t", "md"), dir.join("r_t_merged.md"));
+        std::fs::write(dir.join("r_t_merged.md"), "x").unwrap();
+        assert_eq!(unique_output(dir, "r_t", "md"), dir.join("r_t-2_merged.md"));
+        std::fs::write(dir.join("r_t-2_merged.part1-of-3.md"), "x").unwrap();
+        assert_eq!(unique_output(dir, "r_t", "md"), dir.join("r_t-3_merged.md"));
+        assert!(crate::scanner::is_own_output_name("r_t-3_merged.md"));
+
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut o = MergeOptions::for_folder(src.to_string_lossy());
+        let out = format!("{}/new/", dir.display());
+        o.output_path = Some(out.clone());
+        let job = resolve_job(&o).unwrap();
+        assert!(dir.join("new").is_dir(), "created");
+        assert_eq!(job.output_path.parent(), Some(dir.join("new").as_path()));
+    }
+
+    #[test]
     fn selection_filters_and_force_include_rescues() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
         std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
         std::fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
         std::fs::write(root.join("notes.txt"), "hello\n").unwrap();

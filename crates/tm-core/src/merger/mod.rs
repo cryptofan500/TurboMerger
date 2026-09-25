@@ -105,6 +105,9 @@ pub struct MergeConfig {
     pub show_source_path: bool,
     /// The root is a temporary clone (skills written into it would vanish).
     pub remote: bool,
+    /// Same bytes on every OS (N-16): CRLF → LF in contents, NFC paths
+    /// (display and order), no timestamps.
+    pub reproducible: bool,
 }
 
 impl Default for MergeConfig {
@@ -125,6 +128,7 @@ impl Default for MergeConfig {
             source_label: None,
             show_source_path: false,
             remote: false,
+            reproducible: false,
         }
     }
 }
@@ -229,7 +233,20 @@ where
 
     // Order files (a stable copy so the caller's slice is untouched).
     let mut ordered: Vec<&PathBuf> = files.iter().collect();
-    order_files(root, &mut ordered, cfg.ordering);
+    order_files(root, &mut ordered, cfg.ordering, cfg.reproducible);
+    // --reproducible: the report's paths are NFC too, in NFC order.
+    let nfc_skips: Vec<SkipEntry>;
+    let scan_skips: &[SkipEntry] = if cfg.reproducible {
+        let mut v: Vec<SkipEntry> = scan_skips
+            .iter()
+            .map(|s| SkipEntry::new(nfc(&s.path), s.reason.clone(), s.kind))
+            .collect();
+        v.sort_by(|a, b| a.path.cmp(&b.path));
+        nfc_skips = v;
+        &nfc_skips
+    } else {
+        scan_skips
+    };
 
     let mut spool = Spool::new_near(output)?;
     let mut blocks: Vec<Block> = Vec::with_capacity(total_files);
@@ -294,11 +311,15 @@ where
             done += 1;
             match p.result {
                 Ok((mut b, content)) => {
+                    if cfg.reproducible {
+                        b.relative = nfc(&b.relative);
+                    }
                     progress_callback(done, total_files, &b.relative);
                     b.span = spool.append(&content)?;
                     blocks.push(b);
                 }
                 Err((rel, reason, kind)) => {
+                    let rel = if cfg.reproducible { nfc(&rel) } else { rel };
                     progress_callback(done, total_files, &rel);
                     merge_skips.push(SkipEntry::new(rel, reason, kind));
                 }
@@ -475,7 +496,7 @@ where
 
     // Claude-skill emission (T3-4): best-effort, into the scanned repo.
     if cfg.emit_skill && !cfg.remote {
-        match write_skill(root, &blocks, &outcome) {
+        match write_skill(root, &blocks, &outcome, cfg.reproducible) {
             Ok(p) => outcome.skill = Some(p),
             Err(e) => eprintln!("skill generation failed: {}", e),
         }
@@ -639,7 +660,12 @@ fn harvest_from_credential_files(
 
 /// Write `.claude/skills/<repo>/SKILL.md` describing the merged snapshot and
 /// how to regenerate it. Overwrites on re-merge (watch mode included).
-fn write_skill(root: &Path, blocks: &[Block], outcome: &MergeOutcome) -> Result<PathBuf> {
+fn write_skill(
+    root: &Path,
+    blocks: &[Block],
+    outcome: &MergeOutcome,
+    reproducible: bool,
+) -> Result<PathBuf> {
     let repo = root
         .file_name()
         .and_then(|n| n.to_str())
@@ -680,7 +706,7 @@ fn write_skill(root: &Path, blocks: &[Block], outcome: &MergeOutcome) -> Result<
     let content = format!(
         "---\nname: {slug}\ndescription: Repo context for {repo}. Use when working on {repo} code — points at the TurboMerger merged snapshot and how to regenerate or map it.\n---\n\n\
 # {repo} — TurboMerger context\n\n\
-Merged snapshot ({files} files, ~{tokens} o200k tokens, generated {when} by TurboMerger v{version}):\n\n{outputs}\n\n\
+Merged snapshot ({files} files, ~{tokens} o200k tokens, generated {when}by TurboMerger v{version}):\n\n{outputs}\n\n\
 Regenerate: `turbomerger merge \"{root}\"` (flags: `--compress` for signatures-only, `--git-diff` for the working-tree diff).\n\
 Structural overview instead of full content: `turbomerger map \"{root}\" --tokens 1024`.\n\n\
 ## Project structure\n\n{fence}\n{tree}{fence}\n",
@@ -689,7 +715,11 @@ Structural overview instead of full content: `turbomerger map \"{root}\" --token
         repo = repo,
         files = outcome.files_processed,
         tokens = outcome.tokens_o200k,
-        when = chrono::Utc::now().format("%Y-%m-%dT%H:%MZ"),
+        when = if reproducible {
+            String::new()
+        } else {
+            format!("{} ", chrono::Utc::now().format("%Y-%m-%dT%H:%MZ"))
+        },
         version = env!("CARGO_PKG_VERSION"),
         outputs = outputs,
         root = root.display(),
@@ -703,6 +733,12 @@ Structural overview instead of full content: `turbomerger map \"{root}\" --token
 // ============================================================================
 // HELPERS
 // ============================================================================
+
+/// Unicode NFC — for `--reproducible` display paths only (never for I/O).
+fn nfc(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfc().collect()
+}
 
 fn relative_display(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
@@ -771,7 +807,25 @@ fn entry_rank(rel: &str) -> i32 {
     score
 }
 
-fn order_files(root: &Path, files: &mut [&PathBuf], ordering: Ordering) {
+fn order_files(root: &Path, files: &mut [&PathBuf], ordering: Ordering, reproducible: bool) {
+    if reproducible {
+        // The same order on every OS: NFC path strings, not OS path bytes.
+        let key = |p: &PathBuf| nfc(&relative_display(root, p));
+        match ordering {
+            Ordering::Path => files.sort_by_cached_key(|p| key(p)),
+            Ordering::EntryFirst => files.sort_by_cached_key(|p| {
+                let k = key(p);
+                (entry_rank(&k), k)
+            }),
+            Ordering::ImportantLast => {
+                files.sort_by_cached_key(|p| {
+                    let k = key(p);
+                    (std::cmp::Reverse(entry_rank(&k)), std::cmp::Reverse(k))
+                });
+            }
+        }
+        return;
+    }
     match ordering {
         Ordering::Path => files.sort(),
         Ordering::EntryFirst => {

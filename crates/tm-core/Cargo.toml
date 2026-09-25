@@ -17,6 +17,7 @@ cap-std.workspace = true
 chardetng.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+dunce.workspace = true
 encoding_rs.workspace = true
 globset.workspace = true
 ignore.workspace = true

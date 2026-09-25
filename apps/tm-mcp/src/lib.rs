@@ -101,7 +101,7 @@ impl McpServer {
         };
         std::fs::create_dir_all(&output_dir)
             .map_err(|e| format!("cannot create {}: {}", output_dir.display(), e))?;
-        let output_dir = std::fs::canonicalize(&output_dir).map_err(|e| e.to_string())?;
+        let output_dir = dunce::canonicalize(&output_dir).map_err(|e| e.to_string())?;
         Ok(McpServer {
             roots,
             output_dir,
@@ -157,7 +157,7 @@ impl McpServer {
         } else {
             self.output_dir.join(p)
         };
-        let canon = std::fs::canonicalize(&candidate)
+        let canon = dunce::canonicalize(&candidate)
             .map_err(|_| format!("not a TurboMerger output: {}", path))?;
         if !canon.starts_with(&self.output_dir) || !canon.is_file() {
             return Err(format!(

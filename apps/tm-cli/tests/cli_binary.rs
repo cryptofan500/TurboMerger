@@ -166,3 +166,48 @@ fn explain_names_the_rule() {
     let o = tm(&["explain", "r", "main.rs"], tmp.path());
     assert!(stdout(&o).contains("merged"));
 }
+
+#[test]
+fn reproducible_outputs_do_not_depend_on_line_ends_or_name_normalization() {
+    // N-16: the same project checked out on Windows (CRLF) and macOS (NFD
+    // names) must merge to the same bytes with --reproducible.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a").join("proj");
+    let b = tmp.path().join("b").join("proj");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    fs::write(a.join("main.rs"), "fn main() {\r\n    x();\r\n}\r\n").unwrap();
+    fs::write(b.join("main.rs"), "fn main() {\n    x();\n}\n").unwrap();
+    fs::write(a.join("cafe\u{301}.md"), "# notes\r\n").unwrap(); // NFD
+    fs::write(b.join("caf\u{e9}.md"), "# notes\n").unwrap(); // NFC
+    fs::write(a.join("zeta.txt"), "z\n").unwrap();
+    fs::write(b.join("zeta.txt"), "z\n").unwrap();
+    for (src, out) in [(&a, "a.md"), (&b, "b.md")] {
+        let o = tm(
+            &["merge", &src.to_string_lossy(), out, "--reproducible", "-q"],
+            tmp.path(),
+        );
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    let (ra, rb) = (
+        fs::read(tmp.path().join("a.md")).unwrap(),
+        fs::read(tmp.path().join("b.md")).unwrap(),
+    );
+    assert!(!ra.contains(&b'\r'), "LF only");
+    assert_eq!(
+        String::from_utf8_lossy(&ra),
+        String::from_utf8_lossy(&rb),
+        "same bytes"
+    );
+    // Without the flag the CRLF copy keeps its line ends.
+    let o = tm(&["merge", &a.to_string_lossy(), "raw.md", "-q"], tmp.path());
+    assert_eq!(o.status.code(), Some(0));
+    assert!(fs::read(tmp.path().join("raw.md"))
+        .unwrap()
+        .contains(&b'\r'));
+}

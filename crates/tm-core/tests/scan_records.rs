@@ -286,3 +286,51 @@ fn user_globs_are_reported_as_such() {
     let g = skip(&scan, "--include/--exclude: user glob");
     assert_eq!(g.kind, SkipKind::IgnoredByRule);
 }
+
+/// Windows junctions are links: recorded, never followed, and a junction
+/// cannot be picked as the root (D2; N-10 keeps other reparse points, such
+/// as OneDrive placeholders, as ordinary entries).
+#[cfg(windows)]
+#[test]
+fn junctions_are_recorded_and_not_followed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.rs"), "fn secret() {}\n").unwrap();
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(root.join("link"))
+        .arg(&outside)
+        .status()
+        .expect("mklink runs");
+    assert!(status.success(), "mklink /J needs no admin rights");
+
+    let scan = scan_text_files(&root, &ScanOptions::default()).unwrap();
+    let names: Vec<String> = scan
+        .files
+        .iter()
+        .map(|f| {
+            f.strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    assert_eq!(names, vec!["main.rs"], "the junction is not followed");
+    let entry = scan
+        .skipped
+        .iter()
+        .find(|s| s.path.starts_with("link"))
+        .expect("the junction is recorded");
+    assert!(
+        entry.reason.contains("outside the root"),
+        "{}",
+        entry.reason
+    );
+    assert!(
+        tm_core::security::validate_and_canonicalize(&root.join("link").to_string_lossy()).is_err()
+    );
+}

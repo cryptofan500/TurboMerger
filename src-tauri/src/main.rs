@@ -15,5 +15,22 @@ fn main() {
             std::process::exit(code);
         }
     }
+    #[cfg(target_os = "linux")]
+    nvidia_wayland_workaround();
     tm_gui::run();
+}
+
+/// WebKitGTK's DMA-BUF renderer shows a blank window on NVIDIA's driver
+/// under Wayland (N-42). Turn it off there, unless the user decided.
+#[cfg(target_os = "linux")]
+fn nvidia_wayland_workaround() {
+    let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    let wayland = set("WAYLAND_DISPLAY")
+        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"));
+    let nvidia = std::path::Path::new("/proc/driver/nvidia/version").exists()
+        || std::path::Path::new("/sys/module/nvidia").exists();
+    if wayland && nvidia && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        // Single-threaded here: nothing else reads the environment yet.
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
 }

@@ -80,6 +80,9 @@ fn process_file_inner(
     }
 
     let (mut content, utf8_note) = decode_text(buffer, bom);
+    if cfg.reproducible && content.contains('\r') {
+        content = content.replace("\r\n", "\n");
+    }
 
     if cfg.redact {
         *harvested = crate::security::harvest_labeled_values(&content);

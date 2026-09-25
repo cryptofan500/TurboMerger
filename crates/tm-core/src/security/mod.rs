@@ -15,10 +15,6 @@ use regex::Regex;
 
 pub mod masking;
 
-/// Windows file attribute for reparse points (junctions/symlinks)
-#[cfg(windows)]
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-
 /// Top-level system directories that must never be scanned. Checked against the
 /// FIRST component under the drive root only — a repo folder named `windows`
 /// somewhere deeper is fine.
@@ -91,16 +87,19 @@ impl From<io::Error> for SecurityError {
 
 /// Check whether a Windows scan-root path traverses a reparse point.
 /// Per-file checks are handled by the walker.
+///
+/// Only links count — symlinks and junctions, which std reports as
+/// `is_symlink` (name-surrogate reparse points). A OneDrive folder is a
+/// reparse point too, and v7 refused every project inside one (N-10).
 #[cfg(windows)]
 pub fn has_reparse_point_in_path(path: &Path) -> Result<bool, SecurityError> {
-    use std::os::windows::fs::MetadataExt;
     for ancestor in path.ancestors() {
         if ancestor.as_os_str().is_empty() {
             continue;
         }
         match fs::symlink_metadata(ancestor) {
             Ok(meta) => {
-                if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                if meta.file_type().is_symlink() {
                     return Ok(true);
                 }
             }
@@ -228,7 +227,7 @@ pub fn validate_and_canonicalize(path: &str) -> Result<PathBuf, SecurityError> {
     }
 
     let canonical =
-        fs::canonicalize(&path).map_err(|e| SecurityError::ValidationFailed(e.to_string()))?;
+        dunce::canonicalize(&path).map_err(|e| SecurityError::ValidationFailed(e.to_string()))?;
 
     if has_reparse_point_in_path(&canonical)? {
         return Err(SecurityError::ReparsePointDetected);

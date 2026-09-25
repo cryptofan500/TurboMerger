@@ -136,6 +136,9 @@ pub struct ScanArgs {
     /// Read settings from this turbomerger.toml instead of <src>/turbomerger.toml
     #[arg(long, value_name = "FILE", env = "TURBOMERGER_CONFIG")]
     pub config: Option<PathBuf>,
+    /// Download cloud files that are not on this device (OneDrive, iCloud) and read them
+    #[arg(long)]
+    pub hydrate: bool,
     /// Per-file size cap in MB (default 2, or the config file's value)
     #[arg(long, value_name = "MB", env = "TURBOMERGER_MAX_FILE_SIZE",
           value_parser = clap::value_parser!(u64).range(1..=4096))]
@@ -187,6 +190,9 @@ pub struct MergeCmd {
     /// Exit 3 when any file was skipped, not only content that was not captured
     #[arg(long)]
     pub fail_on_skip: bool,
+    /// Same bytes on every OS: LF line ends, NFC paths, no timestamps
+    #[arg(long)]
+    pub reproducible: bool,
     /// Print nothing on success
     #[arg(short, long)]
     pub quiet: bool,
@@ -391,6 +397,7 @@ fn merge_options(src_root: String, scan: &ScanArgs) -> MergeOptions {
         .as_ref()
         .map(|p| p.to_string_lossy().to_string());
     o.max_file_size_mb = scan.max_file_size;
+    o.hydrate = scan.hydrate;
     o
 }
 
@@ -433,6 +440,7 @@ fn run_merge(a: MergeCmd) -> i32 {
     options.git_log_count = a.git_log.unwrap_or(0) as usize;
     options.emit_skill = a.emit_skill;
     options.show_source_path = a.show_source_path;
+    options.reproducible = a.reproducible;
     options.remote = remote_label.is_some();
     options.source_label = remote_label;
 
@@ -745,7 +753,7 @@ fn run_explain(a: ExplainCmd) -> i32 {
     // Resolve only the directories: the last component is explained as named
     // (canonicalizing it would explain a symlink's target instead).
     let rel = if a.path.is_absolute() {
-        let parent = a.path.parent().and_then(|p| std::fs::canonicalize(p).ok());
+        let parent = a.path.parent().and_then(|p| dunce::canonicalize(p).ok());
         let joined = match (parent, a.path.file_name()) {
             (Some(p), Some(name)) => p.join(name),
             _ => a.path.clone(),

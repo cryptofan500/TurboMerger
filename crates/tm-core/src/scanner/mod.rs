@@ -41,11 +41,15 @@ use crate::security::{has_reparse_point_in_path, sensitive_reason};
 
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
-#[cfg(windows)]
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-/// OneDrive/cloud placeholder: reading it would force a download (hydration)
+/// OneDrive/cloud placeholder file: reading it would force a download.
 #[cfg(windows)]
 const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+/// Cloud folder whose listing is not on this device: opening it downloads it.
+#[cfg(windows)]
+const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+/// macOS: an iCloud Drive file or folder whose data is not on this Mac.
+#[cfg(target_os = "macos")]
+const SF_DATALESS: u32 = 0x4000_0000;
 
 /// Number of bytes to read for content-based binary detection
 const SNIFF_SIZE: usize = 8192;
@@ -277,6 +281,9 @@ pub struct ScanOptions {
     pub include_globs: Vec<String>,
     /// Blacklist globs — matching files are dropped.
     pub exclude_globs: Vec<String>,
+    /// Read cloud files that are not on this device (downloads them). Off:
+    /// they are recorded as not captured (N-10, N-11).
+    pub hydrate: bool,
 }
 
 impl Default for ScanOptions {
@@ -292,6 +299,7 @@ impl Default for ScanOptions {
             extra_binary_exts: Vec::new(),
             include_globs: Vec::new(),
             exclude_globs: Vec::new(),
+            hydrate: false,
         }
     }
 }
@@ -408,6 +416,11 @@ fn is_minified_filename(name: &str) -> bool {
         || lower.ends_with(".min.mjs")
         || lower.ends_with(".chunk.js")
         || lower.ends_with(".bundle.js")
+}
+
+/// For other modules: does `name` look like one of our outputs?
+pub fn is_own_output_name(name: &str) -> bool {
+    is_own_output(&name.to_lowercase())
 }
 
 /// Previous TurboMerger outputs — re-merging them snowballs dumps-into-dumps.
@@ -585,6 +598,8 @@ struct Pruned {
     reason: &'static str,
     is_dir: bool,
     symlink: bool,
+    /// Counting its contents would download it (cloud folders).
+    no_count: bool,
 }
 
 /// Walk filter: `None` = keep walking, `Some(p)` = prune and record.
@@ -592,6 +607,7 @@ fn prune_entry(
     entry: &ignore::DirEntry,
     include_venv: bool,
     include_hidden: bool,
+    hydrate: bool,
 ) -> Option<Pruned> {
     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
     let pruned = |reason: &'static str, symlink: bool| Pruned {
@@ -599,19 +615,25 @@ fn prune_entry(
         reason,
         is_dir,
         symlink,
+        no_count: false,
     };
+    // Symlinks and, on Windows, junctions: std reports name-surrogate
+    // reparse points as links. Other reparse points (OneDrive placeholders,
+    // dedup) are ordinary files and folders (N-10).
     if entry.path_is_symlink() {
         return Some(pruned("symlink", true));
     }
     let name_lower = entry.file_name().to_string_lossy().to_lowercase();
 
     if is_dir {
-        // Junction points masquerade as plain dirs — reject via attributes
-        #[cfg(windows)]
-        if let Ok(meta) = entry.metadata() {
-            if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return Some(pruned("junction / reparse point — not followed", true));
-            }
+        if !hydrate && is_cloud_only_dir(entry) {
+            return Some(Pruned {
+                no_count: true,
+                ..pruned(
+                    "cloud folder not on this device — not scanned (--hydrate downloads it)",
+                    false,
+                )
+            });
         }
         return prune_dir_reason(entry.path(), &name_lower, include_venv, include_hidden)
             .map(|r| pruned(r, false));
@@ -628,6 +650,29 @@ fn prune_entry(
         return Some(pruned("hidden file (--include-hidden to include)", false));
     }
     None
+}
+
+/// A folder whose listing lives only in the cloud (Windows RECALL_ON_OPEN,
+/// macOS dataless): listing it would download it.
+#[allow(unused_variables)]
+fn is_cloud_only_dir(entry: &ignore::DirEntry) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if let Ok(meta) = entry.metadata() {
+            return meta.file_attributes()
+                & (FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+                != 0;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        if let Ok(meta) = entry.metadata() {
+            return meta.st_flags() & SF_DATALESS != 0;
+        }
+    }
+    false
 }
 
 enum Verdict {
@@ -775,11 +820,9 @@ pub fn find_credential_files(root: &Path) -> Vec<PathBuf> {
         let name_lower = entry.file_name().to_string_lossy().to_lowercase();
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir {
-            #[cfg(windows)]
-            if let Ok(meta) = entry.metadata() {
-                if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                    return false;
-                }
+            // Never download a cloud-only folder just to look for secrets.
+            if is_cloud_only_dir(entry) {
+                return false;
             }
             // Prune noise dirs and venvs; keep everything else, dotdirs included.
             // Build outputs never hold credential files; skipping them keeps
@@ -1019,7 +1062,7 @@ pub fn scan_with(
     if has_reparse_point_in_path(root).unwrap_or(true) {
         anyhow::bail!("Root path contains junction points or symlinks");
     }
-    let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let root_canon = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let use_ancestors = options.respect_gitignore && inside_git_worktree(root);
 
     let mut builder = WalkBuilder::new(root);
@@ -1061,13 +1104,14 @@ pub fn scan_with(
 
     let include_venv = options.include_venv;
     let include_hidden = options.include_hidden;
+    let hydrate = options.hydrate;
     let pruned: Arc<Mutex<Vec<Pruned>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&pruned);
     builder.filter_entry(move |entry| {
         if entry.depth() == 0 {
             return true;
         }
-        match prune_entry(entry, include_venv, include_hidden) {
+        match prune_entry(entry, include_venv, include_hidden, hydrate) {
             None => true,
             Some(p) => {
                 if let Ok(mut v) = recorder.lock() {
@@ -1123,12 +1167,21 @@ pub fn scan_with(
             }
         };
         #[cfg(windows)]
+        if !options.hydrate && meta.file_attributes() & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0 {
+            skipped.push(SkipEntry::new(
+                relative_display(root, &path),
+                "cloud file not on this device — not read (--hydrate downloads it)",
+                SkipKind::NotCaptured,
+            ));
+            continue;
+        }
+        #[cfg(target_os = "macos")]
         {
-            let attrs = meta.file_attributes();
-            if attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0 {
+            use std::os::macos::fs::MetadataExt;
+            if !options.hydrate && meta.st_flags() & SF_DATALESS != 0 {
                 skipped.push(SkipEntry::new(
                     relative_display(root, &path),
-                    "cloud placeholder (not downloaded locally)",
+                    "iCloud file not on this Mac — not read (--hydrate downloads it)",
                     SkipKind::NotCaptured,
                 ));
                 continue;
@@ -1185,12 +1238,12 @@ pub fn scan_with(
             }
         } else if p.is_dir {
             stats.pruned_dirs += 1;
-            let counted = if p.reason == "version-control metadata" {
+            let counted = if p.reason == "version-control metadata" || p.no_count {
                 None
             } else {
                 count_tree(&p.path, &mut budget, cancel)
             };
-            let reason = if p.reason == "version-control metadata" {
+            let reason = if p.reason == "version-control metadata" || p.no_count {
                 format!("{} — not scanned", p.reason)
             } else {
                 format!("{} — not scanned ({})", p.reason, count_note(counted))
@@ -1362,7 +1415,7 @@ enum LinkTarget {
 }
 
 fn resolve_symlink(link: &Path, root_canon: &Path) -> LinkTarget {
-    let Ok(target) = std::fs::canonicalize(link) else {
+    let Ok(target) = dunce::canonicalize(link) else {
         return LinkTarget::Broken;
     };
     let Ok(rel) = target.strip_prefix(root_canon) else {
@@ -1406,7 +1459,7 @@ fn find_ignored(
         }
         // Pruned by our own rules: already recorded by walk 1 (or inside an
         // ignored directory, which is reported as a whole).
-        if prune_entry(entry, include_venv, include_hidden).is_some() {
+        if prune_entry(entry, include_venv, include_hidden, false).is_some() {
             return false;
         }
         if seen.contains(entry.path()) {

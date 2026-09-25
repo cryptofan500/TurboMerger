@@ -19,6 +19,7 @@ tm-mcp.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 ctrlc.workspace = true
+dunce.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]

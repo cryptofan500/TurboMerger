@@ -27,6 +27,8 @@ clap_complete = "4.5"
 # Graceful Ctrl-C for the CLI (cancel the job, clean up temp files).
 ctrlc = "3.5"
 dirs = "6"
+# canonicalize without Windows `\\?\` prefixes (N-41; clippy.toml bans std's)
+dunce = "1.0.5"
 encoding_rs = "0.8.35"
 globset = "0.4"
 ignore = "0.4"

@@ -167,7 +167,7 @@ impl SafeRoot {
     pub fn open(root: &Path) -> Result<SafeRoot, String> {
         let dir = Dir::open_ambient_dir(root, cap_std::ambient_authority())
             .map_err(|e| format!("cannot open target root: {}", describe(&e)))?;
-        let root_os = os_path(&dir).or_else(|| std::fs::canonicalize(root).ok());
+        let root_os = os_path(&dir).or_else(|| dunce::canonicalize(root).ok());
         Ok(SafeRoot { dir, root_os })
     }
 

@@ -4038,6 +4038,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "ctrlc",
+ "dunce",
  "mimalloc",
  "tempfile",
  "tm-core",
@@ -4055,6 +4056,7 @@ dependencies = [
  "chardetng",
  "chrono",
  "dirs",
+ "dunce",
  "encoding_rs",
  "globset",
  "ignore",
@@ -4087,6 +4089,7 @@ name = "tm-gui"
 version = "7.7.0"
 dependencies = [
  "dirs",
+ "dunce",
  "notify",
  "notify-debouncer-mini",
  "open",
@@ -4106,6 +4109,7 @@ name = "tm-mcp"
 version = "7.7.0"
 dependencies = [
  "dirs",
+ "dunce",
  "regex",
  "rmcp",
  "serde",
