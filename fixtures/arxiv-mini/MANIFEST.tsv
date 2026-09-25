@@ -1,0 +1,13 @@
+arxiv_id	rel_path	bytes	sha256	pages	figures	tables	abs_url	why
+2608.31006	2026-08/2608.31006.pdf	922638	dc542f360834b42c32d13d6ccdbfaff61d84f885790bb27747ddbd9ac727e6c1	4	6	1	https://arxiv.org/abs/2608.31006	4 pp, no outline, duplicate label (Figure 4 cropped + full-paged), A.12/A.13 subject
+2608.00084	2026-08/2608.00084.pdf	2616003	454995dad77cbc318a1fedcd3e11b9ee5b4e28778b1cdd819e6a0a63cf352f6a	16	13	3	https://arxiv.org/abs/2608.00084	REVTeX roman table labels (TABLE I.), A.13 subject
+2608.15188	2026-08/2608.15188.pdf	676036	373cc87cef3cc50eabbd5d96225f3016db6c3ae21969c020b1013134f13c7f66	19	7	27	https://arxiv.org/abs/2608.15188	A.13 subject (LaTeX-vs-text token ratio)
+2608.09867	2026-08/2608.09867.pdf	3849013	eb8697b6ec47c6522d17247359f949426516af8d54263bd8626d1f3e62bcef23	116	43	5	https://arxiv.org/abs/2608.09867	116 pp, slowest paper (14.9 s), most figures (43), referenced-not-detected
+2608.08975	2026-08/2608.08975.pdf	1322174	cea31a07b3d124be3cb87c6193feaee8924f167a9ae3f8d2cb9ba29995924d01	63	5	43	https://arxiv.org/abs/2608.08975	duplicate labels, 3 full-page fallbacks, 43 tables
+2608.14352	2026-08/2608.14352.pdf	587097	14a4cb15980fcc06f31880d1bc6e0927cf91625073a2d7e128327146de67d273	7	4	2	https://arxiv.org/abs/2608.14352	duplicate labels, short
+2608.19008	2026-08/2608.19008.pdf	22094089	a3c02f93d8d9f69d488d6afa5b5154206dae206581882791d04eae01ac16b3fc	38	21	0	https://arxiv.org/abs/2608.19008	no outline, figure-heavy (21 figures)
+2608.17504	2026-08/2608.17504.pdf	3660871	3f4a4c461e95a2f6c32c6bc12a8288c4e0b0456f645828614d27ee587fead258	78	21	19	https://arxiv.org/abs/2608.17504	78 pp, roman table labels, 21 figures + 19 tables
+2608.14893	2026-08/2608.14893.pdf	4001144	38470924425afa9edde8b8a0ca1ff1801c37400f11e5b0e38ac1f85e032ea14a	31	9	5	https://arxiv.org/abs/2608.14893	most full-page fallbacks (6)
+2608.19893	2026-08/2608.19893.pdf	2719932	180b8f89b53ee8eb1d67e80f030e22db060a380a9bc7ec343af2f1d9ff17cb58	48	14	63	https://arxiv.org/abs/2608.19893	most referenced-but-not-detected (4)
+2608.10716	2026-08/2608.10716.pdf	9517360	29f021b3db41aa2c33ebc69e9b486f334578f1e36ac0ca25c14a715e4a886e85	23	10	18	https://arxiv.org/abs/2608.10716	two-column, 18 tables, second-slowest (12.9 s)
+2608.09892	_excluded-search-candidates/2608.09892.pdf	5519778	8b974774f39dd765da9332b4f12c2bdd8ac34f380e1d58c4502e8c4df253579a	9	3	5	https://arxiv.org/abs/2608.09892	not in inventory.tsv (title from PDF metadata), roman tables
