@@ -353,6 +353,13 @@ fn run(run: &Run, src: &Path, work: &Path) -> BTreeMap<String, Vec<u8>> {
         "_run.txt".to_string(),
         format!("exit={}\n{}\n", o.status.code().unwrap_or(-1), summary).into_bytes(),
     );
+    if !matches!(o.status.code(), Some(0 | 3)) {
+        eprintln!(
+            "{}: stderr: {}",
+            run.name,
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
     files
 }
 
@@ -423,8 +430,11 @@ fn merge_outputs_match_the_golden_files() {
         let got: Vec<&String> = actual.keys().collect();
         if names != got {
             failures.push(format!(
-                "{}: files differ: golden {:?}, actual {:?}",
-                r.name, names, got
+                "{}: files differ: golden {:?}, actual {:?}; run: {}",
+                r.name,
+                names,
+                got,
+                String::from_utf8_lossy(&actual["_run.txt"])
             ));
             continue;
         }
