@@ -21,3 +21,4 @@ to their replacement.
 | [0012](0012-private-fixtures.md) | Private and licensed fixtures stay local | Accepted — implemented |
 | [0013](0013-phase1-secret-masking.md) | Phase-1 secret masking: one deterministic pass, no prose harvest | Accepted — implemented |
 | [0014](0014-mcp-confinement.md) | MCP root confinement and version negotiation; rmcp SDK in Phase 2 | Accepted — implemented |
+| [0015](0015-two-binaries.md) | Two binaries: `turbomerger` (console CLI) and `turbomerger-gui`; workspace layout | Accepted — implemented |

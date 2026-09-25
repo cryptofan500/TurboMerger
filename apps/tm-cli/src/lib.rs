@@ -24,9 +24,9 @@ use std::sync::atomic::AtomicBool;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
-use crate::commands::{resolve_job, MergeOptions};
-use crate::scanner::{self, SkipEntry, SkipKind};
-use crate::security;
+use tm_core::job::{resolve_job, MergeOptions};
+use tm_core::scanner::{self, SkipEntry, SkipKind};
+use tm_core::security;
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_ERROR: i32 = 1;
@@ -249,7 +249,8 @@ pub struct McpCmd {
     pub allow_remote: bool,
 }
 
-/// Parse and run a command line. `None` = no arguments: launch the GUI.
+/// Parse and run a command line. `None` = no arguments (the caller opens
+/// the desktop app or prints help; see `launch_gui_or_help`).
 pub fn run(argv: &[OsString]) -> Option<i32> {
     if argv.len() <= 1 {
         return None;
@@ -267,7 +268,11 @@ pub fn run(argv: &[OsString]) -> Option<i32> {
         Command::Map(m) => run_map(m),
         Command::Apply(a) => run_apply(a),
         Command::Explain(e) => run_explain(e),
-        Command::Mcp(m) => crate::mcp::run_mcp(m),
+        Command::Mcp(m) => tm_mcp::run_mcp(tm_mcp::McpConfig {
+            roots: m.root,
+            output_dir: m.output_dir,
+            allow_remote: m.allow_remote,
+        }),
         Command::Completions { shell } => {
             clap_complete::generate(
                 shell,
@@ -280,70 +285,78 @@ pub fn run(argv: &[OsString]) -> Option<i32> {
     })
 }
 
-/// A local path, or an explicit remote reference cloned into a temp dir.
-/// Returns (root, checkout guard, source label for remote sources).
-pub(crate) fn resolve_source(
-    src: &str,
-) -> Result<
-    (
-        String,
-        Option<crate::remote::RemoteCheckout>,
-        Option<String>,
-    ),
-    String,
-> {
-    if std::path::Path::new(src).exists() {
-        return Ok((src.to_string(), None, None));
-    }
-    if let Some((url, name)) = crate::remote::parse_remote_explicit(src) {
-        let pat = std::env::var("TURBOMERGER_PAT").ok();
-        eprintln!("cloning {} (shallow)...", url);
-        let co = crate::remote::clone_shallow(&url, &name, pat.as_deref())?;
-        let path = co.path.to_string_lossy().to_string();
-        return Ok((path, Some(co), Some(url)));
-    }
-    if crate::remote::parse_remote(src).is_some() {
-        return Err(format!(
-            "source not found: {} (to pack the GitHub repository, use gh:{})",
-            src, src
-        ));
-    }
-    Err(format!("source not found: {}", src))
+/// The subcommand names, for shells that forward to this CLI (the desktop
+/// binary runs `turbomerger-gui merge …` through here for compatibility).
+pub fn is_subcommand(arg: &std::ffi::OsStr) -> bool {
+    let Some(a) = arg.to_str() else {
+        return false;
+    };
+    a.starts_with('-')
+        || Cli::command()
+            .get_subcommands()
+            .any(|c| c.get_name() == a || c.get_all_aliases().any(|al| al == a))
+        || a == "help"
 }
 
-pub(crate) fn merge_options(src_root: String, scan: &ScanArgs) -> MergeOptions {
-    MergeOptions {
-        folder_path: src_root,
-        output_path: None,
-        include_venv: scan.include_venv,
-        include_tree: true,
-        content_detection: true,
-        respect_gitignore: !scan.no_gitignore,
-        include_hidden: scan.include_hidden,
-        redact_secrets: true,
-        format: None,
-        ordering: None,
-        max_tokens: None,
-        include_globs: scan.include.clone(),
-        exclude_globs: scan.exclude.clone(),
-        remove_empty_lines: false,
-        truncate_base64: false,
-        compress: false,
-        strip_comments: false,
-        git_diff: false,
-        git_log_count: 0,
-        emit_skill: false,
-        selected_paths: None,
-        force_include: Vec::new(),
-        show_source_path: false,
-        source_label: None,
-        remote: false,
-        config_path: scan
-            .config
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string()),
-        max_file_size_mb: scan.max_file_size,
+/// `turbomerger` with no arguments: open the desktop app when one is
+/// installed next to this binary (or on PATH) and a display is available;
+/// otherwise print the help. Never blocks on the GUI.
+pub fn launch_gui_or_help() -> i32 {
+    let name = if cfg!(windows) {
+        "turbomerger-gui.exe"
+    } else {
+        "turbomerger-gui"
+    };
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join(name)))
+        .filter(|p| p.is_file());
+    let on_path = || {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join(name))
+                .find(|p| p.is_file())
+        })
+    };
+    let has_display = cfg!(any(windows, target_os = "macos"))
+        || std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+    if has_display {
+        if let Some(gui) = beside.or_else(on_path) {
+            let spawned = std::process::Command::new(&gui)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            if spawned.is_ok() {
+                return EXIT_OK;
+            }
+        }
     }
+    let _ = Cli::command().print_help();
+    eprintln!();
+    EXIT_USAGE
+}
+
+/// A local path, or an explicit remote reference cloned into a temp dir
+/// (announced on stderr).
+fn resolve_source(src: &str) -> Result<tm_core::job::ResolvedSource, String> {
+    tm_core::job::resolve_source(src, |url| eprintln!("cloning {} (shallow)...", url))
+}
+
+fn merge_options(src_root: String, scan: &ScanArgs) -> MergeOptions {
+    let mut o = MergeOptions::for_folder(src_root);
+    o.include_venv = scan.include_venv;
+    o.respect_gitignore = !scan.no_gitignore;
+    o.include_hidden = scan.include_hidden;
+    o.include_globs = scan.include.clone();
+    o.exclude_globs = scan.exclude.clone();
+    o.config_path = scan
+        .config
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string());
+    o.max_file_size_mb = scan.max_file_size;
+    o
 }
 
 /// The exit code a finished merge earns (see the module docs).
@@ -363,14 +376,15 @@ pub fn merge_exit_code(files_merged: usize, skips: &[&SkipEntry], fail_on_skip: 
 }
 
 fn run_merge(a: MergeCmd) -> i32 {
-    let (src_root, _checkout, remote_label) = match resolve_source(&a.src) {
+    let source = match resolve_source(&a.src) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
             return EXIT_ERROR;
         }
     };
-    let mut options = merge_options(src_root, &a.scan);
+    let remote_label = source.remote_label.clone();
+    let mut options = merge_options(source.root.clone(), &a.scan);
     options.output_path = a.out.as_ref().map(|p| p.to_string_lossy().to_string());
     options.redact_secrets = !a.no_redact;
     options.format = Some(a.format.as_str().to_string());
@@ -406,7 +420,7 @@ fn run_merge(a: MergeCmd) -> i32 {
         return EXIT_ERROR;
     }
     let cancel = AtomicBool::new(false);
-    let o = match crate::merger::merge_files_with_progress(
+    let o = match tm_core::merger::merge_files_with_progress(
         &job.root,
         &scan.files,
         &job.output_path,
@@ -461,14 +475,14 @@ fn run_merge(a: MergeCmd) -> i32 {
 }
 
 fn run_map(a: MapCmd) -> i32 {
-    let (src_root, _checkout, _) = match resolve_source(&a.src) {
+    let source = match resolve_source(&a.src) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
             return EXIT_ERROR;
         }
     };
-    let mut options = merge_options(src_root, &a.scan);
+    let mut options = merge_options(source.root.clone(), &a.scan);
     options.include_tree = false;
     let job = match resolve_job(&options) {
         Ok(j) => j,
@@ -484,7 +498,7 @@ fn run_map(a: MapCmd) -> i32 {
             return EXIT_ERROR;
         }
     };
-    let map = crate::repomap::build_repo_map(&job.root, &scan.files, a.tokens as usize);
+    let map = tm_core::repomap::build_repo_map(&job.root, &scan.files, a.tokens as usize);
     match a.out {
         Some(out) => {
             if let Err(e) = std::fs::write(&out, &map) {
@@ -512,18 +526,20 @@ fn run_apply(a: ApplyCmd) -> i32 {
             return EXIT_ERROR;
         }
     };
-    let policy =
-        match crate::applyback::ApplyPolicy::new(&a.allow_control, &a.allow_manifest, a.allow_exec)
-        {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("error: {}", e);
-                return EXIT_USAGE;
-            }
-        };
+    let policy = match tm_core::applyback::ApplyPolicy::new(
+        &a.allow_control,
+        &a.allow_manifest,
+        a.allow_exec,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return EXIT_USAGE;
+        }
+    };
 
     if a.restore {
-        return match crate::applyback::restore_last(&root, &policy) {
+        return match tm_core::applyback::restore_last(&root, &policy) {
             Ok(r) => {
                 for p in &r.restored {
                     println!("restored {}", p);
@@ -556,12 +572,12 @@ fn run_apply(a: ApplyCmd) -> i32 {
             return EXIT_ERROR;
         }
     };
-    let changes = crate::applyback::parse_reply(&reply);
+    let changes = tm_core::applyback::parse_reply(&reply);
     if changes.is_empty() {
         eprintln!("no file changes recognized in {}", from.display());
         return EXIT_ERROR;
     }
-    let built = match crate::applyback::build_preview(&root, &changes, &policy) {
+    let built = match tm_core::applyback::build_preview(&root, &changes, &policy) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -594,7 +610,7 @@ fn run_apply(a: ApplyCmd) -> i32 {
             println!("SKIP   {} — {}", f.rel_path, f.note);
         }
     }
-    let appliable: Vec<crate::applyback::ReadyFile> = built
+    let appliable: Vec<tm_core::applyback::ReadyFile> = built
         .ready
         .into_iter()
         .filter(|f| !f.needs_confirm)
@@ -615,7 +631,7 @@ fn run_apply(a: ApplyCmd) -> i32 {
         );
         return skips_exit;
     }
-    match crate::applyback::apply_files(&root, &appliable, &policy) {
+    match tm_core::applyback::apply_files(&root, &appliable, &policy) {
         Ok(o) => {
             for p in &o.applied {
                 println!("applied {}", p);

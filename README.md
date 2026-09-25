@@ -50,8 +50,8 @@ npm run tauri:build:mac
 Build outputs:
 
 ```text
-src-tauri/target/aarch64-apple-darwin/release/bundle/macos/TurboMerger.app
-src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+target/aarch64-apple-darwin/release/bundle/macos/TurboMerger.app
+target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
 ```
 
 See [docs/MACOS.md](docs/MACOS.md) for the full M4 runbook, validation commands,
@@ -103,8 +103,8 @@ npm run tauri:build:linux
 Build outputs:
 
 ```text
-src-tauri/target/release/bundle/deb/*.deb
-src-tauri/target/release/bundle/appimage/*.AppImage
+target/release/bundle/deb/*.deb
+target/release/bundle/appimage/*.AppImage
 ```
 
 See [docs/LINUX.md](docs/LINUX.md) for the full runbook, the AppImage/FUSE
@@ -196,8 +196,12 @@ The one-line summary on stdout is
 `merged=N scan_skipped=N merge_skipped=N redacted=N tokens_o200k=N parts=N not_captured=N`
 followed by one `out=<path>` line per output file.
 
-After a source build on Apple Silicon, the binary is at
-`src-tauri/target/aarch64-apple-darwin/release/turbomerger`. Private remote
+The command line is its own console binary, `turbomerger`; the desktop app is
+`turbomerger-gui` (ADR 0015). Installers ship both (the `.deb` puts both in
+`/usr/bin`; on macOS the CLI is `TurboMerger.app/Contents/MacOS/turbomerger`).
+`turbomerger` with no arguments opens the desktop app when it is installed and a
+display is available, and prints this help otherwise. After a source build the
+CLI is at `target/release/turbomerger`. Private remote
 repositories can use `TURBOMERGER_PAT`; the desktop PAT field remains in memory
 and is never persisted.
 
@@ -253,7 +257,7 @@ npm ci
 npm run check          # versions, ESLint, both TypeScript configs, frontend build
 npm run format:check   # rustfmt check
 npm run clippy         # warnings are errors
-npm run test:rust      # 150+ Rust unit/integration tests
+npm run test:rust      # 150+ Rust unit/integration tests, incl. golden outputs
 npm run tauri:dev      # desktop development mode
 ```
 
@@ -265,18 +269,15 @@ produce a draft release through a single publisher job; see
 ## Architecture
 
 ```text
+Cargo.toml                   workspace: one version, shared dependency pins, release profile
+crates/tm-core/              the engine, no GUI: job setup, scanner, security (path policy,
+                             redaction), merger (decode/redact/format/report), compress,
+                             repomap, remote clones, apply-back; tests/ = the audit repros
+apps/tm-cli/                 `turbomerger`, the console CLI (clap, exit-code contract);
+                             tests/golden.rs pins the output bytes (fixtures/golden/)
+apps/tm-mcp/                 MCP stdio server, confined to its roots
+src-tauri/                   `turbomerger-gui`, the Tauri shell: commands, watch mode
 src/                         React/TypeScript UI
-src-tauri/src/commands.rs    Tauri commands, watch mode, shared job setup
-src-tauri/src/cli.rs         headless CLI (clap) and the exit-code contract
-src-tauri/src/scanner/       gitignore-aware classification
-src-tauri/src/security/      path policy, sensitive-file rules, redaction
-src-tauri/src/merger/        decode/redact/format/report pipeline
-src-tauri/src/compress/      tree-sitter signature compression
-src-tauri/src/repomap/       definition/reference ranking
-src-tauri/src/remote/        shallow remote clones
-src-tauri/src/applyback/     preview/apply/backup/restore, path policy, handle-relative I/O
-src-tauri/src/mcp/           MCP stdio server
-src-tauri/tests/             end-to-end Rust fixtures (the audit repros as tests)
 fixtures/                    repro scripts, pinned corpora (payloads local-only)
 prototypes/                  reference oracles for the document and photo pipelines
 docs/adr/                    architecture decision records

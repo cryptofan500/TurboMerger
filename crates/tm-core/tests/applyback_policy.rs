@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use turbomerger::applyback::{
+use tm_core::applyback::{
     apply_files, build_preview, parse_reply, restore_last, ApplyPolicy, BuiltPreview, PreviewFile,
 };
 
@@ -62,7 +62,7 @@ fn apply_permitted(repo: &Repo, built: &BuiltPreview, policy: &ApplyPolicy) -> V
     apply_files(&repo.root, &ok, policy).expect("apply").applied
 }
 
-const POISON: &str = include_str!("../../fixtures/poison-applyback/reply.md");
+const POISON: &str = include_str!("../../../fixtures/poison-applyback/reply.md");
 
 #[cfg(unix)]
 fn make_executable(p: &std::path::Path) {

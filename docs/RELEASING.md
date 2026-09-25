@@ -10,7 +10,7 @@ GitHub Release.
 1. Update `CHANGELOG.md`.
 2. Keep these versions identical:
    - `package.json`
-   - `src-tauri/Cargo.toml`
+   - `Cargo.toml` (`[workspace.package].version`; every crate inherits it)
    - `src-tauri/tauri.conf.json`
 3. From a clean dependency install, run:
 

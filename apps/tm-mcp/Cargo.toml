@@ -1,0 +1,19 @@
+[package]
+name = "tm-mcp"
+description = "TurboMerger Model Context Protocol server (stdio), confined to its roots"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+edition = "2021"
+publish = false
+
+[dependencies]
+tm-core.workspace = true
+dirs.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

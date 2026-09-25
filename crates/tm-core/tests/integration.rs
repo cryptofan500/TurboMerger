@@ -7,8 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use turbomerger::merger::{merge_files_with_progress, MergeConfig, Ordering, OutputFormat};
-use turbomerger::scanner::{scan_text_files, ScanOptions};
+use tm_core::merger::{merge_files_with_progress, MergeConfig, Ordering, OutputFormat};
+use tm_core::scanner::{scan_text_files, ScanOptions};
 
 fn md_cfg() -> MergeConfig {
     MergeConfig::default()

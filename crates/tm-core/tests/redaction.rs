@@ -4,8 +4,8 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-use turbomerger::merger::{merge_files_with_progress, MergeConfig};
-use turbomerger::scanner::{scan_text_files, ScanOptions};
+use tm_core::merger::{merge_files_with_progress, MergeConfig};
+use tm_core::scanner::{scan_text_files, ScanOptions};
 
 fn merge_to_string(root: &Path, out: &Path) -> String {
     let scan = scan_text_files(root, &ScanOptions::default()).expect("scan");

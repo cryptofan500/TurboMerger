@@ -27,8 +27,7 @@ use std::sync::atomic::AtomicBool;
 
 use serde_json::{json, Value};
 
-use crate::cli::McpCmd;
-use crate::commands::{resolve_job, MergeOptions};
+use tm_core::job::{resolve_job, MergeOptions, ResolvedSource};
 
 /// Newest first; the server's answer when the client asks for anything else.
 const SUPPORTED_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -36,6 +35,19 @@ const READ_DEFAULT_LINES: usize = 200;
 const READ_MAX_LINES: usize = 1000;
 const READ_MAX_BYTES: usize = 200 * 1024;
 const GREP_MAX_MATCHES: usize = 100;
+
+/// How the server was started (`turbomerger mcp --root … --output-dir …
+/// --allow-remote`).
+#[derive(Debug, Clone, Default)]
+pub struct McpConfig {
+    /// Folders clients may pack or map. Empty: the working directory, unless
+    /// it is `/` or the home folder.
+    pub roots: Vec<PathBuf>,
+    /// Where pack_directory writes (default: an app data folder).
+    pub output_dir: Option<PathBuf>,
+    /// Let clients pack remote repositories.
+    pub allow_remote: bool,
+}
 
 /// What this server instance may touch.
 #[derive(Debug, Clone)]
@@ -51,9 +63,9 @@ impl McpServer {
     /// Build from the command line: `--root` dirs (default: the working
     /// directory unless it is `/` or the home folder) and `--output-dir`
     /// (default: `<data dir>/com.turbomerger.app/mcp-outputs`).
-    pub fn from_args(args: &McpCmd) -> Result<McpServer, String> {
+    pub fn from_config(args: &McpConfig) -> Result<McpServer, String> {
         let mut roots = Vec::new();
-        let requested: Vec<PathBuf> = if args.root.is_empty() {
+        let requested: Vec<PathBuf> = if args.roots.is_empty() {
             let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
             let home = dirs::home_dir();
             let too_broad = cwd.parent().is_none() || home.as_deref() == Some(cwd.as_path());
@@ -63,10 +75,10 @@ impl McpServer {
                 vec![cwd]
             }
         } else {
-            args.root.clone()
+            args.roots.clone()
         };
         for r in requested {
-            let c = crate::security::validate_and_canonicalize(&r.to_string_lossy())
+            let c = tm_core::security::validate_and_canonicalize(&r.to_string_lossy())
                 .map_err(|e| format!("--root {}: {}", r.display(), e))?;
             roots.push(c);
         }
@@ -89,25 +101,17 @@ impl McpServer {
 
     /// Resolve a client-supplied source: an explicit remote reference (when
     /// allowed) or a folder under one of the roots.
-    fn resolve_source(
-        &self,
-        src: &str,
-    ) -> Result<
-        (
-            String,
-            Option<crate::remote::RemoteCheckout>,
-            Option<String>,
-        ),
-        String,
-    > {
-        if crate::remote::parse_remote_explicit(src).is_some() && !Path::new(src).exists() {
+    fn resolve_source(&self, src: &str) -> Result<ResolvedSource, String> {
+        if tm_core::remote::parse_remote_explicit(src).is_some() && !Path::new(src).exists() {
             if !self.allow_remote {
                 return Err(
                     "remote repositories are disabled for this server (start it with --allow-remote)"
                         .into(),
                 );
             }
-            return crate::cli::resolve_source(src);
+            return tm_core::job::resolve_source(src, |url| {
+                eprintln!("cloning {} (shallow)...", url)
+            });
         }
         if self.roots.is_empty() {
             return Err(
@@ -115,7 +119,7 @@ impl McpServer {
                     .into(),
             );
         }
-        let canon = crate::security::validate_and_canonicalize(src)
+        let canon = tm_core::security::validate_and_canonicalize(src)
             .map_err(|e| format!("{}: {}", src, e))?;
         if !self.roots.iter().any(|r| canon.starts_with(r)) {
             return Err(format!(
@@ -128,7 +132,11 @@ impl McpServer {
                     .join(", ")
             ));
         }
-        Ok((canon.to_string_lossy().to_string(), None, None))
+        Ok(ResolvedSource {
+            root: canon.to_string_lossy().to_string(),
+            checkout: None,
+            remote_label: None,
+        })
     }
 
     /// A path inside the managed outputs directory, or an error.
@@ -152,8 +160,8 @@ impl McpServer {
 }
 
 /// Blocking stdio loop. Returns the process exit code.
-pub fn run_mcp(args: McpCmd) -> i32 {
-    let server = match McpServer::from_args(&args) {
+pub fn run_mcp(args: McpConfig) -> i32 {
+    let server = match McpServer::from_config(&args) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -339,57 +347,42 @@ fn arg_usize(args: &Value, key: &str) -> Option<usize> {
 impl McpServer {
     fn tool_pack_directory(&self, args: &Value) -> Result<String, String> {
         let src = arg_str(args, "path").ok_or("path is required")?;
-        let (root, _checkout, remote_label) = self.resolve_source(src)?;
+        let source = self.resolve_source(src)?;
         let format = arg_str(args, "format").map(|s| s.to_string());
         // The client names the file at most; the directory is always ours.
         let output_path = arg_str(args, "output").map(|hint| {
             let base = Path::new(hint)
                 .file_name()
-                .map(|n| crate::security::sanitize_filename(&n.to_string_lossy()))
+                .map(|n| tm_core::security::sanitize_filename(&n.to_string_lossy()))
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| "merged".into());
             self.output_dir.join(base).to_string_lossy().to_string()
         });
-        let options = MergeOptions {
-            folder_path: root,
-            output_path: Some(
-                output_path.unwrap_or_else(|| self.output_dir.to_string_lossy().to_string()),
-            ),
-            include_venv: false,
-            include_tree: true,
-            content_detection: true,
-            respect_gitignore: !arg_bool(args, "no_gitignore"),
-            include_hidden: arg_bool(args, "include_hidden"),
-            // Forced: an MCP client must never produce an unredacted dump.
-            redact_secrets: true,
-            format,
-            ordering: arg_str(args, "ordering").map(|s| s.to_string()),
-            max_tokens: arg_usize(args, "max_tokens"),
-            include_globs: Vec::new(),
-            exclude_globs: Vec::new(),
-            remove_empty_lines: false,
-            truncate_base64: false,
-            compress: arg_bool(args, "compress"),
-            strip_comments: arg_bool(args, "strip_comments"),
-            git_diff: arg_bool(args, "git_diff"),
-            git_log_count: arg_usize(args, "git_log").unwrap_or(0),
-            emit_skill: arg_bool(args, "emit_skill"),
-            selected_paths: None,
-            force_include: Vec::new(),
-            show_source_path: false,
-            remote: remote_label.is_some(),
-            source_label: remote_label,
-            config_path: None,
-            max_file_size_mb: None,
-        };
+        let mut options = MergeOptions::for_folder(source.root.clone());
+        options.output_path =
+            Some(output_path.unwrap_or_else(|| self.output_dir.to_string_lossy().to_string()));
+        options.respect_gitignore = !arg_bool(args, "no_gitignore");
+        options.include_hidden = arg_bool(args, "include_hidden");
+        // Forced: an MCP client must never produce an unredacted dump.
+        options.redact_secrets = true;
+        options.format = format;
+        options.ordering = arg_str(args, "ordering").map(|s| s.to_string());
+        options.max_tokens = arg_usize(args, "max_tokens");
+        options.compress = arg_bool(args, "compress");
+        options.strip_comments = arg_bool(args, "strip_comments");
+        options.git_diff = arg_bool(args, "git_diff");
+        options.git_log_count = arg_usize(args, "git_log").unwrap_or(0);
+        options.emit_skill = arg_bool(args, "emit_skill");
+        options.remote = source.remote_label.is_some();
+        options.source_label = source.remote_label.clone();
         let job = resolve_job(&options)?;
         if !job.output_path.starts_with(&self.output_dir) {
             return Err("output must stay in the outputs folder".into());
         }
-        let scan = crate::scanner::scan_text_files(&job.root, &job.scan_options)
+        let scan = tm_core::scanner::scan_text_files(&job.root, &job.scan_options)
             .map_err(|e| format!("scan failed: {}", e))?;
         let cancel = AtomicBool::new(false);
-        let outcome = crate::merger::merge_files_with_progress(
+        let outcome = tm_core::merger::merge_files_with_progress(
             &job.root,
             &scan.files,
             &job.output_path,
@@ -403,7 +396,7 @@ impl McpServer {
             .skipped
             .iter()
             .chain(outcome.skipped.iter())
-            .filter(|s| s.kind == crate::scanner::SkipKind::NotCaptured)
+            .filter(|s| s.kind == tm_core::scanner::SkipKind::NotCaptured)
             .count();
         let mut text = format!(
         "merged={} skipped={} not_captured={} secrets_redacted={} tokens_o200k={} (~{} Claude est.) parts={}\n",
@@ -412,7 +405,7 @@ impl McpServer {
         not_captured,
         outcome.secrets_redacted,
         outcome.tokens_o200k,
-        crate::tokens::claude_estimate(outcome.tokens_o200k),
+        tm_core::tokens::claude_estimate(outcome.tokens_o200k),
         outcome.outputs.len()
     );
         for p in &outcome.outputs {
@@ -424,40 +417,13 @@ impl McpServer {
     fn tool_repo_map(&self, args: &Value) -> Result<String, String> {
         let src = arg_str(args, "path").ok_or("path is required")?;
         let tokens = arg_usize(args, "tokens").unwrap_or(1024);
-        let (root, _checkout, _) = self.resolve_source(src)?;
-        let options = MergeOptions {
-            folder_path: root,
-            output_path: None,
-            include_venv: false,
-            include_tree: false,
-            content_detection: true,
-            respect_gitignore: true,
-            include_hidden: false,
-            redact_secrets: true,
-            format: None,
-            ordering: None,
-            max_tokens: None,
-            include_globs: Vec::new(),
-            exclude_globs: Vec::new(),
-            remove_empty_lines: false,
-            truncate_base64: false,
-            compress: false,
-            strip_comments: false,
-            git_diff: false,
-            git_log_count: 0,
-            emit_skill: false,
-            selected_paths: None,
-            force_include: Vec::new(),
-            show_source_path: false,
-            source_label: None,
-            remote: false,
-            config_path: None,
-            max_file_size_mb: None,
-        };
+        let source = self.resolve_source(src)?;
+        let mut options = MergeOptions::for_folder(source.root.clone());
+        options.include_tree = false;
         let job = resolve_job(&options)?;
-        let scan = crate::scanner::scan_text_files(&job.root, &job.scan_options)
+        let scan = tm_core::scanner::scan_text_files(&job.root, &job.scan_options)
             .map_err(|e| format!("scan failed: {}", e))?;
-        Ok(crate::repomap::build_repo_map(
+        Ok(tm_core::repomap::build_repo_map(
             &job.root,
             &scan.files,
             tokens,
@@ -537,13 +503,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let shared = tmp.path().join("shared");
         std::fs::create_dir_all(&shared).unwrap();
-        let args = McpCmd {
-            root: vec![shared],
+        let args = McpConfig {
+            roots: vec![shared],
             output_dir: Some(tmp.path().join("outs")),
             allow_remote: false,
         };
         Env {
-            server: McpServer::from_args(&args).unwrap(),
+            server: McpServer::from_config(&args).unwrap(),
             tmp,
         }
     }

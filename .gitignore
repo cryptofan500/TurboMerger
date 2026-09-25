@@ -91,3 +91,6 @@ START-HERE.md
 # Local-only fixture payloads: licensed PDFs, private photos, ground truth
 # with real names/order numbers. Manifests + READMEs are tracked; payloads never.
 fixtures/**/local/
+
+# Sidecar binaries staged by scripts/build-sidecar.mjs for the bundler
+src-tauri/binaries/

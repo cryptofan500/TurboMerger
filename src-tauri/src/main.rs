@@ -5,15 +5,15 @@
 )]
 
 fn main() {
-    // Any argument means the headless CLI (`merge`, `map`, `apply`, `explain`,
-    // `mcp`, `completions`, `--help`, `--version`); parsing is strict and never
-    // falls through to the GUI, which aborts without a display (N-30).
-    // Note: a release (GUI-subsystem) Windows build has no attached console, so
-    // stdout is only visible when redirected; the output files and the exit
-    // code are the authoritative result (two binaries arrive in v8, N-29).
+    // The command line is its own console binary, `turbomerger` (N-29). For
+    // compatibility — scripts that still call this binary, and the AppImage,
+    // whose arguments land here — a known subcommand or flag runs it
+    // in-process; anything else opens the app.
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if let Some(code) = turbomerger::cli::run(&argv) {
-        std::process::exit(code);
+    if argv.get(1).is_some_and(|a| tm_cli::is_subcommand(a)) {
+        if let Some(code) = tm_cli::run(&argv) {
+            std::process::exit(code);
+        }
     }
-    turbomerger::run();
+    tm_gui::run();
 }

@@ -3,18 +3,32 @@ import { readFileSync } from "node:fs";
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
 const packageVersion = readJson("package.json").version;
 const tauriVersion = readJson("src-tauri/tauri.conf.json").version;
-const cargoManifest = readFileSync("src-tauri/Cargo.toml", "utf8");
-const cargoVersion = cargoManifest.match(
-  /^\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m,
-)?.[1];
 
+// The Rust version lives once, in the workspace root; every member inherits it.
+const workspaceManifest = readFileSync("Cargo.toml", "utf8");
+const cargoVersion = workspaceManifest.match(
+  /^\[workspace\.package\][\s\S]*?^version\s*=\s*"([^"]+)"/m,
+)?.[1];
 if (!cargoVersion) {
-  throw new Error("Could not read [package].version from src-tauri/Cargo.toml");
+  throw new Error("Could not read [workspace.package].version from Cargo.toml");
+}
+const members = workspaceManifest
+  .match(/^members\s*=\s*\[([^\]]*)\]/m)?.[1]
+  .match(/"([^"]+)"/g)
+  ?.map((m) => m.slice(1, -1));
+if (!members?.length) {
+  throw new Error("Could not read [workspace].members from Cargo.toml");
+}
+for (const member of members) {
+  const manifest = readFileSync(`${member}/Cargo.toml`, "utf8");
+  if (!/^version\.workspace\s*=\s*true/m.test(manifest)) {
+    throw new Error(`${member}/Cargo.toml must use version.workspace = true`);
+  }
 }
 
 const versions = new Map([
   ["package.json", packageVersion],
-  ["src-tauri/Cargo.toml", cargoVersion],
+  ["Cargo.toml [workspace.package]", cargoVersion],
   ["src-tauri/tauri.conf.json", tauriVersion],
 ]);
 const unique = new Set(versions.values());

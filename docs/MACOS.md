@@ -91,9 +91,10 @@ npm run tauri:build:mac
 Outputs:
 
 ```text
-src-tauri/target/aarch64-apple-darwin/release/turbomerger
-src-tauri/target/aarch64-apple-darwin/release/bundle/macos/TurboMerger.app
-src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+target/aarch64-apple-darwin/release/turbomerger-gui   # the desktop app
+target/release/turbomerger                           # the command line (also inside the .app)
+target/aarch64-apple-darwin/release/bundle/macos/TurboMerger.app
+target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
 ```
 
 The repository commits its complete icon set, including `icon.icns`; do not run
@@ -106,12 +107,12 @@ builds; the warning does not prevent this build.
 ### 4. Verify the bundle
 
 ```bash
-APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/TurboMerger.app"
-BIN="$(find "$APP/Contents/MacOS" -maxdepth 1 -type f -print -quit)"
+APP="target/aarch64-apple-darwin/release/bundle/macos/TurboMerger.app"
+BIN="$APP/Contents/MacOS/turbomerger-gui"   # the CLI sits beside it: $APP/Contents/MacOS/turbomerger
 
 lipo -archs "$BIN"                         # must include arm64
 codesign --verify --deep --strict "$APP"   # verifies the ad-hoc signature
-hdiutil verify src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+hdiutil verify target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
 open "$APP"
 ```
 
@@ -142,10 +143,10 @@ Run `xcode-select --install`, let installation finish, then open a new Terminal.
 
 ### A dependency reports the wrong architecture
 
-Do not copy `node_modules` or `src-tauri/target` from Windows or Intel macOS.
+Do not copy `node_modules` or `target` from Windows or Intel macOS.
 
 ```bash
-rm -rf node_modules src-tauri/target
+rm -rf node_modules target
 npm ci
 ```
 

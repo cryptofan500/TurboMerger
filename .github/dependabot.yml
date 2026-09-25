@@ -1,19 +1,30 @@
 version: 2
+# Minor and patch updates arrive as one grouped PR per ecosystem; majors stay
+# separate because they need a migration (see docs/RELEASING.md).
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
     open-pull-requests-limit: 5
 
   - package-ecosystem: npm
     directory: /
     schedule:
       interval: weekly
+    groups:
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
     open-pull-requests-limit: 5
 
   - package-ecosystem: cargo
-    directory: /src-tauri
+    directory: /
     schedule:
       interval: weekly
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
     open-pull-requests-limit: 5

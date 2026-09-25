@@ -1,17 +1,7 @@
-pub mod applyback;
-pub mod cli;
-mod commands;
-pub mod compress;
-pub mod config;
-pub mod mcp;
-pub mod merger;
-pub mod remote;
-pub mod repomap;
-pub mod scanner;
-pub mod security;
-pub mod tokens;
+//! TurboMerger desktop app: a Tauri shell over `tm-core`. The console
+//! command line is the separate `turbomerger` binary (`apps/tm-cli`).
 
-pub use commands::MergeOptions;
+mod commands;
 
 use std::sync::Mutex;
 

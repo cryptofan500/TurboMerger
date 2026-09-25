@@ -5,10 +5,10 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-use turbomerger::applyback::parse_reply;
-use turbomerger::merger::{merge_files_with_progress, MergeConfig, MergeOutcome, OutputFormat};
-use turbomerger::scanner::{scan_text_files, ScanOptions};
-use turbomerger::tokens;
+use tm_core::applyback::parse_reply;
+use tm_core::merger::{merge_files_with_progress, MergeConfig, MergeOutcome, OutputFormat};
+use tm_core::scanner::{scan_text_files, ScanOptions};
+use tm_core::tokens;
 
 fn merge(root: &Path, out: &Path, cfg: &MergeConfig) -> MergeOutcome {
     let scan = scan_text_files(root, &ScanOptions::default()).expect("scan");
@@ -147,7 +147,7 @@ fn cxml_content_cannot_forge_documents_and_still_round_trips() {
         .find(|c| c.path == "injection.txt")
         .expect("parsed");
     match &inj.body {
-        turbomerger::applyback::ChangeBody::Full(c) => assert_eq!(c, evil),
+        tm_core::applyback::ChangeBody::Full(c) => assert_eq!(c, evil),
         other => panic!("{other:?}"),
     }
 }

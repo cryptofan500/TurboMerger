@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use turbomerger::scanner::{scan_text_files, ScanOptions, ScanResult, SkipKind};
+use tm_core::scanner::{scan_text_files, ScanOptions, ScanResult, SkipKind};
 
 fn write(root: &Path, rel: &str, body: &str) {
     let p = root.join(rel);
@@ -41,7 +41,7 @@ fn merged(root: &Path, scan: &ScanResult) -> Vec<String> {
     scan.files.iter().map(|f| rel(root, f)).collect()
 }
 
-fn skip<'a>(scan: &'a ScanResult, path: &str) -> &'a turbomerger::scanner::SkipEntry {
+fn skip<'a>(scan: &'a ScanResult, path: &str) -> &'a tm_core::scanner::SkipEntry {
     scan.skipped
         .iter()
         .find(|s| s.path == path)

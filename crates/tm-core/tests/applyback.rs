@@ -6,11 +6,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
-use turbomerger::applyback::{
+use tm_core::applyback::{
     apply_files, build_preview, parse_reply, restore_last, ApplyPolicy, BuiltPreview, ParsedChange,
 };
-use turbomerger::merger::{merge_files_with_progress, MergeConfig, OutputFormat};
-use turbomerger::scanner::{scan_text_files, ScanOptions};
+use tm_core::merger::{merge_files_with_progress, MergeConfig, OutputFormat};
+use tm_core::scanner::{scan_text_files, ScanOptions};
 
 struct Fixture {
     root: PathBuf,

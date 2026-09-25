@@ -186,6 +186,9 @@ fn build_unix(root: &Path) {
     symlink("missing.rs", root.join("broken_link")).unwrap();
 }
 
+/// Writes one fixture tree into the directory it is given.
+type Builder = fn(&Path);
+
 struct Run {
     name: &'static str,
     fixture: &'static str,
@@ -371,7 +374,7 @@ fn first_difference(a: &[u8], b: &[u8]) -> String {
 fn merge_outputs_match_the_golden_files() {
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path();
-    let builders: &[(&str, fn(&Path))] = &[
+    let builders: &[(&str, Builder)] = &[
         ("golden_code", build_code),
         ("golden_secrets", build_secrets),
         ("golden_split", build_split),
