@@ -13,6 +13,8 @@ interface MergeResult {
   output_paths: string[];
   files_processed: number;
   files_skipped: number;
+  /** Inputs whose content is NOT in the output (documents, photos, too large…). */
+  not_captured: number;
   total_bytes: number;
   duration_ms: number;
   files_by_extension: number;
@@ -625,6 +627,12 @@ function App() {
               {result.files_skipped_binary > 0 && `, ${result.files_skipped_binary.toLocaleString()} binary`}
               {result.files_unreadable > 0 && `, ${result.files_unreadable.toLocaleString()} unreadable`}
             </p>
+            {result.not_captured > 0 && (
+              <p className="detection-breakdown" style={{ color: "var(--warning)" }}>
+                ⚠ {result.not_captured.toLocaleString()} input{result.not_captured === 1 ? "" : "s"} not
+                captured (documents, photos, too large, unreadable…) — see “Not captured” in the Merge Report
+              </p>
+            )}
             {result.secrets_redacted > 0 && (
               <p className="detection-breakdown" style={{ color: "var(--warning)" }}>
                 ⚠ {result.secrets_redacted.toLocaleString()} secret{result.secrets_redacted === 1 ? "" : "s"} redacted — see Merge Report in the output

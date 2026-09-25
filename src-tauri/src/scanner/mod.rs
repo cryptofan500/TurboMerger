@@ -10,9 +10,25 @@
 //!   Merge Report) instead of vanishing silently.
 //! - One unreadable entry no longer aborts the scan.
 //! - Content sniffing runs in parallel (rayon) instead of on the walk thread.
+//!
+//! v7.8 (plan N-01/N-02/N-03 — "0 silent drops"):
+//! - Directories are pruned by name only when the name is unambiguous
+//!   (`.git`, `node_modules`, `__pycache__`, …). `target/` needs a sibling
+//!   `Cargo.toml`, virtualenvs need `pyvenv.cfg`/`conda-meta`, caches need
+//!   `CACHEDIR.TAG`. `packages/`, `build/`, `debug/`, `release/`, `env/`,
+//!   `vendor/`, `coverage/`… are source in plenty of repos; `.gitignore`
+//!   decides for them.
+//! - Every pruned directory, hidden file and symlink is recorded with a
+//!   reason (pruned directories with file and byte counts).
+//! - Symlinks to files inside the root are followed once (deduplicated
+//!   against their target); links that leave the root are recorded.
+//! - Entries hidden by ignore rules are counted per rule, and ancestor
+//!   ignore files apply only when the root is inside a git worktree.
 
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use ignore::WalkBuilder;
@@ -53,6 +69,12 @@ const LARGE_FILE_UNKNOWN_EXT: u64 = 524_288;
 static TEXT_EXTENSIONS: phf::Set<&'static str> = phf_set! {
     // Code — mainstream
     "rs", "py", "js", "ts", "tsx", "jsx", "c", "cpp", "h", "hpp", "java", "kt", "go",
+    // Code — C/C++ variants, GPU, .NET/Qt UI (N-05: were sniffed, and dropped above 500 KB)
+    "cc", "cxx", "hh", "hxx", "inl", "ipp", "cu", "cuh", "glsl", "hlsl", "wgsl", "metal",
+    "csproj", "fsproj", "vbproj", "sln", "props", "targets", "xaml", "razor", "cshtml",
+    "qml", "ui", "svg",
+    // Logs, subtitles, mail
+    "log", "srt", "vtt", "eml",
     "rb", "php", "swift", "cs", "fs", "scala", "clj", "ex", "exs", "lua", "r", "jl",
     "hs", "elm", "erl", "nim", "zig", "v", "d", "ada", "pas", "pl", "pm", "tcl",
     // Code — mobile
@@ -102,7 +124,7 @@ static BINARY_EXTENSIONS: phf::Set<&'static str> = phf_set! {
     "o", "obj", "lib", "a", "class", "pyc", "pyo", "wasm",
     // Images
     "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp",
-    "tiff", "tif", "psd", "raw", "heic", "heif", "avif", "svg",
+    "tiff", "tif", "psd", "raw", "heic", "heif", "avif",
     // Audio
     "mp3", "wav", "flac", "aac", "ogg", "wma", "m4a", "opus",
     // Video
@@ -152,44 +174,40 @@ static SKIP_FILES: &[&str] = &[
 // SKIP DIRECTORY SETS
 // ============================================================================
 
-/// Directories to ALWAYS skip (regardless of include_venv / include_hidden)
+/// Version-control metadata: pruned everywhere, never counted.
+const VCS_DIRS: &[&str] = &[".git", ".svn", ".hg", ".bzr"];
+
+/// Credential directories: pruned everywhere, even with hidden files on.
+const CREDENTIAL_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg"];
+
+/// Directory names that never hold a project's own source: dependency trees,
+/// tool caches, build caches, OS junk, TurboMerger's own state. Pruned at any
+/// depth. Ambiguous names (`build`, `dist`, `out`, `debug`, `release`,
+/// `packages`, `vendor`, `coverage`, `env`, `obj`, `target`…) are NOT here —
+/// `.gitignore` and the markers in `prune_dir_reason` decide for those.
 static SKIP_DIRS_ALWAYS: phf::Set<&'static str> = phf_set! {
-    // Version Control
-    ".git", ".svn", ".hg", ".bzr",
-    // Node.js
-    "node_modules", ".npm", ".yarn", ".pnpm-store",
-    // Rust
-    "target", ".cargo",
-    // Build outputs
-    "dist", "build", "out", "_build",
-    // IDE/Editor
-    ".idea", ".vscode", ".vs",
-    // Coverage/Testing
-    "coverage", ".coverage", "htmlcov", ".nyc_output",
-    // Caches
-    ".cache", ".parcel-cache", ".next", ".nuxt", ".output",
-    ".svelte-kit", ".turbo",
-    // Deployment
-    ".vercel", ".netlify",
-    // Generated / docs
-    "__generated__", ".docusaurus", "storybook-static",
-    // Misc
-    "vendor", "packages", "bower_components",
-    "obj", "debug", "release", "x64", "x86",
-    // Windows
-    "$recycle.bin", "system volume information",
-    // macOS
-    ".ds_store", "__macosx",
-    // Terraform/Cloud
-    ".terraform", ".serverless",
-    // Credential directories
-    ".ssh", ".aws", ".gnupg",
+    // Dependencies
+    "node_modules", ".pnpm-store", "bower_components",
+    // Framework/tool caches
+    ".parcel-cache", ".next", ".nuxt", ".svelte-kit", ".turbo", ".docusaurus",
+    ".nyc_output", "htmlcov", "storybook-static",
+    ".terraform", ".serverless", ".vercel", ".netlify",
+    // OS junk
+    "__macosx", "$recycle.bin", "system volume information",
     // TurboMerger's own apply-back backups (T3-3)
     ".turbomerger",
 };
 
-/// Python venv directories - only skipped when include_venv=false
+/// Python caches and dependency dirs — only skipped when include_venv=false.
+/// Virtualenv ROOTS are detected by their `pyvenv.cfg` / `conda-meta` marker.
 static SKIP_DIRS_VENV: phf::Set<&'static str> = phf_set! {
+    "site-packages", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".tox", ".nox", ".eggs", "pip-wheel-metadata",
+};
+
+/// Venv names used only by the harvest-only credential walk (speed); the main
+/// scan identifies virtualenvs by marker instead.
+static VENV_NAMES: phf::Set<&'static str> = phf_set! {
     "venv", ".venv", "env", ".env", "virtualenv",
     "virtual_env", "virtualenvs", "pyenv",
     ".poetry", ".pipenv",
@@ -284,14 +302,50 @@ pub struct ScanStats {
     pub by_content: usize,
     pub skipped_binary: usize,
     pub unreadable: usize,
+    /// Directories not descended into (dependency trees, caches, hidden…).
+    pub pruned_dirs: usize,
+    /// Files and directories hidden by ignore rules / user globs.
+    pub ignored_entries: usize,
+    /// Symlinks met during the walk (followed or recorded).
+    pub symlinks: usize,
 }
 
-/// A skipped file plus the reason — feeds the output's Merge Report so nothing
-/// is ever dropped invisibly.
+/// Why something is not in the merge — decides the exit code (N-31).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipKind {
+    /// Left out on purpose: sensitive files, lockfiles, previous outputs,
+    /// hidden files, minified bundles, user globs, VCS/dependency dirs.
+    Excluded,
+    /// Binary by design (images, archives, executables, fonts, databases).
+    Binary,
+    /// Content that should have been captured but was not: unsupported
+    /// documents and photos, too large, unreadable, credential-dense.
+    NotCaptured,
+    /// A directory that was not descended into (counts in the reason).
+    PrunedDir,
+    /// Entries hidden by one ignore rule (counts in the reason).
+    IgnoredByRule,
+}
+
+/// A skipped file (or pruned directory, or ignore-rule summary) plus the
+/// reason — feeds the output's Merge Report so nothing is ever dropped
+/// invisibly.
 #[derive(Debug, Clone, Serialize)]
 pub struct SkipEntry {
     pub path: String,
     pub reason: String,
+    pub kind: SkipKind,
+}
+
+impl SkipEntry {
+    pub fn new(path: impl Into<String>, reason: impl Into<String>, kind: SkipKind) -> SkipEntry {
+        SkipEntry {
+            path: path.into(),
+            reason: reason.into(),
+            kind,
+        }
+    }
 }
 
 /// Complete scan result
@@ -320,7 +374,7 @@ fn has_word_boundary(name: &str, pattern: &str, idx: usize) -> bool {
 /// Fast check if a directory name indicates a virtual environment (no I/O)
 #[inline]
 fn is_venv_by_name(lower_name: &str) -> bool {
-    if SKIP_DIRS_VENV.contains(lower_name) {
+    if VENV_NAMES.contains(lower_name) {
         return true;
     }
 
@@ -428,6 +482,12 @@ fn sniff_file_content(path: &Path) -> Result<bool> {
     if crate::security::is_binary_content(&buffer) {
         return Ok(false);
     }
+    // Well-formed UTF-8 is text: CJK prose is mostly high bytes, notebooks
+    // and generated JSON have very long lines (N-04). The statistics below
+    // are for legacy 8-bit encodings only.
+    if crate::security::is_valid_text_window(&buffer) {
+        return Ok(true);
+    }
 
     let control_count = buffer
         .iter()
@@ -465,98 +525,171 @@ pub fn relative_display(root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
-/// Directory/file filter applied during the walk (cheap name checks only).
-fn keep_entry(entry: &ignore::DirEntry, include_venv: bool, include_hidden: bool) -> bool {
-    if entry.path_is_symlink() {
-        return false;
+/// Why a directory is not descended into, or `None` to walk it. Cheap: name
+/// checks plus at most a few `stat`s for markers.
+fn prune_dir_reason(
+    path: &Path,
+    name_lower: &str,
+    include_venv: bool,
+    include_hidden: bool,
+) -> Option<&'static str> {
+    if VCS_DIRS.contains(&name_lower) {
+        return Some("version-control metadata");
     }
+    if CREDENTIAL_DIRS.contains(&name_lower) {
+        return Some("credential directory — never scanned");
+    }
+    if SKIP_DIRS_ALWAYS.contains(name_lower) {
+        return Some("dependency / tool-cache directory");
+    }
+    if name_lower == "target"
+        && path
+            .parent()
+            .is_some_and(|p| p.join("Cargo.toml").is_file())
+    {
+        return Some("Rust build output (next to Cargo.toml)");
+    }
+    if path.join("CACHEDIR.TAG").is_file() {
+        return Some("cache directory (CACHEDIR.TAG)");
+    }
+    if !include_venv {
+        if SKIP_DIRS_VENV.contains(name_lower) {
+            return Some("Python cache / dependency directory (--include-venv to scan)");
+        }
+        if path.join("pyvenv.cfg").is_file() {
+            return Some("Python virtual environment (pyvenv.cfg; --include-venv to scan)");
+        }
+        if path.join("conda-meta").is_dir() {
+            return Some("conda environment (conda-meta; --include-venv to scan)");
+        }
+    }
+    if name_lower.starts_with('.') && !include_hidden && !DOT_DIR_ALLOWLIST.contains(&name_lower) {
+        return Some("hidden directory (--include-hidden to scan)");
+    }
+    None
+}
 
-    let name = entry.file_name().to_string_lossy();
-    let name_lower = name.to_lowercase();
+/// Something the walk filter left out, recorded for the report.
+struct Pruned {
+    path: PathBuf,
+    reason: &'static str,
+    is_dir: bool,
+    symlink: bool,
+}
+
+/// Walk filter: `None` = keep walking, `Some(p)` = prune and record.
+fn prune_entry(
+    entry: &ignore::DirEntry,
+    include_venv: bool,
+    include_hidden: bool,
+) -> Option<Pruned> {
     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+    let pruned = |reason: &'static str, symlink: bool| Pruned {
+        path: entry.path().to_path_buf(),
+        reason,
+        is_dir,
+        symlink,
+    };
+    if entry.path_is_symlink() {
+        return Some(pruned("symlink", true));
+    }
+    let name_lower = entry.file_name().to_string_lossy().to_lowercase();
 
     if is_dir {
         // Junction points masquerade as plain dirs — reject via attributes
         #[cfg(windows)]
         if let Ok(meta) = entry.metadata() {
             if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return false;
+                return Some(pruned("junction / reparse point — not followed", true));
             }
         }
-        if SKIP_DIRS_ALWAYS.contains(name_lower.as_str()) {
-            return false;
-        }
-        if !include_venv && is_venv_by_name(&name_lower) {
-            return false;
-        }
-        if name_lower.starts_with('.')
-            && !include_hidden
-            && !DOT_DIR_ALLOWLIST.contains(&name_lower.as_str())
-        {
-            return false;
-        }
-        return true;
+        return prune_dir_reason(entry.path(), &name_lower, include_venv, include_hidden)
+            .map(|r| pruned(r, false));
     }
 
     // Files: hidden gate (dot-prefix) with the config-file allowlist. Sensitive
     // files (.env, *.pem, id_rsa…) are let through even when hidden so they get
-    // RECORDED as skipped-with-reason in classify(), never dropped silently.
+    // RECORDED as skipped-with-reason in classify().
     if name_lower.starts_with('.')
         && !include_hidden
         && !is_allowlisted_dotfile(&name_lower)
         && sensitive_reason(entry.path()).is_none()
     {
-        return false;
+        return Some(pruned("hidden file (--include-hidden to include)", false));
     }
-
-    true
+    None
 }
 
 enum Verdict {
     TextByExt,
     TextByContent,
-    Skip(String),
-    SkipBinary(String),
+    Skip(String, SkipKind),
     Unreadable,
+}
+
+/// Content-bearing formats with no extractor yet (documents: Phase 3,
+/// photos: Phase 6). They are reported as NOT captured — never as a silent
+/// "binary" skip — so a folder of PDFs or photos no longer exits 0 (N-06,
+/// N-53).
+fn not_yet_extractable(ext_lower: &str) -> Option<&'static str> {
+    match ext_lower {
+        "pdf" | "doc" | "docx" | "odt" | "epub" | "xls" | "xlsx" | "ods" | "ppt" | "pptx"
+        | "odp" => Some("document — text extraction is not supported yet"),
+        "heic" | "heif" | "jpg" | "jpeg" | "tif" | "tiff" => {
+            Some("photo — OCR is not supported yet")
+        }
+        _ => None,
+    }
 }
 
 /// Decide whether a single candidate file is merged. Runs on rayon threads.
 fn classify(path: &Path, len: u64, options: &ScanOptions) -> Verdict {
     let name = match path.file_name().and_then(|n| n.to_str()) {
         Some(n) => n,
-        None => return Verdict::Skip("unrepresentable file name".into()),
+        None => return Verdict::Skip("unrepresentable file name".into(), SkipKind::NotCaptured),
     };
     let name_lower = name.to_lowercase();
 
     if SKIP_FILES.iter().any(|&s| s == name_lower) {
-        return Verdict::Skip("lock/system file (context bloat)".into());
+        return Verdict::Skip(
+            "lock/system file (context bloat)".into(),
+            SkipKind::Excluded,
+        );
     }
     if is_own_output(&name_lower) {
-        return Verdict::Skip("previous TurboMerger output".into());
+        return Verdict::Skip("previous TurboMerger output".into(), SkipKind::Excluded);
     }
     if is_minified_filename(name) {
-        return Verdict::SkipBinary("minified/bundled".into());
+        return Verdict::Skip("minified/bundled".into(), SkipKind::Excluded);
     }
     if let Some(reason) = sensitive_reason(path) {
-        return Verdict::Skip(reason.to_string());
+        return Verdict::Skip(reason.to_string(), SkipKind::Excluded);
+    }
+    let ext_lower = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if let Some(reason) = ext_lower.as_deref().and_then(not_yet_extractable) {
+        return Verdict::Skip(reason.into(), SkipKind::NotCaptured);
     }
     if len > options.max_file_size {
-        return Verdict::Skip(format!("too large ({} KB)", len / 1024));
+        return Verdict::Skip(
+            format!("too large ({} KB)", len / 1024),
+            SkipKind::NotCaptured,
+        );
     }
 
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext_lower = ext.to_ascii_lowercase();
-
+    if let Some(ext_lower) = ext_lower {
         // Step 1: Config exclude list (highest priority user override)
         if options.extra_skip_exts.iter().any(|e| e == &ext_lower) {
-            return Verdict::Skip("excluded by turbomerger.toml".into());
+            return Verdict::Skip("excluded by turbomerger.toml".into(), SkipKind::Excluded);
         }
 
         // Step 2: Known binary extension → skip
         if BINARY_EXTENSIONS.contains(ext_lower.as_str())
             || options.extra_binary_exts.iter().any(|e| e == &ext_lower)
         {
-            return Verdict::SkipBinary("binary extension".into());
+            return Verdict::Skip("binary extension".into(), SkipKind::Binary);
         }
 
         let known_text = TEXT_EXTENSIONS.contains(ext_lower.as_str())
@@ -564,7 +697,10 @@ fn classify(path: &Path, len: u64, options: &ScanOptions) -> Verdict {
 
         // Large files must be known text extensions
         if len > LARGE_FILE_UNKNOWN_EXT && !known_text {
-            return Verdict::SkipBinary("large file with unknown extension".into());
+            return Verdict::Skip(
+                "large file with unknown extension".into(),
+                SkipKind::NotCaptured,
+            );
         }
 
         // Step 3: Known text extension → include
@@ -576,26 +712,35 @@ fn classify(path: &Path, len: u64, options: &ScanOptions) -> Verdict {
         if options.content_sniff {
             return match sniff_file_content(path) {
                 Ok(true) => Verdict::TextByContent,
-                Ok(false) => Verdict::SkipBinary("binary content".into()),
+                Ok(false) => Verdict::Skip("binary content".into(), SkipKind::Binary),
                 Err(_) => Verdict::Unreadable,
             };
         }
-        Verdict::Skip("unknown extension (content detection off)".into())
+        Verdict::Skip(
+            "unknown extension (content detection off)".into(),
+            SkipKind::NotCaptured,
+        )
     } else {
         // Extensionless files — known names, then optional sniff
         if len > LARGE_FILE_UNKNOWN_EXT && !is_known_extensionless_file(&name_lower) {
-            return Verdict::SkipBinary("large file with unknown extension".into());
+            return Verdict::Skip(
+                "large file with unknown extension".into(),
+                SkipKind::NotCaptured,
+            );
         }
         if is_known_extensionless_file(&name_lower) {
             Verdict::TextByExt
         } else if options.content_sniff {
             match sniff_file_content(path) {
                 Ok(true) => Verdict::TextByContent,
-                Ok(false) => Verdict::SkipBinary("binary content".into()),
+                Ok(false) => Verdict::Skip("binary content".into(), SkipKind::Binary),
                 Err(_) => Verdict::Unreadable,
             }
         } else {
-            Verdict::Skip("no extension (content detection off)".into())
+            Verdict::Skip(
+                "no extension (content detection off)".into(),
+                SkipKind::NotCaptured,
+            )
         }
     }
 }
@@ -640,7 +785,14 @@ pub fn find_credential_files(root: &Path) -> Vec<PathBuf> {
                 }
             }
             // Prune noise dirs and venvs; keep everything else, dotdirs included.
-            return !SKIP_DIRS_ALWAYS.contains(name_lower.as_str())
+            // Build outputs never hold credential files; skipping them keeps
+            // this gitignore-bypassing walk fast.
+            return !VCS_DIRS.contains(&name_lower.as_str())
+                && !SKIP_DIRS_ALWAYS.contains(name_lower.as_str())
+                && !matches!(
+                    name_lower.as_str(),
+                    "target" | "dist" | "build" | "out" | "_build" | "obj" | "coverage"
+                )
                 && !is_venv_by_name(&name_lower);
         }
         true
@@ -680,27 +832,199 @@ pub fn find_credential_files(root: &Path) -> Vec<PathBuf> {
 // MAIN SCANNER
 // ============================================================================
 
+/// True when `root` is inside a git worktree (a `.git` dir or file at the
+/// root or any ancestor). Ancestor ignore files only apply there (N-03): a
+/// dotfiles repo in `$HOME` must not hide files in `~/Desktop/papers`.
+pub fn inside_git_worktree(root: &Path) -> bool {
+    root.ancestors().any(|a| a.join(".git").exists())
+}
+
+/// Per-directory counting budget for pruned/ignored directories, and a global
+/// cap so fifty `node_modules` cannot turn the report into the slow part.
+const COUNT_CAP_PER_DIR: usize = 10_000;
+const COUNT_CAP_TOTAL: usize = 100_000;
+
+/// Files and bytes under `dir`, without following links. `None` when the
+/// global budget is spent; `capped` when this directory hit its own cap.
+fn count_tree(dir: &Path, budget: &mut usize) -> Option<(usize, u64, bool)> {
+    if *budget == 0 {
+        return None;
+    }
+    let (mut files, mut bytes, mut visited) = (0usize, 0u64, 0usize);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            visited += 1;
+            *budget = budget.saturating_sub(1);
+            if visited > COUNT_CAP_PER_DIR || *budget == 0 {
+                return Some((files, bytes, true));
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(e.path());
+            } else if ft.is_file() {
+                files += 1;
+                bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    Some((files, bytes, false))
+}
+
+fn human_bytes(b: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = b as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{} B", b)
+    } else {
+        format!("{:.1} {}", v, UNITS[u])
+    }
+}
+
+fn count_note(counted: Option<(usize, u64, bool)>) -> String {
+    match counted {
+        None => "not counted".into(),
+        Some((files, bytes, capped)) => format!(
+            "{}{} file{}, {}{}",
+            files,
+            if capped { "+" } else { "" },
+            if files == 1 && !capped { "" } else { "s" },
+            human_bytes(bytes),
+            if capped { "+" } else { "" }
+        ),
+    }
+}
+
+/// Finds which ignore rule hides an entry, for the report ("12 files ignored
+/// by `profiles/` in .gitignore"). Approximate by design — deepest matching
+/// ignore file wins — which is what the user needs to find the rule.
+struct IgnoreAttribution {
+    root: PathBuf,
+    stop: Option<PathBuf>,
+    cache: BTreeMap<PathBuf, Option<ignore::gitignore::Gitignore>>,
+}
+
+impl IgnoreAttribution {
+    fn new(root: &Path, include_ancestors: bool) -> Self {
+        // With ancestor ignore files on, look up to the worktree root.
+        let stop = if include_ancestors {
+            root.ancestors()
+                .find(|a| a.join(".git").exists())
+                .map(Path::to_path_buf)
+        } else {
+            None
+        };
+        IgnoreAttribution {
+            root: root.to_path_buf(),
+            stop,
+            cache: BTreeMap::new(),
+        }
+    }
+
+    fn matcher(&mut self, file: PathBuf) -> Option<&ignore::gitignore::Gitignore> {
+        self.cache
+            .entry(file.clone())
+            .or_insert_with(|| {
+                if !file.is_file() {
+                    return None;
+                }
+                let dir = if file.ends_with("info/exclude") {
+                    file.parent()?.parent()?.parent()?.to_path_buf()
+                } else {
+                    file.parent()?.to_path_buf()
+                };
+                let mut b = ignore::gitignore::GitignoreBuilder::new(dir);
+                b.add(&file);
+                b.build().ok()
+            })
+            .as_ref()
+    }
+
+    /// `(source file relative to the root, pattern)` of the rule that hides `path`.
+    fn rule_for(&mut self, path: &Path, is_dir: bool) -> Option<(String, String)> {
+        let top = self.stop.clone().unwrap_or_else(|| self.root.clone());
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for a in path.ancestors().skip(1) {
+            dirs.push(a.to_path_buf());
+            if a == top {
+                break;
+            }
+        }
+        for dir in dirs {
+            let mut files = vec![
+                dir.join(".turbomergerignore"),
+                dir.join(".ignore"),
+                dir.join(".gitignore"),
+            ];
+            if dir == top || dir.join(".git").is_dir() {
+                files.push(dir.join(".git").join("info").join("exclude"));
+            }
+            for file in files {
+                let Ok(rel) = path.strip_prefix(&dir) else {
+                    continue;
+                };
+                let rel = rel.to_path_buf();
+                let pattern = {
+                    let Some(gi) = self.matcher(file.clone()) else {
+                        continue;
+                    };
+                    match gi.matched_path_or_any_parents(&rel, is_dir) {
+                        ignore::Match::Ignore(glob) => glob.original().to_string(),
+                        _ => continue,
+                    }
+                };
+                {
+                    let source = file
+                        .strip_prefix(&self.root)
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|_| {
+                            format!(
+                                "{} (outside the scanned folder)",
+                                file.file_name().unwrap_or_default().to_string_lossy()
+                            )
+                        });
+                    return Some((source, pattern));
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Scan directory for text files: gitignore-aware walk, then parallel
-/// classification with per-file skip reasons.
+/// classification with per-file skip reasons. Nothing leaves the scan
+/// unrecorded: pruned directories, hidden files, symlinks and ignored
+/// entries all land in `skipped` (N-01/N-02/N-03).
 pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult> {
     if has_reparse_point_in_path(root).unwrap_or(true) {
         anyhow::bail!("Root path contains junction points or symlinks");
     }
+    let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let use_ancestors = options.respect_gitignore && inside_git_worktree(root);
 
     let mut builder = WalkBuilder::new(root);
     builder
         .follow_links(false)
-        .hidden(false) // hidden handling is ours (dot allowlist in keep_entry)
+        .hidden(false) // hidden handling is ours (dot allowlist in prune_entry)
         .require_git(false) // honor .gitignore even outside a git repo
         .git_ignore(options.respect_gitignore)
         .git_exclude(options.respect_gitignore)
         .ignore(options.respect_gitignore)
-        .parents(options.respect_gitignore)
+        .parents(use_ancestors)
         .git_global(false); // deterministic: user-global excludes don't apply
     builder.add_custom_ignore_filename(".turbomergerignore");
 
     // User include/exclude globs via ripgrep's override layer. A non-empty
     // whitelist means only matching files survive; `!glob` entries are excludes.
+    let mut overrides: Option<ignore::overrides::Override> = None;
     if !options.include_globs.is_empty() || !options.exclude_globs.is_empty() {
         let mut ob = ignore::overrides::OverrideBuilder::new(root);
         for g in &options.include_globs {
@@ -716,38 +1040,52 @@ pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult>
             ob.add(&pat)
                 .map_err(|e| anyhow::anyhow!("bad exclude glob '{}': {}", g, e))?;
         }
-        let overrides = ob
+        let built = ob
             .build()
             .map_err(|e| anyhow::anyhow!("glob build failed: {}", e))?;
-        builder.overrides(overrides);
+        builder.overrides(built.clone());
+        overrides = Some(built);
     }
 
     let include_venv = options.include_venv;
     let include_hidden = options.include_hidden;
+    let pruned: Arc<Mutex<Vec<Pruned>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&pruned);
     builder.filter_entry(move |entry| {
         if entry.depth() == 0 {
             return true;
         }
-        keep_entry(entry, include_venv, include_hidden)
+        match prune_entry(entry, include_venv, include_hidden) {
+            None => true,
+            Some(p) => {
+                if let Ok(mut v) = recorder.lock() {
+                    v.push(p);
+                }
+                false
+            }
+        }
     });
 
-    // Phase 1 (sequential, heavily pruned): collect candidate files.
+    // Walk 1 (sequential, heavily pruned): collect candidate files.
     let mut candidates: Vec<(PathBuf, u64)> = Vec::new();
     let mut skipped: Vec<SkipEntry> = Vec::new();
     let mut stats = ScanStats::default();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
 
     for result in builder.build() {
         let entry = match result {
             Ok(e) => e,
             Err(err) => {
                 stats.unreadable += 1;
-                skipped.push(SkipEntry {
-                    path: err.to_string(),
-                    reason: "unreadable during walk".into(),
-                });
+                skipped.push(SkipEntry::new(
+                    scrub_root(&err.to_string(), root),
+                    "unreadable during walk",
+                    SkipKind::NotCaptured,
+                ));
                 continue;
             }
         };
+        seen.insert(entry.path().to_path_buf());
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
@@ -756,31 +1094,149 @@ pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult>
             Ok(m) => m,
             Err(_) => {
                 stats.unreadable += 1;
-                skipped.push(SkipEntry {
-                    path: relative_display(root, &path),
-                    reason: "metadata unreadable".into(),
-                });
+                skipped.push(SkipEntry::new(
+                    relative_display(root, &path),
+                    "metadata unreadable",
+                    SkipKind::NotCaptured,
+                ));
                 continue;
             }
         };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
         #[cfg(windows)]
         {
             let attrs = meta.file_attributes();
-            if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                continue;
-            }
             if attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0 {
-                skipped.push(SkipEntry {
-                    path: relative_display(root, &path),
-                    reason: "cloud placeholder (not downloaded locally)".into(),
-                });
+                skipped.push(SkipEntry::new(
+                    relative_display(root, &path),
+                    "cloud placeholder (not downloaded locally)",
+                    SkipKind::NotCaptured,
+                ));
                 continue;
             }
         }
         candidates.push((path, meta.len()));
+    }
+
+    // What the walk filter left out: directories (with counts), hidden files,
+    // and symlinks (resolved below).
+    let pruned = std::mem::take(&mut *pruned.lock().expect("prune recorder"));
+    let mut budget = COUNT_CAP_TOTAL;
+    let candidate_rels: HashSet<String> = candidates
+        .iter()
+        .map(|(p, _)| relative_display(root, p))
+        .collect();
+    for p in pruned {
+        let rel = relative_display(root, &p.path);
+        if p.symlink {
+            stats.symlinks += 1;
+            match resolve_symlink(&p.path, &root_canon) {
+                LinkTarget::InRootFile(target_rel) if candidate_rels.contains(&target_rel) => {
+                    skipped.push(SkipEntry::new(
+                        rel,
+                        format!("symlink to {} (content included there)", target_rel),
+                        SkipKind::Excluded,
+                    ));
+                }
+                LinkTarget::InRootFile(_) => {
+                    // The target is not merged under its own name (hidden,
+                    // ignored…): merge it once under the link's name.
+                    let len = std::fs::metadata(&p.path).map(|m| m.len()).unwrap_or(0);
+                    candidates.push((p.path, len));
+                }
+                LinkTarget::InRootDir(target_rel) => skipped.push(SkipEntry::new(
+                    format!("{}/", rel),
+                    format!("symlinked directory → {}/ — not followed", target_rel),
+                    SkipKind::Excluded,
+                )),
+                LinkTarget::Outside => skipped.push(SkipEntry::new(
+                    rel,
+                    "symlink points outside the root — not followed",
+                    SkipKind::Excluded,
+                )),
+                LinkTarget::Broken => {
+                    skipped.push(SkipEntry::new(rel, "broken symlink", SkipKind::Excluded))
+                }
+            }
+        } else if p.is_dir {
+            stats.pruned_dirs += 1;
+            let counted = if p.reason == "version-control metadata" {
+                None
+            } else {
+                count_tree(&p.path, &mut budget)
+            };
+            let reason = if p.reason == "version-control metadata" {
+                format!("{} — not scanned", p.reason)
+            } else {
+                format!("{} — not scanned ({})", p.reason, count_note(counted))
+            };
+            skipped.push(SkipEntry::new(
+                format!("{}/", rel),
+                reason,
+                SkipKind::PrunedDir,
+            ));
+        } else {
+            skipped.push(SkipEntry::new(rel, p.reason, SkipKind::Excluded));
+        }
+    }
+
+    // Walk 2: everything ignore rules or user globs hid, counted per rule.
+    if options.respect_gitignore || overrides.is_some() {
+        let ignored = find_ignored(root, &seen, include_venv, include_hidden);
+        stats.ignored_entries = ignored.len();
+        let mut attribution = IgnoreAttribution::new(root, use_ancestors);
+        // (source, pattern) -> (files, dirs, bytes, capped)
+        let mut per_rule: BTreeMap<(String, String), (usize, usize, u64, bool)> = BTreeMap::new();
+        for (path, is_dir) in ignored {
+            let rel = relative_display(root, &path);
+            let by_glob = overrides
+                .as_ref()
+                .map(|o| o.matched(&rel, is_dir))
+                .is_some_and(|m| {
+                    m.is_ignore() || (m.is_none() && !is_dir && o_has_whitelist(options))
+                });
+            let key = if by_glob {
+                ("--include/--exclude".to_string(), "user glob".to_string())
+            } else {
+                attribution.rule_for(&path, is_dir).unwrap_or_else(|| {
+                    (
+                        "ignore rules".to_string(),
+                        "(rule not identified)".to_string(),
+                    )
+                })
+            };
+            let slot = per_rule.entry(key).or_insert((0, 0, 0, false));
+            if is_dir {
+                slot.1 += 1;
+                if let Some((f, b, capped)) = count_tree(&path, &mut budget) {
+                    slot.0 += f;
+                    slot.2 += b;
+                    slot.3 |= capped;
+                }
+            } else {
+                slot.0 += 1;
+                slot.2 += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            }
+        }
+        for ((source, pattern), (files, dirs, bytes, capped)) in per_rule {
+            let mut what = format!(
+                "{}{} file{}",
+                files,
+                if capped { "+" } else { "" },
+                if files == 1 && !capped { "" } else { "s" }
+            );
+            if dirs > 0 {
+                what.push_str(&format!(
+                    " in {} director{}",
+                    dirs,
+                    if dirs == 1 { "y" } else { "ies" }
+                ));
+            }
+            skipped.push(SkipEntry::new(
+                format!("{}: {}", source, pattern),
+                format!("ignored — {} ({})", what, human_bytes(bytes)),
+                SkipKind::IgnoredByRule,
+            ));
+        }
     }
 
     // Phase 2 (parallel): classify candidates (includes content sniffing).
@@ -803,25 +1259,19 @@ pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult>
                 stats.by_content += 1;
                 files.push(path);
             }
-            Verdict::SkipBinary(reason) => {
-                stats.skipped_binary += 1;
-                skipped.push(SkipEntry {
-                    path: relative_display(root, &path),
-                    reason,
-                });
-            }
-            Verdict::Skip(reason) => {
-                skipped.push(SkipEntry {
-                    path: relative_display(root, &path),
-                    reason,
-                });
+            Verdict::Skip(reason, kind) => {
+                if kind == SkipKind::Binary {
+                    stats.skipped_binary += 1;
+                }
+                skipped.push(SkipEntry::new(relative_display(root, &path), reason, kind));
             }
             Verdict::Unreadable => {
                 stats.unreadable += 1;
-                skipped.push(SkipEntry {
-                    path: relative_display(root, &path),
-                    reason: "unreadable".into(),
-                });
+                skipped.push(SkipEntry::new(
+                    relative_display(root, &path),
+                    "unreadable",
+                    SkipKind::NotCaptured,
+                ));
             }
         }
     }
@@ -833,6 +1283,87 @@ pub fn scan_text_files(root: &Path, options: &ScanOptions) -> Result<ScanResult>
         stats,
         skipped,
     })
+}
+
+fn o_has_whitelist(options: &ScanOptions) -> bool {
+    !options.include_globs.is_empty()
+}
+
+/// Walk errors embed absolute paths; the report shows root-relative ones.
+fn scrub_root(msg: &str, root: &Path) -> String {
+    let r = root.to_string_lossy();
+    msg.replace(&format!("{}/", r), "")
+        .replace(&format!("{}\\", r), "")
+        .replace(r.as_ref(), ".")
+}
+
+enum LinkTarget {
+    InRootFile(String),
+    InRootDir(String),
+    Outside,
+    Broken,
+}
+
+fn resolve_symlink(link: &Path, root_canon: &Path) -> LinkTarget {
+    let Ok(target) = std::fs::canonicalize(link) else {
+        return LinkTarget::Broken;
+    };
+    let Ok(rel) = target.strip_prefix(root_canon) else {
+        return LinkTarget::Outside;
+    };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    if target.is_dir() {
+        LinkTarget::InRootDir(rel)
+    } else if target.is_file() {
+        LinkTarget::InRootFile(rel)
+    } else {
+        LinkTarget::Outside
+    }
+}
+
+/// Entries that the ignore rules / user globs hid from walk 1: the same walk
+/// without those rules, stopping at the first entry walk 1 never saw (an
+/// ignored directory is reported once, not descended into).
+fn find_ignored(
+    root: &Path,
+    seen: &HashSet<PathBuf>,
+    include_venv: bool,
+    include_hidden: bool,
+) -> Vec<(PathBuf, bool)> {
+    let seen = Arc::new(seen.clone());
+    let found: Arc<Mutex<Vec<(PathBuf, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&found);
+    let mut b = WalkBuilder::new(root);
+    b.follow_links(false)
+        .hidden(false)
+        .require_git(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
+        .git_global(false);
+    b.filter_entry(move |entry| {
+        if entry.depth() == 0 {
+            return true;
+        }
+        // Pruned by our own rules: already recorded by walk 1 (or inside an
+        // ignored directory, which is reported as a whole).
+        if prune_entry(entry, include_venv, include_hidden).is_some() {
+            return false;
+        }
+        if seen.contains(entry.path()) {
+            return true;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if let Ok(mut v) = sink.lock() {
+            v.push((entry.path().to_path_buf(), is_dir));
+        }
+        false
+    });
+    for _ in b.build() {}
+    let mut out = std::mem::take(&mut *found.lock().expect("ignored sink"));
+    out.sort();
+    out
 }
 
 // ============================================================================
@@ -871,11 +1402,19 @@ mod tests {
     #[test]
     fn test_skip_dirs_separation() {
         assert!(SKIP_DIRS_ALWAYS.contains("node_modules"));
-        assert!(SKIP_DIRS_ALWAYS.contains(".git"));
-        assert!(SKIP_DIRS_ALWAYS.contains(".ssh"));
+        assert!(VCS_DIRS.contains(&".git"));
+        assert!(CREDENTIAL_DIRS.contains(&".ssh"));
         assert!(SKIP_DIRS_ALWAYS.contains(".turbomerger"));
-        assert!(SKIP_DIRS_VENV.contains("venv"));
-        assert!(!SKIP_DIRS_ALWAYS.contains("venv"));
+        assert!(SKIP_DIRS_VENV.contains("__pycache__"));
+        // N-01: ambiguous names are source in plenty of repos — never pruned
+        // by name alone.
+        for name in [
+            "packages", "build", "dist", "out", "debug", "release", "vendor", "coverage", "env",
+            "obj", "target", "venv", "lib64", "x64",
+        ] {
+            assert!(!SKIP_DIRS_ALWAYS.contains(name), "{name}");
+            assert!(!SKIP_DIRS_VENV.contains(name), "{name}");
+        }
     }
 
     #[test]
@@ -960,13 +1499,24 @@ mod tests {
     }
 
     #[test]
-    fn test_sniff_rejects_minified_js() {
-        let dir = std::env::temp_dir().join("turbomerger_test_minified");
-        let _ = std::fs::create_dir_all(&dir);
-        let file_path = dir.join("bundle.xyz");
-        std::fs::write(&file_path, "a".repeat(5000).as_bytes()).unwrap();
-        assert!(!sniff_file_content(&file_path).unwrap());
-        let _ = std::fs::remove_dir_all(&dir);
+    fn test_sniff_is_validity_first() {
+        // N-04: one long line (a notebook's embedded image, generated JSON) and
+        // mostly-high-byte UTF-8 (CJK subtitles) are text, not binary.
+        let dir = tempfile::tempdir().unwrap();
+        let long = dir.path().join("bundle.xyz");
+        std::fs::write(&long, "a".repeat(5000).as_bytes()).unwrap();
+        assert!(sniff_file_content(&long).unwrap());
+        let cjk = dir.path().join("lecture.sub");
+        std::fs::write(&cjk, "这是一个关于机器学习的讲座字幕示例。\n".repeat(50)).unwrap();
+        assert!(sniff_file_content(&cjk).unwrap());
+        let magic = dir.path().join("MZ80_notes.txt2");
+        std::fs::write(&magic, "MZ-80 emulator notes\nThis is plain text.\n").unwrap();
+        assert!(sniff_file_content(&magic).unwrap());
+        // Invalid UTF-8 full of control bytes is still binary.
+        let bin = dir.path().join("blob.xyz");
+        let data: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8 | 0x80).collect();
+        std::fs::write(&bin, [&[0x01u8, 0x02, 0x03][..], &data].concat()).unwrap();
+        assert!(!sniff_file_content(&bin).unwrap());
     }
 
     #[test]

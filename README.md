@@ -119,8 +119,15 @@ timestamped Markdown, Claude XML, XML, JSON, or plain-text snapshot containing:
 - every included text file in collision-safe fences;
 - exact `o200k_base` token counts and context-window hints;
 - optional token-budget splitting and signature-only compression;
-- optional Git diff and recent-commit context; and
-- a merge report explaining every included, skipped, unreadable, or redacted file.
+- optional Git diff (of the merged files only) and recent-commit context; and
+- a merge report that accounts for every input: what was **not captured**
+  (documents and photos without an extractor yet, files too large, unreadable),
+  what was skipped on purpose, which directories were not scanned (with file
+  counts), and how many entries each ignore rule hid.
+
+Split outputs carry the full tree and a contents list with part numbers in
+part 1, the report once, and every part within the token budget. Headers name
+the source folder, never your absolute home path (`--show-source-path` opts in).
 
 ## Highlights
 
@@ -131,14 +138,20 @@ timestamped Markdown, Claude XML, XML, JSON, or plain-text snapshot containing:
 - **Curate before merge** — tri-state file tree, token treemap, saved per-project
   selections, and explicit rescue of skipped files.
 - **Remote repository packing** — shallow-clones GitHub/GitLab URLs or
-  `owner/repo` shorthand into a self-cleaning temporary directory.
+  `gh:owner/repo` into a self-cleaning temporary directory (Git LFS skipped,
+  5-minute timeout; a private-repo token travels in an HTTP header, never in the
+  URL or the clone's config).
 - **Compression and repo maps** — tree-sitter signatures plus a ranked,
   budget-aware Aider-style repository map.
 - **Watch mode** — debounced regeneration while ignoring Git state, Finder
   metadata, TurboMerger backups, and TurboMerger's own output.
 - **Apply-back** — paste a fenced-file response, cxml response, or unified diff;
   preview per-file changes, accept only what you want, create backups, and restore.
-- **CLI and MCP** — headless merge/map/apply commands and an MCP stdio server.
+  Files inside `.git` are never written; CI pipelines, git-hook managers, editor
+  and coding-agent settings, and build manifests need an explicit per-file
+  confirmation; symlinks are never followed; files keep their encoding.
+- **CLI and MCP** — headless merge/map/apply/explain commands and an MCP stdio
+  server confined to the folders you share with it.
 
 ## Use the desktop app
 
@@ -152,16 +165,36 @@ timestamped Markdown, Claude XML, XML, JSON, or plain-text snapshot containing:
 ## CLI
 
 ```text
-turbomerger merge <src|owner/repo|URL> [out]
-    [--format md|xml|cxml|json|plain] [--ordering path|entry-first|important-last]
-    [--max-tokens N] [--include GLOB] [--exclude GLOB]
-    [--compress] [--strip-comments] [--git-diff] [--git-log N] [--emit-skill]
-    [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--quiet]
-turbomerger map <src|owner/repo|URL> [out] [--tokens N]
-turbomerger mcp
+turbomerger merge <folder|URL|gh:owner/repo> [out]
+    [--format markdown|xml|cxml|json|plain] [--ordering path|entry-first|important-last]
+    [--max-tokens N] [--include GLOB] [--exclude GLOB] [--config FILE] [--max-file-size MB]
+    [--compress] [--strip-comments] [--git-diff] [--git-log [N]] [--emit-skill]
+    [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv]
+    [--show-source-path] [--fail-on-skip] [--quiet]
+turbomerger map <folder|URL|gh:owner/repo> [out] [--tokens N]
+turbomerger explain <folder> <path>          # why is this path (not) in the merge?
 turbomerger apply <root> --from reply.md [--yes]
+    [--allow-control GLOB] [--allow-manifest GLOB] [--allow-exec]
 turbomerger apply <root> --restore
+turbomerger mcp [--root DIR]... [--output-dir DIR] [--allow-remote]
+turbomerger completions bash|zsh|fish|powershell|elvish
+turbomerger --help | --version
 ```
+
+Arguments are validated strictly: a typo or a bad number is a usage error
+(exit 2) and nothing is written. A bare `owner/repo` is a local path; write
+`gh:owner/repo` to clone from GitHub.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | complete — everything found was merged or excluded on purpose |
+| 1 | error |
+| 2 | usage error |
+| 3 | completed, but some content was **not captured** (or nothing merged, or any skip with `--fail-on-skip`); `apply`: some proposals were held or refused |
+
+The one-line summary on stdout is
+`merged=N scan_skipped=N merge_skipped=N redacted=N tokens_o200k=N parts=N not_captured=N`
+followed by one `out=<path>` line per output file.
 
 After a source build on Apple Silicon, the binary is at
 `src-tauri/target/aarch64-apple-darwin/release/turbomerger`. Private remote
@@ -189,14 +222,24 @@ UI values take precedence. Use `.turbomergerignore` for path rules.
 
 ## Security model
 
-- The walker does not follow symlinks/junctions, and broad operating-system roots
-  are rejected. Normal macOS projects under `/Users`, external volumes, and safe
-  temporary descendants remain usable.
+- The walker does not follow symlinks/junctions (links to files inside the root
+  are merged once; every other link is listed), and broad operating-system roots
+  are rejected. Normal macOS projects under `/Users`, external volumes, Linux
+  `/run/media/…` drives and `/run/user/<uid>/…` mounts remain usable.
 - Sensitive files and credential-dense data files are never merged. Selected
   credential documents may be read harvest-only so their values can be redacted
   if echoed elsewhere; their contents are discarded.
-- Apply-back is dry-run first, confines paths to the selected root, refuses binary
-  targets and deletions, checks for on-disk changes, and creates restorable backups.
+- Apply-back is dry-run first and does all I/O through directory handles: a
+  symlink anywhere on a path is refused, never followed. It never writes inside
+  `.git`, holds control files and build manifests for explicit confirmation,
+  refuses executable targets unless `--allow-exec`, keeps each file's encoding
+  byte-for-byte, refuses binary targets, deletions and `[REDACTED]` placeholders,
+  checks for on-disk changes, and creates backups that only this machine can
+  restore from.
+- The MCP server packs only folders under its `--root` directories, writes only to
+  its own outputs folder, and needs `--allow-remote` for remote repositories.
+- Merged file contents are marked as untrusted data, and content that could forge
+  an output delimiter is escaped (cxml) or cannot match it (plain).
 - The WebView has a strict Content Security Policy and no generic filesystem plugin.
 
 No automatic redactor is perfect. Review generated output before uploading it,
@@ -210,7 +253,7 @@ npm ci
 npm run check          # versions, ESLint, both TypeScript configs, frontend build
 npm run format:check   # rustfmt check
 npm run clippy         # warnings are errors
-npm run test:rust      # 94+ Rust unit/integration tests
+npm run test:rust      # 150+ Rust unit/integration tests
 npm run tauri:dev      # desktop development mode
 ```
 
@@ -223,16 +266,20 @@ produce a draft release through a single publisher job; see
 
 ```text
 src/                         React/TypeScript UI
-src-tauri/src/commands.rs    Tauri commands, CLI, watch mode
+src-tauri/src/commands.rs    Tauri commands, watch mode, shared job setup
+src-tauri/src/cli.rs         headless CLI (clap) and the exit-code contract
 src-tauri/src/scanner/       gitignore-aware classification
 src-tauri/src/security/      path policy, sensitive-file rules, redaction
 src-tauri/src/merger/        decode/redact/format/report pipeline
 src-tauri/src/compress/      tree-sitter signature compression
 src-tauri/src/repomap/       definition/reference ranking
 src-tauri/src/remote/        shallow remote clones
-src-tauri/src/applyback/     preview/apply/backup/restore
+src-tauri/src/applyback/     preview/apply/backup/restore, path policy, handle-relative I/O
 src-tauri/src/mcp/           MCP stdio server
-src-tauri/tests/             end-to-end Rust fixtures
+src-tauri/tests/             end-to-end Rust fixtures (the audit repros as tests)
+fixtures/                    repro scripts, pinned corpora (payloads local-only)
+prototypes/                  reference oracles for the document and photo pipelines
+docs/adr/                    architecture decision records
 ```
 
 ## License

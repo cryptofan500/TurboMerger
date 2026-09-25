@@ -786,3 +786,83 @@ fn compress_elides_bodies_and_strip_removes_comments() {
         "merge report must note compression"
     );
 }
+
+#[test]
+fn git_diff_covers_only_the_merged_files() {
+    // v1 N-24: `git diff HEAD` covered the whole repository — including files
+    // the merge excluded (credential-dense notes, a deleted .env) and files
+    // outside the scanned sub-folder.
+    let git = |root: &Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let sub = repo.join("app");
+    fs::create_dir_all(&sub).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "tester"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    fs::write(sub.join("main.rs"), "fn main() {}\n").unwrap();
+    fs::write(sub.join("notes.md"), "# notes\n").unwrap();
+    fs::write(sub.join(".env"), "A=1\n").unwrap();
+    fs::write(repo.join("outside.rs"), "fn outside() {}\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "seed"]);
+
+    fs::write(sub.join("main.rs"), "fn main() { changed(); }\n").unwrap();
+    fs::write(
+        sub.join("notes.md"),
+        "# notes\ngmail: alice@corp-mail.net | Hunter2Hunter2!\nbob@wp-post.org : Sup3rS3cret99\n",
+    )
+    .unwrap();
+    fs::remove_file(sub.join(".env")).unwrap();
+    fs::write(repo.join("outside.rs"), "fn outside() { changed(); }\n").unwrap();
+
+    let scan = scan_text_files(&sub, &ScanOptions::default()).unwrap();
+    let out = tmp.path().join("diff.md");
+    let cancel = AtomicBool::new(false);
+    let cfg = MergeConfig {
+        git_diff: true,
+        ..MergeConfig::default()
+    };
+    merge_files_with_progress(
+        &sub,
+        &scan.files,
+        &out,
+        &cfg,
+        &cancel,
+        |_, _, _| {},
+        &scan.skipped,
+    )
+    .unwrap();
+    let text = fs::read_to_string(&out).unwrap();
+    let diff = text
+        .split("## GIT DIFF (working tree vs HEAD)")
+        .nth(1)
+        .expect("diff section");
+    let diff = diff.split("## Merge Report").next().unwrap();
+    assert!(diff.contains("changed();"), "merged file's change present");
+    assert!(
+        !diff.contains("Hunter2Hunter2"),
+        "excluded notes leaked via the diff"
+    );
+    assert!(!diff.contains("A=1"), "deleted .env leaked via the diff");
+    assert!(
+        !diff.contains("fn outside"),
+        "file outside the scanned folder leaked"
+    );
+    assert!(text.contains("`GIT DIFF: notes.md` — diff section omitted"));
+    assert!(text.contains("`GIT DIFF: .env` — diff section omitted"));
+}

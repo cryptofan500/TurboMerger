@@ -57,9 +57,29 @@ chardetng = "1.0.0"
 tempfile = "3"
 # Apply-back diffs (T3-3)
 similar = "2"
+# Apply-back writes go through directory handles, never ambient paths (N-17).
+# >= 4.0.3: GHSA-hp8f-xmx4-4qrg (trailing-slash O_NOFOLLOW bypass, 2026-08-20).
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
+# Apply-back --allow-control / --allow-manifest globs (N-52)
+globset = "0.4"
+# One deterministic leftmost-longest pass for known-secret masking (N-13/N-14/N-35)
+aho-corasick = "1.1"
+# Strict CLI parsing (N-30)
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4.5"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
+# Win32_Foundation: GetFinalPathNameByHandleW (apply-back post-open verification)
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+# O_NONBLOCK for apply-back reads (a FIFO swapped in must not hang the preview)
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# F_GETPATH for apply-back post-open verification
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"

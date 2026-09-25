@@ -6,13 +6,25 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
-use turbomerger::applyback::{apply_files, build_preview, parse_reply, restore_last};
+use turbomerger::applyback::{
+    apply_files, build_preview, parse_reply, restore_last, ApplyPolicy, BuiltPreview, ParsedChange,
+};
 use turbomerger::merger::{merge_files_with_progress, MergeConfig, OutputFormat};
 use turbomerger::scanner::{scan_text_files, ScanOptions};
 
 struct Fixture {
     root: PathBuf,
     _tmp: tempfile::TempDir,
+}
+
+impl Fixture {
+    /// Default policy, with the trusted-backup record kept inside the temp dir.
+    fn policy(&self) -> ApplyPolicy {
+        ApplyPolicy::default().with_state_dir(self._tmp.path().join("state"))
+    }
+    fn preview(&self, changes: &[ParsedChange]) -> BuiltPreview {
+        build_preview(&self.root, changes, &self.policy()).expect("preview")
+    }
 }
 
 fn build_fixture() -> Fixture {
@@ -50,7 +62,7 @@ fn markdown_reply_applies_creates_and_restores() {
 
     let changes = parse_reply(reply);
     assert_eq!(changes.len(), 2);
-    let built = build_preview(&fx.root, &changes).expect("preview");
+    let built = fx.preview(&changes);
 
     // Preview is honest: one modify, one create, diffs counted.
     let main = &built.preview.files[0];
@@ -70,7 +82,7 @@ fn markdown_reply_applies_creates_and_restores() {
     assert!(!fx.root.join(".turbomerger").exists());
 
     // Apply: contents land, backup + manifest exist.
-    let outcome = apply_files(&fx.root, &built.ready).expect("apply");
+    let outcome = apply_files(&fx.root, &built.ready, &fx.policy()).expect("apply");
     assert_eq!(outcome.applied.len(), 2);
     assert!(outcome.failed.is_empty());
     assert!(fs::read_to_string(fx.root.join("src/main.rs"))
@@ -87,7 +99,7 @@ fn markdown_reply_applies_creates_and_restores() {
     assert!(backed.contains("one"), "backup holds the original");
 
     // Restore: original back, created file gone.
-    let restore = restore_last(&fx.root).expect("restore");
+    let restore = restore_last(&fx.root, &fx.policy()).expect("restore");
     assert_eq!(restore.restored, vec!["src/main.rs".to_string()]);
     assert_eq!(restore.deleted, vec!["docs/new_guide.md".to_string()]);
     assert!(fs::read_to_string(fx.root.join("src/main.rs"))
@@ -122,7 +134,7 @@ fn own_markdown_output_round_trips_as_identical() {
         "all merged sections should parse: got {}",
         changes.len()
     );
-    let built = build_preview(&fx.root, &changes).expect("preview");
+    let built = fx.preview(&changes);
     for f in &built.preview.files {
         assert!(f.ok, "{}: {}", f.rel_path, f.note);
         assert!(
@@ -169,7 +181,7 @@ fn own_cxml_output_round_trips_as_identical() {
         !changes.iter().any(|c| c.path.contains("MERGE_INFO")),
         "synthetic MERGE_INFO document must be skipped"
     );
-    let built = build_preview(&fx.root, &changes).expect("preview");
+    let built = fx.preview(&changes);
     for f in &built.preview.files {
         assert!(
             f.ok && f.identical,
@@ -199,14 +211,14 @@ fn unified_diff_modifies_and_dev_null_creates() {
 ";
     let changes = parse_reply(reply);
     assert_eq!(changes.len(), 2);
-    let built = build_preview(&fx.root, &changes).expect("preview");
+    let built = fx.preview(&changes);
     assert!(
         built.preview.files.iter().all(|f| f.ok),
         "{:?}",
         built.preview.files
     );
 
-    let outcome = apply_files(&fx.root, &built.ready).expect("apply");
+    let outcome = apply_files(&fx.root, &built.ready, &fx.policy()).expect("apply");
     assert_eq!(outcome.applied.len(), 2);
     let lib = fs::read_to_string(fx.root.join("src/lib.rs")).unwrap();
     assert!(lib.contains("a.wrapping_add(b)"), "{}", lib);
@@ -219,9 +231,9 @@ fn crlf_file_keeps_crlf_through_full_replacement() {
     let fx = build_fixture();
     // LLM replies come back LF-only; the CRLF original must stay CRLF.
     let reply = "## win.txt\n\n```\nalpha\ngamma\n```\n";
-    let built = build_preview(&fx.root, &parse_reply(reply)).expect("preview");
+    let built = fx.preview(&parse_reply(reply));
     assert!(built.preview.files[0].ok);
-    apply_files(&fx.root, &built.ready).expect("apply");
+    apply_files(&fx.root, &built.ready, &fx.policy()).expect("apply");
     let bytes = fs::read(fx.root.join("win.txt")).unwrap();
     let text = String::from_utf8(bytes).unwrap();
     assert_eq!(text, "alpha\r\ngamma\r\n");
@@ -242,7 +254,7 @@ fn safety_rails_traversal_binary_delete() {
 ";
     let changes = parse_reply(reply);
     assert_eq!(changes.len(), 3);
-    let built = build_preview(&fx.root, &changes).expect("preview");
+    let built = fx.preview(&changes);
     let by_path = |p: &str| {
         built
             .preview
@@ -272,13 +284,13 @@ fn changed_on_disk_fails_that_file_only() {
     let fx = build_fixture();
     let reply = "## src/main.rs\n\n```rust\nfn main() { println!(\"three\"); }\n```\n\n\
 ## README.md\n\n```\n# Fixture\n\nnew docs\n```\n";
-    let built = build_preview(&fx.root, &parse_reply(reply)).expect("preview");
+    let built = fx.preview(&parse_reply(reply));
     assert_eq!(built.ready.len(), 2);
 
     // Someone edits main.rs between preview and apply.
     fs::write(fx.root.join("src/main.rs"), "fn main() { /* raced */ }\n").unwrap();
 
-    let outcome = apply_files(&fx.root, &built.ready).expect("apply");
+    let outcome = apply_files(&fx.root, &built.ready, &fx.policy()).expect("apply");
     assert_eq!(outcome.applied, vec!["README.md".to_string()]);
     assert_eq!(outcome.failed.len(), 1);
     assert_eq!(outcome.failed[0].rel_path, "src/main.rs");
@@ -299,10 +311,10 @@ fn chained_changes_to_one_file_fold_in_order() {
 -step one\n\
 +step two\n\
 ";
-    let built = build_preview(&fx.root, &parse_reply(reply)).expect("preview");
+    let built = fx.preview(&parse_reply(reply));
     assert_eq!(built.preview.files.len(), 1, "one file, one preview card");
     assert_eq!(built.ready.len(), 1);
-    apply_files(&fx.root, &built.ready).expect("apply");
+    apply_files(&fx.root, &built.ready, &fx.policy()).expect("apply");
     assert_eq!(
         fs::read_to_string(fx.root.join("README.md")).unwrap(),
         "step two\n"

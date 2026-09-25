@@ -13,6 +13,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+pub mod masking;
+
 /// Windows file attribute for reparse points (junctions/symlinks)
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -41,6 +43,22 @@ const BLOCKED_ROOT_DIRS: &[&str] = &[
 const BLOCKED_ROOT_DIRS: &[&str] = &[
     "usr", "bin", "sbin", "dev", "etc", "proc", "sys", "run", "boot", "lib", "lib64",
 ];
+
+/// `/run` holds system state, but also every removable drive on
+/// Fedora/Arch/openSUSE (`/run/media/$USER/<volume>`) and every GNOME/GVFS
+/// mount — SMB shares, phones over MTP, Google Drive
+/// (`/run/user/$UID/gvfs/…`). Those two subtrees are user data (N-08).
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn is_allowed_run_path(canonical: &Path) -> bool {
+    let comps: Vec<String> = canonical
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    comps.len() >= 4 && comps[0] == "run" && (comps[1] == "media" || comps[1] == "user")
+}
 
 #[derive(Debug)]
 pub enum SecurityError {
@@ -152,7 +170,9 @@ pub fn normalize_to_long_path(path: &Path) -> Result<PathBuf, SecurityError> {
     Ok(path.to_path_buf())
 }
 
-/// Unicode NFKC normalization before validation
+/// Unicode NFKC normalization — for comparisons and display only. Never
+/// apply it to a path used for I/O: `ＡＢＣ` and NFD `café` are real,
+/// different names on disk (N-09).
 pub fn normalize_unicode(input: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     input.nfkc().collect()
@@ -196,11 +216,12 @@ fn is_blocked_macos_path(canonical: &Path) -> bool {
         .any(|prefix| canonical.starts_with(*prefix))
 }
 
-/// Validates a scan root: unicode-normalized, reparse-point-free, canonical,
-/// long-named, and outside protected operating-system roots.
+/// Validates a scan root: reparse-point-free, canonical, long-named, and
+/// outside protected operating-system roots. The path is used exactly as
+/// given — v7.7.0 NFKC-normalized it first, so folders with full-width or
+/// NFD names failed with "No such file or directory" (N-09).
 pub fn validate_and_canonicalize(path: &str) -> Result<PathBuf, SecurityError> {
-    let normalized_input = normalize_unicode(path);
-    let path = PathBuf::from(&normalized_input);
+    let path = PathBuf::from(path);
 
     if has_reparse_point_in_path(&path)? {
         return Err(SecurityError::ReparsePointDetected);
@@ -227,6 +248,10 @@ pub fn validate_and_canonicalize(path: &str) -> Result<PathBuf, SecurityError> {
         .find(|c| matches!(c, Component::Normal(_)))
     {
         let s = first.to_string_lossy().to_lowercase();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if is_allowed_run_path(&long_path) {
+            return Ok(long_path);
+        }
         if BLOCKED_ROOT_DIRS.contains(&s.as_str()) {
             return Err(SecurityError::SystemPathBlocked);
         }
@@ -369,9 +394,26 @@ const BINARY_SIGNATURES: &[&[u8]] = &[
     b"\x00asm",          // WebAssembly
 ];
 
-/// Enhanced binary detection with magic bytes
+/// True when `data` (a sniff window) is well-formed UTF-8 without NULs —
+/// a multi-byte character cut by the window edge is tolerated.
+pub fn is_valid_text_window(data: &[u8]) -> bool {
+    if data.contains(&0) {
+        return false;
+    }
+    match std::str::from_utf8(data) {
+        Ok(_) => true,
+        // `error_len() == None`: the only problem is an incomplete sequence
+        // at the very end — the window cut a character in half.
+        Err(e) => e.error_len().is_none() && data.len() - e.valid_up_to() < 4,
+    }
+}
+
+/// Binary detection: validity first, then magic bytes and byte statistics.
+/// Well-formed UTF-8 is text even when it happens to start with a magic
+/// number — v7.7.0 dropped `MZ-80 emulator notes` and `BZ-1234 ticket`
+/// Markdown files as executables/archives (N-04).
 pub fn is_binary_content(data: &[u8]) -> bool {
-    if data.is_empty() {
+    if data.is_empty() || is_valid_text_window(data) {
         return false;
     }
 
@@ -806,8 +848,15 @@ fn trim_token(raw: &str) -> &str {
     })
 }
 
+/// Minimum length of an unlabeled (dense-file) token worth masking repo-wide.
+/// Shorter opaque strings collide with ordinary words and identifiers.
+const DENSE_TOKEN_MIN_LEN: usize = 12;
+
 fn consider_dense_token(token: &str, out: &mut Vec<String>) {
-    if token.len() < 8 || token.contains("://") {
+    if token.len() < DENSE_TOKEN_MIN_LEN || token.contains("://") {
+        return;
+    }
+    if looks_like_citation_id(token) {
         return;
     }
     // Slashes usually mean a path — but base64 material legitimately contains
@@ -827,6 +876,27 @@ fn consider_dense_token(token: &str, out: &mut Vec<String>) {
     if labeled_value_is_secret(token) {
         out.push(token.to_string());
     }
+}
+
+/// arXiv identifiers and DOIs have letters, digits and punctuation — the
+/// secret shape — but are citations, never credentials (N-13: `(2023)
+/// arXiv:2210.03629.` became `(2023) [REDACTED].`).
+fn looks_like_citation_id(t: &str) -> bool {
+    static CITATION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^(?:arxiv:)?(?:\d{4}\.\d{4,5}(?:v\d+)?|[a-z.-]+/\d{7}(?:v\d+)?)$|^(?:doi:)?10\.\d{4,9}/\S+$")
+            .expect("citation id regex")
+    });
+    CITATION.is_match(t)
+}
+
+/// True for a credential DUMP (a login list, a creds note), as opposed to a
+/// long document that trips the density rule with a couple of lines (an
+/// arXiv paper's author e-mails, a guide mentioning passwords). Only dumps
+/// contribute their unlabeled tokens to repo-wide masking: at least one line
+/// in ten must be a credential indicator.
+pub fn is_credential_dump(content: &str, indicators: usize) -> bool {
+    let lines = content.lines().filter(|l| !l.trim().is_empty()).count();
+    indicators >= CREDENTIAL_DENSITY_THRESHOLD && indicators * 10 >= lines
 }
 
 /// Version strings and date/timestamps have letters+digits+specials but are
@@ -1101,6 +1171,40 @@ mod tests {
     }
 
     #[test]
+    fn run_media_and_user_mounts_are_user_data() {
+        for ok in [
+            "/run/media/pawel/USB",
+            "/run/media/pawel/USB/project",
+            "/run/user/1000/gvfs/smb-share:server=nas,share=code",
+            "/run/user/1000/tm_probe",
+        ] {
+            assert!(is_allowed_run_path(Path::new(ok)), "{ok}");
+        }
+        for blocked in [
+            "/run",
+            "/run/media",
+            "/run/media/pawel",
+            "/run/user/1000",
+            "/run/systemd/journal",
+            "/run/lock/x/y",
+        ] {
+            assert!(!is_allowed_run_path(Path::new(blocked)), "{blocked}");
+        }
+    }
+
+    #[test]
+    fn unicode_folder_names_are_used_as_given() {
+        // v1 A.7: full-width and NFD names failed after NFKC normalization.
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["ＡＢＣ_fullwidth", "cafe\u{301}_nfd"] {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let got = validate_and_canonicalize(&dir.to_string_lossy()).expect(name);
+            assert_eq!(got.file_name().unwrap().to_string_lossy(), name);
+        }
+    }
+
+    #[test]
     fn macos_system_path_policy_is_precise() {
         for blocked in [
             "/",
@@ -1277,6 +1381,40 @@ mod tests {
             "backtick-wrapped uuid not un-wrapped: {:?}",
             toks3
         );
+    }
+
+    #[test]
+    fn citation_ids_and_short_tokens_are_never_dense_secrets() {
+        let text = "see arXiv:2210.03629 and doi:10.1145/3571730.3571731 or 2608.31006v2 hep-th/9901001\nkey svcKey-Zx9Kq2Mv7Rt4Lp and short Ab12cd34!x\n";
+        let toks = harvest_dense_file_tokens(text);
+        assert_eq!(
+            toks,
+            vec!["svcKey-Zx9Kq2Mv7Rt4Lp".to_string()],
+            "{:?}",
+            toks
+        );
+    }
+
+    #[test]
+    fn dump_ratio_separates_login_lists_from_long_documents() {
+        let dump =
+            "# logins\npassword: Vr7wKp2walKotwica91\nzbig77@wp-post.org:Tr4mwaj9Nocny88\nnotes\n";
+        let n = credential_indicator_count(dump);
+        assert!(is_credential_dump(dump, n), "{n}");
+        let mut paper =
+            String::from("alice@uni.edu | Department of Physics\nbob@uni.edu : Institute 42x\n");
+        for i in 0..200 {
+            paper.push_str(&format!(
+                "Line {} of an ordinary paper about token budgets.\n",
+                i
+            ));
+        }
+        let n = credential_indicator_count(&paper);
+        assert!(
+            n >= CREDENTIAL_DENSITY_THRESHOLD,
+            "fixture must trip the density rule: {n}"
+        );
+        assert!(!is_credential_dump(&paper, n));
     }
 
     #[test]

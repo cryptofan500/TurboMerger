@@ -11,18 +11,37 @@
 //!   are ignored.
 //! - Unified diffs (`--- a/x` / `+++ b/x` with `@@` hunks), fenced or bare.
 //!
-//! Safety rails: proposals can never escape the target root (lexical check —
-//! new files can't canonicalize), binary targets are refused, deletions are
-//! surfaced but never executed, nothing is written at parse/preview time,
-//! and every apply first copies originals to
-//! `<root>/.turbomerger/backups/<UTC>/files/<rel>` plus a manifest that
-//! `restore_last` reverses. `.turbomerger/` is in the scanner's always-skip
-//! set so backups never re-merge.
+//! Safety rails (the reply is untrusted input):
+//! - all I/O goes through directory handles (`safe_fs`): a symlink or
+//!   junction anywhere on a path is refused, never followed, and replacements
+//!   are temp-file + rename inside the same directory handle (N-17);
+//! - a path policy (`policy`) refuses `.git` internals outright, and writes
+//!   control files (hooks, CI, editor/agent auto-run settings) and build
+//!   manifests only after explicit per-file permission (N-52);
+//! - files that are executable today are refused unless allowed; created
+//!   files never get an executable bit;
+//! - targets keep their encoding, BOM and line endings byte-for-byte, or are
+//!   refused (`encoding`, N-15);
+//! - binary targets, deletions, `[REDACTED]` placeholders that would
+//!   overwrite real values, and case-only name collisions are refused;
+//! - nothing is written at parse/preview time; every apply first copies the
+//!   originals to `<root>/.turbomerger/backups/<UTC>/files/<rel>` plus a
+//!   manifest that `restore_last` reverses — and restore only honours
+//!   backups this machine recorded, so a `.turbomerger/` directory shipped
+//!   inside a cloned repo cannot plant files. `.turbomerger/` is in the
+//!   scanner's always-skip set so backups never re-merge.
+
+pub mod encoding;
+pub mod policy;
+pub mod safe_fs;
 
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+pub use policy::{ApplyPolicy, PathClass};
+use safe_fs::{RelPath, SafeRoot};
 
 // ============================================================================
 // PARSED CHANGES
@@ -89,6 +108,16 @@ pub struct PreviewFile {
     pub dels: usize,
     pub diff: Vec<DiffLine>,
     pub diff_truncated: bool,
+    /// "code" | "manifest" | "control" | "forbidden" (see `policy`).
+    pub class: &'static str,
+    /// Why the class matters, e.g. "CI workflow — runs on push".
+    pub class_reason: String,
+    /// Appliable, but only after an explicit per-file confirmation.
+    pub needs_confirm: bool,
+    /// Encoding the change is written in ("UTF-8", "windows-1252", …).
+    pub encoding: String,
+    /// Mode handling worth knowing before applying (exec bit, hard links).
+    pub mode_note: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,8 +131,13 @@ pub struct Preview {
 pub struct ReadyFile {
     pub rel_path: String,
     pub new_content: String,
+    /// `new_content` encoded in the target's own encoding (and BOM).
+    pub new_bytes: Vec<u8>,
     /// Hash of the on-disk bytes at preview time; None = file must not exist.
     pub base_hash: Option<u64>,
+    pub class: PathClass,
+    /// True when the preview's policy did not already permit it.
+    pub needs_confirm: bool,
 }
 
 #[derive(Debug)]
@@ -130,6 +164,8 @@ pub struct RestoreOutcome {
     pub backup_dir: String,
     pub restored: Vec<String>,
     pub deleted: Vec<String>,
+    /// Entries left alone (edited since the apply, unsafe path, …).
+    pub skipped: Vec<ApplyFailure>,
 }
 
 /// Cap on preview diff lines sent to the UI per file.
@@ -466,6 +502,19 @@ fn hunk_header(line: &str) -> Option<(usize, usize, usize, usize)> {
     Some((os, oc, ns, nc))
 }
 
+const CXML_ESCAPED_OPENER: &str = "<document_contents escaped=\"xml\">";
+
+/// Inverse of the merger's `xml_escape` (`&amp;` last, so `&amp;lt;` → `&lt;`).
+fn xml_unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
+}
+
 /// cxml `<source>path</source>…<document_contents>` pairs outside fences.
 /// `raw_lines` keep original `\r`s for body capture (see `parse_reply`).
 fn parse_cxml(
@@ -491,16 +540,22 @@ fn parse_cxml(
             i += 1;
             continue;
         };
-        let path = path.trim().to_string();
-        // Find the contents opener within the next couple of lines.
+        let path = xml_unescape(path.trim());
+        // Find the contents opener within the next couple of lines. Content
+        // that contained `</document` was XML-escaped by the merger (N-20).
+        let is_opener = |l: &str| {
+            let t = l.trim();
+            t == "<document_contents>" || t == CXML_ESCAPED_OPENER
+        };
         let mut j = i + 1;
-        while j < lines.len() && j <= i + 3 && lines[j].trim() != "<document_contents>" {
+        while j < lines.len() && j <= i + 3 && !is_opener(lines[j]) {
             j += 1;
         }
-        if j >= lines.len() || lines[j].trim() != "<document_contents>" {
+        if j >= lines.len() || !is_opener(lines[j]) {
             i += 1;
             continue;
         }
+        let escaped = lines[j].trim() == CXML_ESCAPED_OPENER;
         let body_start = j + 1;
         let mut k = body_start;
         while k < lines.len() && lines[k].trim() != "</document_contents>" {
@@ -520,6 +575,9 @@ fn parse_cxml(
             let mut content = body.join("\n");
             if !content.is_empty() {
                 content.push('\n');
+            }
+            if escaped {
+                content = xml_unescape(&content);
             }
             out.push(ParsedChange {
                 path: path.replace('\\', "/"),
@@ -636,35 +694,6 @@ fn match_line_endings(new: &str, original: &str) -> String {
 // PREVIEW (dry-run — no writes)
 // ============================================================================
 
-/// Join a proposal path under `root`, refusing anything that could escape it.
-/// Lexical (component-based) because created files can't canonicalize yet.
-fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let rel = rel.trim();
-    if rel.is_empty() {
-        return Err("empty path".into());
-    }
-    // ':' rejects drive letters and NTFS alternate data streams in one go.
-    if rel.contains(':') {
-        return Err("absolute or drive-qualified paths are not allowed".into());
-    }
-    let p = Path::new(rel);
-    if p.is_absolute() || rel.starts_with('/') || rel.starts_with('\\') {
-        return Err("absolute paths are not allowed".into());
-    }
-    let mut clean = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            Component::Normal(c) => clean.push(c),
-            Component::CurDir => {}
-            _ => return Err("path escapes the target root".into()),
-        }
-    }
-    if clean.as_os_str().is_empty() {
-        return Err("empty path".into());
-    }
-    Ok(root.join(clean))
-}
-
 /// FNV-1a 64 over raw bytes — change detection between preview and apply.
 fn content_hash(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -675,42 +704,82 @@ fn content_hash(bytes: &[u8]) -> u64 {
     h
 }
 
+/// What a proposal's target looks like on disk (decoded for editing).
+#[derive(Clone)]
 struct DiskState {
     exists: bool,
-    binary: bool,
     content: String,
+    encoding: encoding::TextEncoding,
     hash: u64,
+    info: Option<safe_fs::FileInfo>,
 }
 
-fn read_disk(target: &Path) -> Result<DiskState, String> {
-    if !target.exists() {
-        return Ok(DiskState {
+impl DiskState {
+    fn missing() -> Self {
+        DiskState {
             exists: false,
-            binary: false,
             content: String::new(),
+            encoding: encoding::TextEncoding::Utf8 { bom: false },
             hash: 0,
-        });
+            info: None,
+        }
     }
-    if target.is_dir() {
-        return Err("target is a directory".into());
-    }
-    let bytes = std::fs::read(target).map_err(|e| format!("unreadable: {}", e))?;
-    let check = 8192.min(bytes.len());
-    let binary = crate::security::is_binary_content(&bytes[..check]);
-    Ok(DiskState {
-        exists: true,
-        binary,
-        content: String::from_utf8_lossy(&bytes).into_owned(),
-        hash: content_hash(&bytes),
-    })
 }
 
-/// Resolve proposals against the working tree: validate paths, apply diffs,
-/// compute per-file previews. Dry-run — reads only.
-pub fn build_preview(root: &Path, changes: &[ParsedChange]) -> Result<BuiltPreview, String> {
+/// The OS-reported path must be the requested one. On case-insensitive
+/// volumes a case variant (or a Windows 8.3 short name) opens a file whose
+/// real name differs — refuse, so the preview always names the real file.
+fn check_resolved(rel: &RelPath, resolved: Option<String>) -> Result<(), String> {
+    use unicode_normalization::UnicodeNormalization;
+    let Some(r) = resolved else { return Ok(()) };
+    let want = rel.display();
+    if r == want || r.nfc().eq(want.nfc()) {
+        return Ok(());
+    }
+    Err(format!(
+        "resolves to `{}` on disk — use the exact on-disk name",
+        r
+    ))
+}
+
+fn load_target(sr: &SafeRoot, rel: &RelPath) -> Result<DiskState, String> {
+    match sr.read(rel)? {
+        None => {
+            if let Some(other) = sr.case_variant(rel)? {
+                return Err(format!(
+                    "differs only by case from existing `{}` — use the exact name (a repo with both breaks on macOS/Windows)",
+                    other
+                ));
+            }
+            Ok(DiskState::missing())
+        }
+        Some((bytes, info, resolved)) => {
+            check_resolved(rel, resolved)?;
+            let (content, enc) = encoding::decode_for_edit(&bytes)?;
+            Ok(DiskState {
+                exists: true,
+                content,
+                encoding: enc,
+                hash: content_hash(&bytes),
+                info: Some(info),
+            })
+        }
+    }
+}
+
+const REDACTED: &str = "[REDACTED]";
+
+/// Resolve proposals against the working tree: validate paths, classify
+/// them, apply diffs, encode, compute per-file previews. Dry-run — reads only.
+pub fn build_preview(
+    root: &Path,
+    changes: &[ParsedChange],
+    policy: &ApplyPolicy,
+) -> Result<BuiltPreview, String> {
+    let sr = SafeRoot::open(root)?;
+
     // Fold changes per path in document order (later ones chain on earlier).
     struct Slot {
-        first_order: usize,
         result: Result<(String, DiskState), String>, // (proposed content, disk)
         is_delete: bool,
     }
@@ -718,45 +787,35 @@ pub fn build_preview(root: &Path, changes: &[ParsedChange]) -> Result<BuiltPrevi
     let mut order: Vec<String> = Vec::new();
 
     for ch in changes {
-        let rel = ch.path.trim_matches('/').to_string();
-        if !slots.contains_key(&rel) {
-            order.push(rel.clone());
+        let parsed = RelPath::parse(&ch.path);
+        let key = match &parsed {
+            Ok(r) => r.display(),
+            Err(_) => ch.path.clone(),
+        };
+        if !slots.contains_key(&key) {
+            order.push(key.clone());
         }
-        let slot = slots.entry(rel.clone()).or_insert_with(|| Slot {
-            first_order: ch.order,
+        let slot = slots.entry(key.clone()).or_insert_with(|| Slot {
             result: Err("unresolved".into()),
             is_delete: false,
         });
-        slot.first_order = slot.first_order.min(ch.order);
 
         if matches!(ch.body, ChangeBody::Delete) {
             slot.is_delete = true;
             continue;
         }
+        let rel = match &parsed {
+            Ok(r) => r.clone(),
+            Err(e) => {
+                slot.result = Err(e.clone());
+                continue;
+            }
+        };
         // (Re)resolve the base: prior proposed content, else disk.
         let base = match &slot.result {
-            Ok((content, disk)) => Ok((
-                content.clone(),
-                DiskState {
-                    exists: disk.exists,
-                    binary: disk.binary,
-                    content: disk.content.clone(),
-                    hash: disk.hash,
-                },
-            )),
-            Err(_) => match safe_join(root, &rel) {
-                Ok(target) => match read_disk(&target) {
-                    Ok(disk) => {
-                        if disk.binary {
-                            Err("refusing to modify a binary file".to_string())
-                        } else {
-                            Ok((disk.content.clone(), disk))
-                        }
-                    }
-                    Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
-            },
+            Ok((content, disk)) => Ok((content.clone(), disk.clone())),
+            Err(e) if e != "unresolved" => Err(e.clone()),
+            Err(_) => load_target(&sr, &rel).map(|disk| (disk.content.clone(), disk)),
         };
         slot.result = match base {
             Err(e) => Err(e),
@@ -766,78 +825,168 @@ pub fn build_preview(root: &Path, changes: &[ParsedChange]) -> Result<BuiltPrevi
                 // target file's endings.
                 ChangeBody::Full(c) if c.contains('\r') => Ok((c.clone(), disk)),
                 ChangeBody::Full(c) => Ok((match_line_endings(c, &disk.content), disk)),
-                ChangeBody::Diff(hunks) => match apply_hunks(&base_content, hunks) {
-                    Ok(next) => Ok((next, disk)),
-                    Err(e) => Err(e),
-                },
+                ChangeBody::Diff(hunks) => {
+                    apply_hunks(&base_content, hunks).map(|next| (next, disk))
+                }
                 ChangeBody::Delete => unreachable!(),
             },
         };
     }
 
+    // Two proposals that differ only by case are the same file on macOS and
+    // Windows: whichever wins would be an accident. Refuse both.
+    let mut by_fold: HashMap<String, Vec<String>> = HashMap::new();
+    for key in &order {
+        by_fold
+            .entry(key.to_lowercase())
+            .or_default()
+            .push(key.clone());
+    }
+    for group in by_fold.values().filter(|g| g.len() > 1) {
+        for key in group {
+            let other = group
+                .iter()
+                .find(|k| *k != key)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(slot) = slots.get_mut(key) {
+                slot.result = Err(format!(
+                    "differs only by case from `{}` in the same reply — ambiguous on macOS/Windows",
+                    other
+                ));
+                slot.is_delete = false;
+            }
+        }
+    }
+
     let mut files: Vec<PreviewFile> = Vec::new();
     let mut ready: Vec<ReadyFile> = Vec::new();
 
-    for rel in order {
-        let slot = &slots[&rel];
+    for key in order {
+        let slot = &slots[&key];
+        let classified = policy::classify(&key);
+        let mut pf = PreviewFile {
+            rel_path: key.clone(),
+            action: "modify".into(),
+            ok: false,
+            note: String::new(),
+            identical: false,
+            adds: 0,
+            dels: 0,
+            diff: Vec::new(),
+            diff_truncated: false,
+            class: classified.class.as_str(),
+            class_reason: classified.reason.to_string(),
+            needs_confirm: false,
+            encoding: String::new(),
+            mode_note: String::new(),
+        };
         if slot.is_delete {
-            files.push(PreviewFile {
-                rel_path: rel,
-                action: "delete".into(),
-                ok: false,
-                note: "deletion proposals are shown but never executed — delete manually".into(),
-                identical: false,
-                adds: 0,
-                dels: 0,
-                diff: Vec::new(),
-                diff_truncated: false,
-            });
+            pf.action = "delete".into();
+            pf.note = "deletion proposals are shown but never executed — delete manually".into();
+            files.push(pf);
             continue;
         }
-        match &slot.result {
-            Err(e) => files.push(PreviewFile {
-                rel_path: rel,
-                action: "modify".into(),
-                ok: false,
-                note: e.clone(),
-                identical: false,
-                adds: 0,
-                dels: 0,
-                diff: Vec::new(),
-                diff_truncated: false,
-            }),
-            Ok((proposed, disk)) => {
-                let action = if disk.exists { "modify" } else { "create" };
-                let identical = disk.exists && *proposed == disk.content;
-                let (diff, adds, dels, truncated) = if identical {
-                    (Vec::new(), 0, 0, false)
-                } else {
-                    diff_lines(&disk.content, proposed)
-                };
-                if !identical {
-                    ready.push(ReadyFile {
-                        rel_path: rel.clone(),
-                        new_content: proposed.clone(),
-                        base_hash: disk.exists.then_some(disk.hash),
-                    });
-                }
-                files.push(PreviewFile {
-                    rel_path: rel,
-                    action: action.into(),
-                    ok: true,
-                    note: if identical {
-                        "no changes — already matches disk".into()
-                    } else {
-                        String::new()
-                    },
-                    identical,
-                    adds,
-                    dels,
-                    diff,
-                    diff_truncated: truncated,
-                });
-            }
+        if classified.class == PathClass::Forbidden {
+            pf.note = format!("refused: {}", classified.reason);
+            files.push(pf);
+            continue;
         }
+        let (proposed, disk) = match &slot.result {
+            Err(e) => {
+                pf.note = e.clone();
+                files.push(pf);
+                continue;
+            }
+            Ok(v) => v,
+        };
+        pf.action = if disk.exists { "modify" } else { "create" }.into();
+        pf.encoding = if disk.exists {
+            disk.encoding.label()
+        } else {
+            "UTF-8".into()
+        };
+        let identical = disk.exists && *proposed == disk.content;
+        if identical {
+            pf.ok = true;
+            pf.identical = true;
+            pf.note = "no changes — already matches disk".into();
+            files.push(pf);
+            continue;
+        }
+
+        // Placeholders from a redacted merge would overwrite the real values.
+        let placeholders_added =
+            proposed.matches(REDACTED).count() > disk.content.matches(REDACTED).count();
+        if placeholders_added {
+            pf.note = format!(
+                "the proposal contains {} placeholders from a redacted merge — applying would overwrite the real values; edit this file by hand",
+                REDACTED
+            );
+            files.push(pf);
+            continue;
+        }
+
+        if let Some(info) = &disk.info {
+            if info.executable {
+                if !policy.allow_exec {
+                    pf.note =
+                        "file is executable today — refusing to modify it (--allow-exec)".into();
+                    files.push(pf);
+                    continue;
+                }
+                pf.mode_note = "keeps its executable bit".into();
+            }
+            if info.extra_links > 0 {
+                pf.mode_note = format!(
+                    "{}hard-linked: the other {} link(s) keep the old content",
+                    if pf.mode_note.is_empty() { "" } else { "; " },
+                    info.extra_links
+                );
+            }
+        } else if proposed.starts_with("#!") {
+            pf.mode_note =
+                "created without the executable bit — chmod +x it yourself if intended".into();
+        }
+
+        let enc = if disk.exists {
+            disk.encoding
+        } else {
+            encoding::TextEncoding::Utf8 { bom: false }
+        };
+        let new_bytes = match encoding::encode(proposed, enc) {
+            Ok(b) => b,
+            Err(e) => {
+                pf.note = e;
+                files.push(pf);
+                continue;
+            }
+        };
+
+        let (diff, adds, dels, truncated) = diff_lines(&disk.content, proposed);
+        pf.diff = diff;
+        pf.adds = adds;
+        pf.dels = dels;
+        pf.diff_truncated = truncated;
+        pf.ok = true;
+        pf.needs_confirm = !policy.permits(&key, classified.class);
+        if pf.needs_confirm {
+            pf.note = format!(
+                "{} file — {}; applied only after explicit confirmation ({})",
+                classified.class.as_str(),
+                classified.reason,
+                ApplyPolicy::hint(classified.class)
+            );
+        }
+        ready.push(ReadyFile {
+            rel_path: key.clone(),
+            new_content: proposed.clone(),
+            new_bytes,
+            base_hash: disk.exists.then_some(disk.hash),
+            class: classified.class,
+            needs_confirm: pf.needs_confirm,
+        });
+        files.push(pf);
     }
 
     Ok(BuiltPreview {
@@ -890,6 +1039,9 @@ fn diff_lines(old: &str, new: &str) -> (Vec<DiffLine>, usize, usize, bool) {
 struct ManifestEntry {
     path: String,
     existed: bool,
+    /// Hash of the bytes the apply wrote (absent in pre-7.8 manifests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    applied_hash: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -899,99 +1051,179 @@ struct Manifest {
     entries: Vec<ManifestEntry>,
 }
 
-fn backups_root(root: &Path) -> PathBuf {
-    root.join(".turbomerger").join("backups")
+const BACKUPS: [&str; 2] = [".turbomerger", "backups"];
+
+fn backup_rel(stamp: &str, tail: &[&str]) -> RelPath {
+    let mut comps: Vec<&str> = BACKUPS.to_vec();
+    comps.push(stamp);
+    comps.extend_from_slice(tail);
+    SafeRoot::rel(&comps)
 }
 
-/// Apply validated files: back originals up under
-/// `<root>/.turbomerger/backups/<UTC>/files/<rel>`, write a manifest, then
-/// write the new contents. Per-file hash mismatches fail that file only.
-pub fn apply_files(root: &Path, files: &[ReadyFile]) -> Result<ApplyOutcome, String> {
+/// Where this machine records the backups it created (see `restore_last`).
+fn registry_path(policy: &ApplyPolicy) -> Option<PathBuf> {
+    if let Some(dir) = &policy.state_dir {
+        return Some(dir.join("apply-backups.jsonl"));
+    }
+    if let Some(dir) = std::env::var_os("TURBOMERGER_STATE_DIR").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(dir).join("apply-backups.jsonl"));
+    }
+    dirs::data_local_dir().map(|d| d.join("com.turbomerger.app").join("apply-backups.jsonl"))
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct RegistryLine {
+    root: String,
+    backup: String,
+    manifest_hash: u64,
+}
+
+fn register_backup(policy: &ApplyPolicy, line: &RegistryLine) -> Result<(), String> {
+    use std::io::Write;
+    let path = registry_path(policy).ok_or("no local data directory to record the backup")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    let json = serde_json::to_string(line).map_err(|e| e.to_string())?;
+    writeln!(f, "{}", json).map_err(|e| e.to_string())
+}
+
+fn is_registered(policy: &ApplyPolicy, line: &RegistryLine) -> bool {
+    let Some(path) = registry_path(policy) else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<RegistryLine>(l).ok())
+        .any(|l| l == *line)
+}
+
+fn fail(failed: &mut Vec<ApplyFailure>, rel: &str, reason: String) {
+    failed.push(ApplyFailure {
+        rel_path: rel.to_string(),
+        reason,
+    });
+}
+
+/// Apply validated files. Everything is re-checked first (path policy,
+/// symlinks, exec bit, unchanged since the preview); then originals are
+/// backed up under `<root>/.turbomerger/backups/<UTC>/files/<rel>` with a
+/// manifest, and only then written. Per-file problems fail that file only.
+pub fn apply_files(
+    root: &Path,
+    files: &[ReadyFile],
+    policy: &ApplyPolicy,
+) -> Result<ApplyOutcome, String> {
+    let sr = SafeRoot::open(root)?;
     let mut outcome = ApplyOutcome {
         backup_dir: None,
         applied: Vec::new(),
         failed: Vec::new(),
     };
 
-    // Revalidate everything before touching the disk.
-    let mut valid: Vec<(&ReadyFile, PathBuf, bool)> = Vec::new(); // (file, target, existed)
+    // (file, rel, original bytes + info when it exists)
+    type Original = Option<(Vec<u8>, safe_fs::FileInfo)>;
+    let mut valid: Vec<(&ReadyFile, RelPath, Original)> = Vec::new();
     for f in files {
-        let target = match safe_join(root, &f.rel_path) {
-            Ok(t) => t,
+        let rel = match RelPath::parse(&f.rel_path) {
+            Ok(r) => r,
             Err(e) => {
-                outcome.failed.push(ApplyFailure {
-                    rel_path: f.rel_path.clone(),
-                    reason: e,
-                });
+                fail(&mut outcome.failed, &f.rel_path, e);
                 continue;
             }
         };
-        match (&f.base_hash, target.exists()) {
-            (Some(expected), true) => {
-                let bytes = match std::fs::read(&target) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        outcome.failed.push(ApplyFailure {
-                            rel_path: f.rel_path.clone(),
-                            reason: format!("unreadable: {}", e),
-                        });
-                        continue;
-                    }
-                };
-                if content_hash(&bytes) != *expected {
-                    outcome.failed.push(ApplyFailure {
-                        rel_path: f.rel_path.clone(),
-                        reason: "changed on disk since the preview — re-parse the reply".into(),
-                    });
-                    continue;
+        // Re-classify from the path itself; never trust the ReadyFile's copy.
+        let classified = policy::classify(&rel.display());
+        if !policy.permits(&rel.display(), classified.class) {
+            let why = if classified.class == PathClass::Forbidden {
+                format!("refused: {}", classified.reason)
+            } else {
+                format!(
+                    "{} file not applied — {}; needs explicit confirmation ({})",
+                    classified.class.as_str(),
+                    classified.reason,
+                    ApplyPolicy::hint(classified.class)
+                )
+            };
+            fail(&mut outcome.failed, &f.rel_path, why);
+            continue;
+        }
+        match (f.base_hash, sr.read(&rel)) {
+            (_, Err(e)) => fail(&mut outcome.failed, &f.rel_path, e),
+            (Some(expected), Ok(Some((bytes, info, resolved)))) => {
+                if let Err(e) = check_resolved(&rel, resolved) {
+                    fail(&mut outcome.failed, &f.rel_path, e);
+                } else if content_hash(&bytes) != expected {
+                    fail(
+                        &mut outcome.failed,
+                        &f.rel_path,
+                        "changed on disk since the preview — re-parse the reply".into(),
+                    );
+                } else if info.executable && !policy.allow_exec {
+                    fail(
+                        &mut outcome.failed,
+                        &f.rel_path,
+                        "file is executable — refusing to modify it (--allow-exec)".into(),
+                    );
+                } else {
+                    valid.push((f, rel, Some((bytes, info))));
                 }
-                valid.push((f, target, true));
             }
-            (Some(_), false) => {
-                outcome.failed.push(ApplyFailure {
-                    rel_path: f.rel_path.clone(),
-                    reason: "file disappeared since the preview — re-parse the reply".into(),
-                });
-            }
-            (None, true) => {
-                outcome.failed.push(ApplyFailure {
-                    rel_path: f.rel_path.clone(),
-                    reason: "file appeared on disk since the preview — re-parse the reply".into(),
-                });
-            }
-            (None, false) => valid.push((f, target, false)),
+            (Some(_), Ok(None)) => fail(
+                &mut outcome.failed,
+                &f.rel_path,
+                "file disappeared since the preview — re-parse the reply".into(),
+            ),
+            (None, Ok(Some(_))) => fail(
+                &mut outcome.failed,
+                &f.rel_path,
+                "file appeared on disk since the preview — re-parse the reply".into(),
+            ),
+            (None, Ok(None)) => match sr.case_variant(&rel) {
+                Ok(Some(other)) => fail(
+                    &mut outcome.failed,
+                    &f.rel_path,
+                    format!("differs only by case from existing `{}`", other),
+                ),
+                Err(e) => fail(&mut outcome.failed, &f.rel_path, e),
+                Ok(None) => valid.push((f, rel, None)),
+            },
         }
     }
     if valid.is_empty() {
         return Ok(outcome);
     }
 
-    // Backup dir: UTC stamp, uniquified if two applies land in one second.
-    let stamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
-    let mut backup_dir = backups_root(root).join(&stamp);
+    // Backup dir: millisecond UTC stamp, uniquified on collision.
+    let base_stamp = chrono::Utc::now()
+        .format("%Y-%m-%dT%H-%M-%S%.3fZ")
+        .to_string();
+    let mut stamp = base_stamp.clone();
     let mut n = 1;
-    while backup_dir.exists() {
+    while sr.open_dir(&backup_rel(&stamp, &[]))?.is_some() {
         n += 1;
-        backup_dir = backups_root(root).join(format!("{}-{}", stamp, n));
+        stamp = format!("{}-{:03}", base_stamp, n);
     }
-    let files_dir = backup_dir.join("files");
-    std::fs::create_dir_all(&files_dir).map_err(|e| format!("cannot create backup dir: {}", e))?;
 
     // Backups + manifest FIRST, so a crash mid-write is always restorable.
     let mut entries = Vec::new();
-    for (f, target, existed) in &valid {
-        if *existed {
-            let dst = files_dir.join(f.rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("backup dir failed for {}: {}", f.rel_path, e))?;
-            }
-            std::fs::copy(target, &dst)
+    for (f, rel, original) in &valid {
+        if let Some((bytes, _)) = original {
+            let dst = rel.under(&[BACKUPS[0], BACKUPS[1], &stamp, "files"]);
+            sr.create_new(&dst, bytes)
                 .map_err(|e| format!("backup failed for {}: {}", f.rel_path, e))?;
         }
         entries.push(ManifestEntry {
-            path: f.rel_path.clone(),
-            existed: *existed,
+            path: rel.display(),
+            existed: original.is_some(),
+            applied_hash: Some(content_hash(&f.new_bytes)),
         });
     }
     let manifest = Manifest {
@@ -999,30 +1231,49 @@ pub fn apply_files(root: &Path, files: &[ReadyFile]) -> Result<ApplyOutcome, Str
         root: root.to_string_lossy().to_string(),
         entries,
     };
-    std::fs::write(
-        backup_dir.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| format!("manifest write failed: {}", e))?;
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
+    sr.create_new(&backup_rel(&stamp, &["manifest.json"]), &manifest_bytes)
+        .map_err(|e| format!("manifest write failed: {}", e))?;
+    let backup_dir = root.join(BACKUPS[0]).join(BACKUPS[1]).join(&stamp);
     outcome.backup_dir = Some(backup_dir.to_string_lossy().to_string());
+    // Remember that THIS machine made this backup (restore trusts only these).
+    if let Err(e) = register_backup(
+        policy,
+        &RegistryLine {
+            root: root.to_string_lossy().to_string(),
+            backup: stamp.clone(),
+            manifest_hash: content_hash(&manifest_bytes),
+        },
+    ) {
+        eprintln!("warning: could not record the backup for restore: {}", e);
+    }
 
-    // Now write.
-    for (f, target, _) in &valid {
-        if let Some(parent) = target.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                outcome.failed.push(ApplyFailure {
-                    rel_path: f.rel_path.clone(),
-                    reason: format!("cannot create parent dir: {}", e),
-                });
-                continue;
-            }
+    // Now write, then read back and compare.
+    for (f, rel, original) in &valid {
+        let written = match original {
+            Some((_, info)) => sr.replace(rel, &f.new_bytes, info.mode),
+            None => sr
+                .create_new(rel, &f.new_bytes)
+                .and_then(|resolved| check_resolved(rel, resolved)),
+        };
+        if let Err(e) = written {
+            fail(&mut outcome.failed, &f.rel_path, e);
+            continue;
         }
-        match std::fs::write(target, f.new_content.as_bytes()) {
-            Ok(()) => outcome.applied.push(f.rel_path.clone()),
-            Err(e) => outcome.failed.push(ApplyFailure {
-                rel_path: f.rel_path.clone(),
-                reason: format!("write failed: {}", e),
-            }),
+        match sr.read(rel) {
+            Ok(Some((bytes, _, _))) if bytes == f.new_bytes => {
+                outcome.applied.push(f.rel_path.clone())
+            }
+            Ok(_) => fail(
+                &mut outcome.failed,
+                &f.rel_path,
+                "verification failed: the file on disk differs from what was written".into(),
+            ),
+            Err(e) => fail(
+                &mut outcome.failed,
+                &f.rel_path,
+                format!("verification failed: {}", e),
+            ),
         }
     }
     Ok(outcome)
@@ -1030,49 +1281,127 @@ pub fn apply_files(root: &Path, files: &[ReadyFile]) -> Result<ApplyOutcome, Str
 
 /// Reverse the most recent apply from its manifest: restore backed-up
 /// originals, delete files the apply created. Idempotent; keeps the backup.
-pub fn restore_last(root: &Path) -> Result<RestoreOutcome, String> {
-    let base = backups_root(root);
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&base)
-        .map_err(|_| "no backups found for this folder".to_string())?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_dir() && p.join("manifest.json").exists())
-        .collect();
-    dirs.sort();
-    let latest = dirs
-        .pop()
+///
+/// Only backups this machine recorded at apply time are honoured — a
+/// `.turbomerger/backups/` tree that arrived with a cloned repo is refused.
+/// Files edited since the apply are left alone and reported.
+pub fn restore_last(root: &Path, policy: &ApplyPolicy) -> Result<RestoreOutcome, String> {
+    let sr = SafeRoot::open(root)?;
+    let backups = SafeRoot::rel(&BACKUPS);
+    let latest = sr
+        .subdirs(&backups)?
+        .into_iter()
+        .rev()
+        .find(|d| matches!(sr.stat(&backup_rel(d, &["manifest.json"])), Ok(Some(_))))
         .ok_or_else(|| "no backups found for this folder".to_string())?;
+    let backup_dir = root.join(BACKUPS[0]).join(BACKUPS[1]).join(&latest);
 
-    let manifest: Manifest = serde_json::from_str(
-        &std::fs::read_to_string(latest.join("manifest.json"))
-            .map_err(|e| format!("manifest unreadable: {}", e))?,
-    )
-    .map_err(|e| format!("manifest corrupt: {}", e))?;
+    let (manifest_bytes, _, _) = sr
+        .read(&backup_rel(&latest, &["manifest.json"]))?
+        .ok_or("manifest unreadable")?;
+    let registered = is_registered(
+        policy,
+        &RegistryLine {
+            root: root.to_string_lossy().to_string(),
+            backup: latest.clone(),
+            manifest_hash: content_hash(&manifest_bytes),
+        },
+    );
+    if !registered {
+        return Err(format!(
+            "backup {} was not created by TurboMerger on this machine (or was modified) — refusing to restore from it; copy files back by hand from {}",
+            latest,
+            backup_dir.display()
+        ));
+    }
+    let manifest: Manifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|e| format!("manifest corrupt: {}", e))?;
 
-    let mut restored = Vec::new();
-    let mut deleted = Vec::new();
+    let mut out = RestoreOutcome {
+        backup_dir: backup_dir.to_string_lossy().to_string(),
+        restored: Vec::new(),
+        deleted: Vec::new(),
+        skipped: Vec::new(),
+    };
     for entry in &manifest.entries {
-        let target = safe_join(root, &entry.path)?;
-        if entry.existed {
-            let src = latest
-                .join("files")
-                .join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR));
-            if let Some(parent) = target.parent() {
-                let _ = std::fs::create_dir_all(parent);
+        let rel = match RelPath::parse(&entry.path) {
+            Ok(r) => r,
+            Err(e) => {
+                fail(&mut out.skipped, &entry.path, e);
+                continue;
             }
-            std::fs::copy(&src, &target)
-                .map_err(|e| format!("restore failed for {}: {}", entry.path, e))?;
-            restored.push(entry.path.clone());
-        } else if target.exists() {
-            std::fs::remove_file(&target)
-                .map_err(|e| format!("delete failed for {}: {}", entry.path, e))?;
-            deleted.push(entry.path.clone());
+        };
+        if policy::classify(&rel.display()).class == PathClass::Forbidden {
+            fail(&mut out.skipped, &entry.path, "refused: inside .git".into());
+            continue;
+        }
+        let current = match sr.read(&rel) {
+            Ok(c) => c,
+            Err(e) => {
+                fail(&mut out.skipped, &entry.path, e);
+                continue;
+            }
+        };
+        let edited_since =
+            |bytes: &[u8]| entry.applied_hash.is_some_and(|h| content_hash(bytes) != h);
+        if entry.existed {
+            let src = rel.under(&[BACKUPS[0], BACKUPS[1], &latest, "files"]);
+            let original = match sr.read(&src) {
+                Ok(Some((bytes, _, _))) => bytes,
+                Ok(None) => {
+                    fail(&mut out.skipped, &entry.path, "backup copy missing".into());
+                    continue;
+                }
+                Err(e) => {
+                    fail(&mut out.skipped, &entry.path, e);
+                    continue;
+                }
+            };
+            let result = match &current {
+                Some((cur, _, _)) if *cur == original => Ok(()),
+                Some((cur, _, _)) if edited_since(cur) => {
+                    fail(
+                        &mut out.skipped,
+                        &entry.path,
+                        format!(
+                            "edited since the apply — not restored (the original is in {})",
+                            backup_dir.display()
+                        ),
+                    );
+                    continue;
+                }
+                Some((_, info, _)) => sr.replace(&rel, &original, info.mode),
+                None => sr.create_new(&rel, &original).map(|_| ()),
+            };
+            match result {
+                Ok(()) => out.restored.push(entry.path.clone()),
+                Err(e) => fail(
+                    &mut out.skipped,
+                    &entry.path,
+                    format!("restore failed: {}", e),
+                ),
+            }
+        } else if let Some((cur, _, _)) = &current {
+            if edited_since(cur) {
+                fail(
+                    &mut out.skipped,
+                    &entry.path,
+                    "edited since the apply — left in place".into(),
+                );
+                continue;
+            }
+            match sr.remove_file(&rel) {
+                Ok(true) => out.deleted.push(entry.path.clone()),
+                Ok(false) => {}
+                Err(e) => fail(
+                    &mut out.skipped,
+                    &entry.path,
+                    format!("delete failed: {}", e),
+                ),
+            }
         }
     }
-    Ok(RestoreOutcome {
-        backup_dir: latest.to_string_lossy().to_string(),
-        restored,
-        deleted,
-    })
+    Ok(out)
 }
 
 // ============================================================================
@@ -1227,21 +1556,6 @@ mod tests {
         }];
         assert_eq!(apply_hunks(original, &hunks).unwrap(), "A\r\nb\r\n");
         assert_eq!(match_line_endings("x\ny\n", "p\r\nq\r\n"), "x\r\ny\r\n");
-    }
-
-    #[test]
-    fn safe_join_refuses_escapes() {
-        let root = Path::new("C:\\proj");
-        assert!(safe_join(root, "src/ok.rs").is_ok());
-        assert!(safe_join(root, "./src/ok.rs").is_ok());
-        assert!(safe_join(root, "../evil.rs").is_err());
-        assert!(safe_join(root, "src/../../evil.rs").is_err());
-        assert!(safe_join(root, "C:/evil.rs").is_err());
-        assert!(safe_join(root, "C:\\evil.rs").is_err());
-        assert!(safe_join(root, "/etc/passwd").is_err());
-        assert!(safe_join(root, "\\\\server\\share").is_err());
-        assert!(safe_join(root, "file.txt:stream").is_err());
-        assert!(safe_join(root, "").is_err());
     }
 
     #[test]

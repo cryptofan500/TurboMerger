@@ -1,4 +1,5 @@
 pub mod applyback;
+pub mod cli;
 mod commands;
 pub mod compress;
 pub mod config;
@@ -10,8 +11,7 @@ pub mod scanner;
 pub mod security;
 pub mod tokens;
 
-pub use commands::{run_apply_cli, run_cli, run_map_cli, ApplyArgs, CliArgs, MapArgs};
-pub use mcp::run_mcp;
+pub use commands::MergeOptions;
 
 use std::sync::Mutex;
 

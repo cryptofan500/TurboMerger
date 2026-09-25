@@ -89,6 +89,14 @@ pub fn load_from_dir(dir: &Path) -> TurboMergerConfig {
     }
 }
 
+/// Load configuration from an explicit file (CLI `--config`). Unlike
+/// `load_from_dir`, a missing or malformed file is an error: the user named it.
+pub fn load_from_file(path: &Path) -> Result<TurboMergerConfig, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read config {}: {}", path.display(), e))?;
+    toml::from_str(&content).map_err(|e| format!("bad config {}: {}", path.display(), e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

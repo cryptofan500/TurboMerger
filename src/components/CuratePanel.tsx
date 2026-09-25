@@ -14,6 +14,8 @@ export interface ScanEntry {
 export interface SkipEntry {
   path: string;
   reason: string;
+  /** Why it is not in the merge; decides the CLI exit code. */
+  kind: "excluded" | "binary" | "not_captured" | "pruned_dir" | "ignored_by_rule";
 }
 export interface ScanReport {
   root: string;
@@ -451,8 +453,11 @@ function Treemap({
 // Skip drill-in tab
 // ---------------------------------------------------------------------------
 
-function categorize(reason: string): string {
-  const r = reason.toLowerCase();
+function categorize(s: SkipEntry): string {
+  if (s.kind === "not_captured") return "Not captured (content missing)";
+  if (s.kind === "pruned_dir") return "Directories not scanned";
+  if (s.kind === "ignored_by_rule") return "Ignored by rules";
+  const r = s.reason.toLowerCase();
   if (r.includes("gitignore")) return "Gitignored";
   if (r.includes("credential") || r.includes("sensitive") || r.includes("env file") || r.includes("secret")) return "Sensitive / credentials";
   if (r.includes("binary")) return "Binary";
@@ -476,12 +481,17 @@ function SkipList({
   const groups = useMemo(() => {
     const m = new Map<string, SkipEntry[]>();
     for (const s of skipped) {
-      const cat = categorize(s.reason);
+      const cat = categorize(s);
       const arr = m.get(cat) || [];
       arr.push(s);
       m.set(cat, arr);
     }
-    return [...m.entries()].sort((a, b) => b[1].length - a[1].length);
+    // Missing content first — that is what the user must know about.
+    return [...m.entries()].sort(
+      (a, b) =>
+        Number(b[0].startsWith("Not captured")) - Number(a[0].startsWith("Not captured")) ||
+        b[1].length - a[1].length,
+    );
   }, [skipped]);
   const [open, setOpen] = useState<Set<string>>(() => new Set(groups.slice(0, 1).map(([g]) => g)));
 
@@ -513,12 +523,14 @@ function SkipList({
                 <div className="skip-row" key={s.path}>
                   <span className="skip-path">{s.path}</span>
                   <span className="skip-reason">{s.reason}</span>
-                  <button
-                    className={`btn btn-tiny ${forceInclude.has(s.path) ? "btn-success" : "btn-secondary"}`}
-                    onClick={() => onToggleForce(s.path)}
-                  >
-                    {forceInclude.has(s.path) ? "✓ will include" : "include anyway"}
-                  </button>
+                  {s.kind !== "pruned_dir" && s.kind !== "ignored_by_rule" && (
+                    <button
+                      className={`btn btn-tiny ${forceInclude.has(s.path) ? "btn-success" : "btn-secondary"}`}
+                      onClick={() => onToggleForce(s.path)}
+                    >
+                      {forceInclude.has(s.path) ? "✓ will include" : "include anyway"}
+                    </button>
+                  )}
                 </div>
               ))}
             </div>

@@ -2,8 +2,17 @@
 //! shorthand, shallow-clone it into a self-cleaning temp dir, and hand the
 //! checkout to the normal scan/merge pipeline.
 //!
-//! Credentials: an optional PAT is held in memory only, injected into the
-//! clone URL, never logged; git stderr is scrubbed before it can surface.
+//! Credentials: an optional PAT is held in memory only and handed to git as
+//! an HTTP `Authorization` header through `GIT_CONFIG_*` environment
+//! variables (the `actions/checkout` mechanism) — never in argv, where any
+//! local user can read it, and never in the clone's `.git/config`, where it
+//! would survive a crash (N-22). git stderr is scrubbed before it surfaces.
+//!
+//! Only explicit references clone (N-23): `https://…`, `git@host:…`, or
+//! `gh:owner/repo`. A bare `owner/repo` is a local path to the CLI and MCP —
+//! a typo like `merge docs/api` in the wrong folder no longer packs
+//! github.com/docs/api. (The GUI's remote box still accepts the shorthand:
+//! typing into it is the explicit intent.)
 
 use std::path::{Path, PathBuf};
 
@@ -62,21 +71,44 @@ pub fn parse_remote(input: &str) -> Option<(String, String)> {
         return Some((url.clone(), repo_name(&url)?));
     }
 
-    if s.starts_with("git@") && s.contains(':') {
+    if let Some(rest) = s.strip_prefix("gh:") {
+        return parse_shorthand(rest);
+    }
+
+    if let Some(rest) = s.strip_prefix("git@") {
+        // Host must look like a host: a leading '-' would reach ssh as an
+        // option (`git@-oProxyCommand=…:x/y`).
+        let (host, _) = rest.split_once(':')?;
+        if host.is_empty()
+            || host.starts_with('-')
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        {
+            return None;
+        }
         return Some((s.to_string(), repo_name(s.split(':').nth(1)?)?));
     }
 
     // owner/repo shorthand: exactly one slash, no path-ish characters, and
     // not something that exists locally (the caller double-checks too).
+    if Path::new(s).exists() {
+        return None;
+    }
+    parse_shorthand(s)
+}
+
+/// `owner/repo` → github.com clone URL.
+fn parse_shorthand(s: &str) -> Option<(String, String)> {
     let parts: Vec<&str> = s.split('/').collect();
     if parts.len() == 2
         && !s.starts_with('.')
+        && !s.starts_with('-')
         && parts.iter().all(|p| {
             !p.is_empty()
                 && p.chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         })
-        && !Path::new(s).exists()
     {
         let url = format!("https://github.com/{}/{}.git", parts[0], parts[1]);
         return Some((url, parts[1].trim_end_matches(".git").to_string()));
@@ -84,12 +116,76 @@ pub fn parse_remote(input: &str) -> Option<(String, String)> {
     None
 }
 
-/// Inject a PAT into an https clone URL (GitHub's x-access-token convention).
-fn with_pat(url: &str, pat: &str) -> String {
-    match url.strip_prefix("https://") {
-        Some(rest) if !pat.is_empty() => format!("https://x-access-token:{}@{}", pat, rest),
-        _ => url.to_string(),
+/// Remote references the CLI and MCP accept: full URLs and `gh:owner/repo`
+/// only — never a bare `owner/repo`, which is a local path there (N-23).
+pub fn parse_remote_explicit(input: &str) -> Option<(String, String)> {
+    let s = input.trim();
+    let explicit = s.starts_with("https://")
+        || s.starts_with("http://")
+        || s.starts_with("git@")
+        || s.starts_with("gh:");
+    if explicit {
+        parse_remote(s)
+    } else {
+        None
     }
+}
+
+/// Host of an https clone URL (`https://host/owner/repo.git` → `host`).
+fn https_host(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://")?;
+    let host = rest.split('/').next()?;
+    (!host.is_empty() && !host.contains('@')).then_some(host)
+}
+
+/// Standard base64 (for the basic-auth header; no dependency needed).
+fn base64(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// `GIT_CONFIG_*` environment for an https PAT: an `Authorization` header
+/// scoped to the clone's host. `None` for SSH URLs or an empty PAT.
+fn pat_env(url: &str, pat: &str) -> Option<[(String, String); 3]> {
+    if pat.is_empty() {
+        return None;
+    }
+    let host = https_host(url)?;
+    Some([
+        ("GIT_CONFIG_COUNT".into(), "1".into()),
+        (
+            "GIT_CONFIG_KEY_0".into(),
+            format!("http.https://{}/.extraheader", host),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0".into(),
+            format!(
+                "AUTHORIZATION: basic {}",
+                base64(format!("x-access-token:{}", pat).as_bytes())
+            ),
+        ),
+    ])
 }
 
 /// Remove the PAT anywhere it could echo back (git prints the URL on failure).
@@ -100,23 +196,25 @@ fn scrub(text: &str, pat: Option<&str>) -> String {
     }
 }
 
+/// Default clone timeout; `TURBOMERGER_CLONE_TIMEOUT` (seconds) overrides it.
+const CLONE_TIMEOUT_SECS: u64 = 300;
+
 /// Shallow-clone `url` into a fresh temp dir. `pat` (optional) is used for
-/// https auth and scrubbed from any error output.
+/// https auth via the environment and scrubbed from any error output. Git
+/// LFS smudging is skipped (it can pull gigabytes) and the clone is killed
+/// after a timeout.
 pub fn clone_shallow(
     url: &str,
     repo_name: &str,
     pat: Option<&str>,
 ) -> Result<RemoteCheckout, String> {
+    use std::io::Read;
+
     let tmp = tempfile::Builder::new()
         .prefix("turbomerger_remote_")
         .tempdir()
         .map_err(|e| format!("temp dir: {}", e))?;
     let target = tmp.path().join(repo_name);
-
-    let auth_url = match pat {
-        Some(p) => with_pat(url, p),
-        None => url.to_string(),
-    };
 
     let mut cmd = std::process::Command::new("git");
     cmd.arg("clone")
@@ -124,21 +222,54 @@ pub fn clone_shallow(
         .arg("1")
         .arg("--single-branch")
         .arg("--no-tags")
-        .arg(&auth_url)
+        .arg("--")
+        .arg(url)
         .arg(&target)
         // Fail fast instead of prompting for credentials in a GUI process.
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if let Some(env) = pat.and_then(|p| pat_env(url, p)) {
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("git not runnable: {}", e))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        buf
+    });
+    let timeout = std::env::var("TURBOMERGER_CLONE_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(CLONE_TIMEOUT_SECS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("clone timed out after {} s", timeout));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => return Err(format!("git wait failed: {}", e)),
+        }
+    };
+    let err = reader.join().unwrap_or_default();
+    if !status.success() {
         let first = err
             .lines()
             .find(|l| !l.trim().is_empty())
@@ -205,6 +336,25 @@ mod tests {
     }
 
     #[test]
+    fn explicit_references_only_for_cli_and_mcp() {
+        assert_eq!(
+            parse_remote_explicit("gh:rust-lang/cargo"),
+            Some((
+                "https://github.com/rust-lang/cargo.git".to_string(),
+                "cargo".to_string()
+            ))
+        );
+        assert!(parse_remote_explicit("https://github.com/o/r").is_some());
+        assert!(parse_remote_explicit("git@github.com:o/r.git").is_some());
+        // A bare owner/repo is a (missing) local path, never a clone.
+        assert_eq!(parse_remote_explicit("docs/api"), None);
+        assert_eq!(parse_remote_explicit("rust-lang/cargo"), None);
+        // ssh option injection through the host part is refused.
+        assert_eq!(parse_remote("git@-oProxyCommand=touch pwned:x/y"), None);
+        assert_eq!(parse_remote("git@-oProxyCommand=x:x/y"), None);
+    }
+
+    #[test]
     fn parse_rejects_local_paths_and_noise() {
         assert_eq!(parse_remote("C:/Users/admin/project"), None);
         assert_eq!(parse_remote("src"), None); // no slash
@@ -224,16 +374,21 @@ mod tests {
     }
 
     #[test]
-    fn pat_injected_and_scrubbed() {
+    fn pat_goes_to_a_host_scoped_header_never_the_url() {
+        let env = pat_env("https://github.com/o/r.git", "TOKEN123").unwrap();
+        assert_eq!(env[1].1, "http.https://github.com/.extraheader");
+        // base64("x-access-token:TOKEN123")
         assert_eq!(
-            with_pat("https://github.com/o/r.git", "TOKEN123"),
-            "https://x-access-token:TOKEN123@github.com/o/r.git"
+            env[2].1,
+            "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46VE9LRU4xMjM="
         );
-        // ssh URLs pass through untouched
-        assert_eq!(
-            with_pat("git@github.com:o/r.git", "TOKEN123"),
-            "git@github.com:o/r.git"
-        );
+        assert!(env.iter().all(|(_, v)| !v.contains("TOKEN123")));
+        // ssh URLs and empty tokens get no header
+        assert!(pat_env("git@github.com:o/r.git", "TOKEN123").is_none());
+        assert!(pat_env("https://github.com/o/r.git", "").is_none());
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(
             scrub(
                 "fatal: repo 'https://x-access-token:TOKEN123@x/y'",
