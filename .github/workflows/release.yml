@@ -40,7 +40,7 @@ jobs:
 
     steps:
       - name: Check out release tag
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
 
@@ -52,7 +52,7 @@ jobs:
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           cache: npm
@@ -95,7 +95,7 @@ jobs:
 
     steps:
       - name: Check out release tag
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
 
@@ -107,7 +107,7 @@ jobs:
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           cache: npm
@@ -142,11 +142,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          deb="$(find src-tauri/target/release/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
+          deb="$(find target/release/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
           test -n "$deb" || { echo "no .deb produced under bundle/deb" >&2; exit 1; }
-          appimage="$(find src-tauri/target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)"
+          appimage="$(find target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)"
           test -n "$appimage" || { echo "no .AppImage produced under bundle/appimage" >&2; exit 1; }
           dpkg --info "$deb"
+          # Both binaries: the desktop app and the console CLI sidecar (ADR 0015).
+          dpkg-deb -c "$deb" > deb-contents.txt
+          grep -Eq '(^| |\./)usr/bin/turbomerger-gui$' deb-contents.txt
+          grep -Eq '(^| |\./)usr/bin/turbomerger$' deb-contents.txt
           file "$appimage"
 
       - name: Verify Apple Silicon application and DMG
@@ -154,12 +158,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          app="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          app="$(find target/aarch64-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
           test -n "$app" || { echo "no .app produced under bundle/macos" >&2; exit 1; }
-          binary="$(find "$app/Contents/MacOS" -maxdepth 1 -type f -print -quit)"
-          dmg="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          binary="$app/Contents/MacOS/turbomerger-gui"
+          test -x "$app/Contents/MacOS/turbomerger"  # the CLI sidecar (ADR 0015)
+          dmg="$(find target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
           test -n "$binary" && test -n "$dmg"
           lipo -archs "$binary" | grep -qw arm64
+          lipo -archs "$app/Contents/MacOS/turbomerger" | grep -qw arm64
           codesign --verify --deep --strict --verbose=2 "$app"
           hdiutil verify "$dmg"
 
@@ -168,7 +174,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path release-assets -Force | Out-Null
-          $files = @(Get-ChildItem -Path src-tauri/target/release/bundle/nsis -Filter *-setup.exe -File)
+          $files = @(Get-ChildItem -Path target/release/bundle/nsis -Filter *-setup.exe -File)
           if ($files.Count -eq 0) { throw "NSIS installer was not produced" }
           $files | Copy-Item -Destination release-assets
 
@@ -179,7 +185,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           shopt -s nullglob
-          files=(src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg)
+          files=(target/aarch64-apple-darwin/release/bundle/dmg/*.dmg)
           (( ${#files[@]} > 0 )) || { echo "DMG was not produced" >&2; exit 1; }
           cp "${files[@]}" release-assets/
 
@@ -190,7 +196,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           shopt -s nullglob
-          files=(src-tauri/target/release/bundle/deb/*.deb src-tauri/target/release/bundle/appimage/*.AppImage)
+          files=(target/release/bundle/deb/*.deb target/release/bundle/appimage/*.AppImage)
           (( ${#files[@]} > 0 )) || { echo "no Linux bundle files were produced" >&2; exit 1; }
           cp "${files[@]}" release-assets/
 

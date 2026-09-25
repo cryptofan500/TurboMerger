@@ -1,0 +1,102 @@
+# refactor/phase-0 (debug build for A.1–A.14; release build for A.6/A.10), Linux x64, 2026-09-24 (Toronto) — `$SP` = scratch dir
+
+### A.1
+merged=2 scan_skipped=120 merge_skipped=0 redacted=0 tokens_o200k=14184 parts=1 not_captured=120
+warning: 120 input(s) were not captured — see "Not captured" in the Merge Report
+exit=3
+### A.2
+merged=9 scan_skipped=5 merge_skipped=2 redacted=0 tokens_o200k=87 parts=1 not_captured=1
+warning: 1 input(s) were not captured — see "Not captured" in the Merge Report
+exit=3
+merged=9 scan_skipped=5 merge_skipped=2 redacted=0 tokens_o200k=87 parts=1 not_captured=1
+warning: 1 input(s) were not captured — see "Not captured" in the Merge Report
+exit=3
+10
+6:> Source: local folder "fx"
+### A.3
+error: unexpected argument '--includ-hidden' found
+
+  tip: a similar argument exists: '--include-hidden'
+
+Usage: turbomerger merge --include-hidden <SRC> [OUT]
+
+For more information, try '--help'.
+exit=2
+error: invalid value 'abc' for '--max-tokens <N>': invalid digit found in string
+
+For more information, try '--help'.
+exit=2
+turbomerger 7.7.0
+exit=0
+### A.4
+$SP/split_out.part3-of-6.md:0
+$SP/split_out.part4-of-6.md:0
+$SP/split_out.part5-of-6.md:0
+$SP/split_out.part6-of-6.md:0
+### A.5
+     12 The old value was [REDACTED] and the rotated value is [REDACTED] today.
+1
+### A.7
+exit=0
+exit=0
+exit=0
+### A.8
+SKIP   docs/note.md — target is a symlink — apply-back never writes through links
+nothing to apply
+exit=3
+ORIGINAL OUTSIDE CONTENT
+modify menu.txt +1 -1  (windows-1252)
+applied menu.txt
+backup=$SP/enc/root/.turbomerger/backups/2026-09-24T20-04-16.981Z
+undo: turbomerger apply "$SP/enc/root" --restore
+exit=0
+6c696e65206f6e6520636166e90a
+### A.9
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2025-11-25","serverInfo":{"name":"turbomerger","version":"7.7.0"}}}
+{"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"$SP/detrepo is outside the fold
+total 8
+drwxrwxr-x  2 pawel pawel 4096 Sep 24 16:04 .
+drwxrwxr-x 10 pawel pawel 4096 Sep 24 16:04 ..
+### A.11
+modify src/main.rs +3 -1
+SKIP   .git/hooks/pre-commit — refused: inside .git (hooks and git config run commands; git never versions these files)
+SKIP   .GIT/hooks/post-checkout — refused: inside .git (hooks and git config run commands; git never versions these files)
+HOLD   .github/workflows/ci.yml — control file — CI workflow — runs on push; applied only after explicit confirmation (--allow-control GLOB)
+HOLD   .vscode/tasks.json — control file — editor settings/tasks can run commands when the folder opens; applied only after explicit confirmation (--allow-control GLOB)
+HOLD   .claude/settings.json — control file — agent settings can define hooks that run commands; applied only after explicit confirmation (--allow-control GLOB)
+HOLD   build.rs — manifest file — build/dependency manifest — runs code on the next build or install; applied only after explicit confirmation (--allow-manifest GLOB)
+SKIP   docs/note.md — target is a symlink — apply-back never writes through links
+applied src/main.rs
+backup=$SP/poison/root/.turbomerger/backups/2026-09-24T20-04-17.098Z
+undo: turbomerger apply "$SP/poison/root" --restore
+exit=3
+-rwxrwxr-x 1 pawel pawel 29 Sep 24 16:04 $SP/poison/root/.git/hooks/pre-commit
+#!/bin/sh
+echo original hook
+ORIGINAL OUTSIDE CONTENT
+ls: cannot access '$SP/poison/root/.github': No such file or directory
+ls: cannot access '$SP/poison/root/.vscode': No such file or directory
+ls: cannot access '$SP/poison/root/build.rs': No such file or directory
+### A.14
+merged=0 scan_skipped=6 merge_skipped=0 redacted=0 tokens_o200k=0 parts=1 not_captured=6
+warning: nothing was merged — the output holds only the report of what was skipped and why
+exit=3
+-rw-rw-r-- 1 pawel pawel 976 Sep 24 16:04 $SP/photos_out.md
+### A.6 (release builds, 200 × 100 KB prose + one dense notes file; wall time)
+| dense tokens | v7.7.0 | this branch |
+|---|---|---|
+| none (baseline corpus) | 0.72 s | 0.75–0.79 s |
+| 2,000 (`account_notes.md`) | 5.90 s | 0.80 s |
+| 8,000 (`account_notes.md`) | 21.57 s | 0.82 s |
+| 2,000 (`account_passwords.md`: full harvest forced) | 6.01 s | 0.83 s |
+| 8,000 (`account_passwords.md`: full harvest forced) | 21.75 s | 0.89 s |
+
+### A.10 (release builds; 120 arXiv papers via `pdftotext`)
+| | v7.7.0 | this branch |
+|---|---|---|
+| merged / merge-skipped | 104 / 16 | 104 / 16 (credential-density rule, N-07 → Phase 5; now reported as not captured, exit 3) |
+| secrets redacted | 1,028 | 17 (in-situ contextual + credit-card rules only) |
+| files with "Propagated known secret" | 72 | 0 |
+| `4,0[REDACTED]` / `[REDACTED] medium` / `Using [REDACTED],` / `(2023) [REDACTED].` | 1 / 4 / 1 / 1 | 0 / 0 / 0 / 0 |
+| wall time | 4.28 s | 0.95 s |
+| distinct outputs over 4 runs | — | 1 |

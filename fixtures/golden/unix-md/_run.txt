@@ -1,0 +1,2 @@
+exit=0
+merged=5 scan_skipped=4 merge_skipped=0 redacted=0 tokens_o200k=24 parts=1 not_captured=0

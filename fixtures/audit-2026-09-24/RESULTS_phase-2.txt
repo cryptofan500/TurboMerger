@@ -1,0 +1,157 @@
+# Phase 2 (workspace, two binaries, streaming, jobs), Linux x64 (Ryzen 5 5500U, 14 GiB), 2026-09-24 (Toronto)
+# Debug build for L2 unless noted; release builds for timings. `$SP` = scratch dir.
+
+## L0 — npm run verify
+cargo test --workspace: 190 passed, 0 failed (last full local run, 35a36c0); clippy (Linux, Windows gnu) and fmt clean.
+npm run verify (clean build, a057488): exit 0 — 190 passed, 0 failed; CI ran the full verify green on d6b0ac3.
+
+## L1 — Windows static check
+cargo clippy --workspace --target x86_64-pc-windows-gnu --all-targets --all-features -- -D warnings: clean
+
+## L1m — static musl CLI
+target/x86_64-unknown-linux-musl/release/turbomerger: ELF 64-bit LSB pie executable, x86-64, static-pie linked, 19,741,936 bytes
+docker run alpine:3: `--version` → turbomerger 7.7.0; merge of the A.6 corpus (200 × 100 KB) → exit 0, 20,511,577-byte output
+
+## L2 — black-box repros (debug CLI)
+Same results as RESULTS_refactor-phase-0.txt, except A.2 (see the note after the output).
+
+### A.1
+out=$SP/arxiv_out.md
+warning: 120 input(s) were not captured — see "Not captured" in the Merge Report
+exit=3
+### A.2
+merged=15 scan_skipped=1 merge_skipped=0 redacted=0 tokens_o200k=290783 parts=1 not_captured=0
+out=$SP/fx_out.md
+exit=0
+exit=0
+16
+6:> Source: local folder "fx"
+### A.3
+
+Usage: turbomerger merge --include-hidden <SRC> [OUT]
+
+For more information, try '--help'.
+exit=2
+total 8
+drwxrwxr-x 2 pawel pawel 4096 Sep 24 22:53 .
+drwxrwxr-x 5 pawel pawel 4096 Sep 24 22:53 ..
+error: invalid value 'abc' for '--max-tokens <N>': invalid digit found in string
+
+For more information, try '--help'.
+exit=2
+turbomerger 7.7.0
+exit=0
+### A.4
+$SP/split_out.part1-of-6.md:1
+$SP/split_out.part2-of-6.md:0
+$SP/split_out.part3-of-6.md:0
+$SP/split_out.part4-of-6.md:0
+$SP/split_out.part5-of-6.md:0
+$SP/split_out.part6-of-6.md:0
+### A.5
+     12 The old value was [REDACTED] and the rotated value is [REDACTED] today.
+1
+### A.7
+exit=0
+exit=0
+exit=0
+### A.8
+SKIP   docs/note.md — target is a symlink — apply-back never writes through links
+nothing to apply
+exit=3
+ORIGINAL OUTSIDE CONTENT
+modify menu.txt +1 -1  (windows-1252)
+applied menu.txt
+backup=$SP/enc/root/.turbomerger/backups/2026-09-25T02-54-15.435Z
+undo: turbomerger apply "$SP/enc/root" --restore
+exit=0
+6c696e65206f6e6520636166e90a
+### A.9
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"turbomerger","version":"7.7.0"},"instructions":"Pack a folder into LLM-ready files wi
+{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"$SP/detrepo is outside the folders shared with this server … 8
+drwxrwxr-x  2 pawel pawel 4096 Sep 24 22:54 .
+drwxrwxr-x 12 pawel pawel 4096 Sep 24 22:54 ..
+### A.11
+modify src/main.rs +3 -1
+SKIP   .git/hooks/pre-commit — refused: inside .git (hooks and git config run commands; git never versions these files)
+SKIP   .GIT/hooks/post-checkout — refused: inside .git (hooks and git config run commands; git never versions these files)
+HOLD   .github/workflows/ci.yml — control file — CI workflow — runs on push; applied only after explicit confirmation (--allow-control GLOB)
+HOLD   .vscode/tasks.json — control file — editor settings/tasks can run commands when the folder opens; applied only after explicit confirmation (--allow-control GLOB)
+HOLD   .claude/settings.json — control file — agent settings can define hooks that run commands; applied only after explicit confirmation (--allow-control GLOB)
+HOLD   build.rs — manifest file — build/dependency manifest — runs code on the next build or install; applied only after explicit confirmation (--allow-manifest GLOB)
+SKIP   docs/note.md — target is a symlink — apply-back never writes through links
+applied src/main.rs
+backup=$SP/poison/root/.turbomerger/backups/2026-09-25T02-54-15.510Z
+undo: turbomerger apply "$SP/poison/root" --restore
+exit=3
+-rwxrwxr-x 1 pawel pawel 29 Sep 24 22:54 $SP/poison/root/.git/hooks/pre-commit
+#!/bin/sh
+echo original hook
+ORIGINAL OUTSIDE CONTENT
+ls: cannot access '$SP/poison/root/.github': No such file or directory
+ls: cannot access '$SP/poison/root/.vscode': No such file or directory
+ls: cannot access '$SP/poison/root/build.rs': No such file or directory
+### A.14
+out=$SP/photos_out.md
+warning: nothing was merged — the output holds only the report of what was skipped and why
+exit=3
+-rw-rw-r-- 1 pawel pawel 976 Sep 24 22:54 $SP/photos_out.md
+
+Note on A.2: the Phase-1 record says merged=9 tokens=87 exit=3. The Phase-1 commit (1e7c510,
+rebuilt in a scratch worktree) actually gives merged=15 scan_skipped=1 not_captured=0 exit=0 on
+this fixture — byte-identical to this branch on the same fixture build. The record was taken
+from an earlier fixture or code state. (The fixture writes random notebook image bytes, so
+token totals differ by a few tokens between fixture builds.)
+
+## L3 — A.10, 120 arXiv papers through pdftotext (release)
+merged=104 scan_skipped=0 merge_skipped=16 redacted=17 tokens_o200k=2481797 parts=1 not_captured=16 (exit 3)
+"Propagated known secret": 0. Four runs byte-identical (sha256 102308ff…e4e4).
+Wall: 0.76 s cold token cache, 0.35–0.42 s warm; peak RSS 161–184 MB.
+
+## L4 — scale (release)
+A.6 (200 × 100 KB, median of 5): base 0.58 s / 100 MB, dense (8,000 tokens) 0.55 s / 104 MB.
+Phase 1: 0.75–0.79 s and 0.82 s.
+
+fixtures/big-tree (3.39 GiB apparent, 424 MB on disk, 65,367 entries):
+  no cache 3.43–3.57 s / 117–125 MB; cold cache 3.46–3.54 s; warm cache 2.23–2.37 s.
+  gen.py verify: inventory=65367 merged=42005 skipped=39 pruned_dir=20303 ignored=3020 unaccounted=0
+  not captured: 1 (big/over_cap.txt, text over the 2 MiB cap); 34 binaries (30 sparse .bin, 4 sniffed .dat)
+
+Build profile benchmark (ADR 0016; median of 5, before the exit-delay fix):
+  tiktoken  opt "z": A.6 0.81/0.81 s, A.10 1.01 s, tree 5.41 s / 147 MB, CLI 18.2 MB
+  tiktoken  opt 3  : A.6 0.61/0.61 s, A.10 0.81 s, tree 3.81 s / 150 MB, CLI 19.6 MB   ← chosen
+  bpe-openai opt "z": A.6 1.01/0.61 s, A.10 0.81 s, tree 4.02 s / 178 MB, CLI 46.7 MB
+  bpe-openai opt 3  : A.6 0.61/0.61 s, A.10 0.61 s, tree 3.02 s / 182 MB, CLI 48.0 MB
+
+Cancel (release CLI, SIGINT during the big-tree merge): 3 ms (scan), 16 ms, 27 ms (merge) —
+exit 4, "cancelled (Ctrl-C) — nothing was written", no file left.
+
+## L5 — determinism
+Golden outputs: 17 runs byte-identical to the Phase-1 captures, on Linux, macOS and Windows CI.
+A.10: 4 runs identical. redaction.rs: 20 runs identical. --reproducible: a CRLF+NFD tree and an
+LF+NFC tree merge to the same bytes (cli_binary.rs).
+
+## L6 — GUI (fixtures/gui-smoke, tauri-driver + WebKitWebDriver in Xvfb, throwaway HOME)
+18/18 checks: merge + not-captured warning + redaction count + output in the session Downloads;
+curate lists "Not captured" first; apply-back on the poisoning fixture blocks .git (both
+spellings) and the symlinked target, holds CI/IDE/agent/build.rs; confirming build.rs applies it
+with src/main.rs; hook and outside file untouched; Restore undoes it; cancel acknowledged in
+0.52 s on the big tree (0.12 s on the generated 15,000-file corpus), nothing written; watch
+re-merges on an edit and stops. Also green in Linux CI.
+
+## L7 — CI (draft PR #15)
+d6b0ac3: Windows x64, macOS Apple Silicon, Linux x64 green — verify (tests, clippy, fmt,
+frontend), Tauri debug build with the CLI sidecar, GUI smoke (Linux), Windows console CLI exit
+codes, musl CLI in Alpine (Linux).
+34e40c2 failed on Windows only: the spool appended at the cursor that a Windows positional read
+had moved (golden secrets-json wrote nothing) — fixed in d6b0ac3 with positional writes and a test.
+
+## Installs this phase (Pawel's apt authorization, handoff rule 9)
+- apt: webkit2gtk-driver 2.52.6-0ubuntu0.24.04.1 (WebKitWebDriver for the GUI smoke)
+- cargo install: tauri-driver 2.0.6
+- rustup: target x86_64-unknown-linux-musl for 1.92.0
+- scratch only: Python venv with selenium 4.49.0; docker image alpine:3
+
+## Housekeeping
+- Deleted the stale src-tauri/target (13 GB, pre-workspace build cache) and ran cargo clean once
+  (47.7 GiB) when the disk reached 100 %; both are rebuildable build output.

@@ -23,6 +23,13 @@ interface PreviewFile {
   dels: number;
   diff: DiffLine[];
   diff_truncated: boolean;
+  /** "code" | "manifest" | "control" | "forbidden" */
+  class: string;
+  class_reason: string;
+  /** Control files and build manifests: written only after explicit confirmation. */
+  needs_confirm: boolean;
+  encoding: string;
+  mode_note: string;
 }
 
 interface Preview {
@@ -45,6 +52,7 @@ interface RestoreOutcome {
   backup_dir: string;
   restored: string[];
   deleted: string[];
+  skipped: ApplyFailure[];
 }
 
 /** Pair delete/insert runs into side-by-side rows. */
@@ -101,6 +109,8 @@ export default function ApplyPanel({ root, disabled }: { root: string; disabled:
   const [reply, setReply] = useState("");
   const [preview, setPreview] = useState<Preview | null>(null);
   const [accepted, setAccepted] = useState<Set<string>>(new Set());
+  // Control/manifest files the user explicitly confirmed, one by one.
+  const [confirmed, setConfirmed] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [outcome, setOutcome] = useState<ApplyOutcome | null>(null);
   const [restored, setRestored] = useState<RestoreOutcome | null>(null);
@@ -117,7 +127,11 @@ export default function ApplyPanel({ root, disabled }: { root: string; disabled:
     try {
       const p = await invoke<Preview>("preview_apply", { root, reply });
       setPreview(p);
-      setAccepted(new Set(p.files.filter((f) => f.ok && !f.identical).map((f) => f.rel_path)));
+      // Control files and manifests start unchecked: they need a confirmation.
+      setAccepted(
+        new Set(p.files.filter((f) => f.ok && !f.identical && !f.needs_confirm).map((f) => f.rel_path)),
+      );
+      setConfirmed(new Set());
       setExpanded(new Set());
     } catch (err) {
       setPreview(null);
@@ -134,11 +148,13 @@ export default function ApplyPanel({ root, disabled }: { root: string; disabled:
       const o = await invoke<ApplyOutcome>("apply_accepted", {
         root,
         accept: [...accepted],
+        confirm: [...confirmed].filter((p) => accepted.has(p)),
       });
       setOutcome(o);
       // The preview is consumed server-side; a new round needs a re-parse.
       setPreview(null);
       setAccepted(new Set());
+      setConfirmed(new Set());
     } catch (err) {
       setError(String(err));
     } finally {
@@ -167,14 +183,41 @@ export default function ApplyPanel({ root, disabled }: { root: string; disabled:
   };
 
   const badge = (f: PreviewFile) =>
-    !f.ok ? "badge badge-blocked" : f.action === "create" ? "badge badge-create" : "badge badge-modify";
+    !f.ok
+      ? "badge badge-blocked"
+      : f.class === "control"
+        ? "badge badge-control"
+        : f.class === "manifest"
+          ? "badge badge-manifest"
+          : f.action === "create"
+            ? "badge badge-create"
+            : "badge badge-modify";
+
+  const badgeText = (f: PreviewFile) =>
+    !f.ok ? (f.action === "delete" ? "delete" : "blocked") : f.needs_confirm ? `${f.action} · ${f.class}` : f.action;
+
+  const confirmFile = (f: PreviewFile, yes: boolean) => {
+    const nextConfirmed = new Set(confirmed);
+    const nextAccepted = new Set(accepted);
+    if (yes) {
+      nextConfirmed.add(f.rel_path);
+      nextAccepted.add(f.rel_path);
+    } else {
+      nextConfirmed.delete(f.rel_path);
+      nextAccepted.delete(f.rel_path);
+    }
+    setConfirmed(nextConfirmed);
+    setAccepted(nextAccepted);
+  };
 
   return (
     <div className="apply-panel">
       <p className="hint">
         Paste the LLM's reply (fenced blocks under <code>## path</code> headers, cxml documents,
         or unified diffs). Nothing is written until you review and click Apply; originals are
-        backed up to <code>.turbomerger/backups/</code> in the source folder.
+        backed up to <code>.turbomerger/backups/</code> in the source folder. Files inside
+        <code>.git</code> are never written; CI, editor and agent settings and build manifests
+        need a separate confirmation.
       </p>
       <textarea
         className="input apply-textarea"
@@ -206,10 +249,10 @@ export default function ApplyPanel({ root, disabled }: { root: string; disabled:
                   <input
                     type="checkbox"
                     checked={accepted.has(f.rel_path)}
-                    disabled={!f.ok || f.identical || busy}
+                    disabled={!f.ok || f.identical || busy || (f.needs_confirm && !confirmed.has(f.rel_path))}
                     onChange={() => toggle(accepted, f.rel_path, setAccepted)}
                   />
-                  <span className={badge(f)}>{f.ok ? f.action : f.action === "delete" ? "delete" : "blocked"}</span>
+                  <span className={badge(f)}>{badgeText(f)}</span>
                   <span className="apply-path">{f.rel_path}</span>
                 </label>
                 <span className="apply-stats">
@@ -231,6 +274,23 @@ export default function ApplyPanel({ root, disabled }: { root: string; disabled:
                 </span>
               </div>
               {!f.ok && <p className="apply-note">{f.note}</p>}
+              {f.ok && f.needs_confirm && !f.identical && (
+                <label className={`apply-confirm apply-confirm-${f.class}`}>
+                  <input
+                    type="checkbox"
+                    checked={confirmed.has(f.rel_path)}
+                    disabled={busy}
+                    onChange={(e) => confirmFile(f, e.target.checked)}
+                  />
+                  <span>
+                    <strong>{f.class === "control" ? "Control file" : "Build manifest"}</strong> — {f.class_reason}.
+                    Apply only if you asked for this change.
+                  </span>
+                </label>
+              )}
+              {f.ok && (f.mode_note || (f.encoding && f.encoding !== "UTF-8")) && (
+                <p className="hint">{[f.mode_note, f.encoding !== "UTF-8" ? `written as ${f.encoding}` : ""].filter(Boolean).join(" · ")}</p>
+              )}
               {expanded.has(f.rel_path) && f.ok && !f.identical && <FileDiff file={f} />}
             </div>
           ))}
@@ -274,6 +334,11 @@ export default function ApplyPanel({ root, disabled }: { root: string; disabled:
             ✓ Restored {restored.restored.length} file{restored.restored.length === 1 ? "" : "s"}
             {restored.deleted.length > 0 && `, removed ${restored.deleted.length} created`}
           </p>
+          {restored.skipped.map((f) => (
+            <p className="apply-note" key={f.rel_path}>
+              ✗ {f.rel_path} — {f.reason}
+            </p>
+          ))}
           <p className="hint">
             From <span className="output-path-inline">{restored.backup_dir}</span>
           </p>

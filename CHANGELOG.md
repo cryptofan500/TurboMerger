@@ -2,6 +2,169 @@
 
 All notable changes to TurboMerger will be documented in this file.
 
+## [Unreleased] — v8 refactor, Phases 1–2 (targets 7.8.0)
+
+Stops the silent content loss, corruption and write-anywhere paths found in the
+2026-09-24 audit (`TURBOMERGER_refactor_september24_2026_v2.md`, findings N-xx).
+Every fix ships with its repro turned into a test (96 → 156 Rust tests).
+
+### Security
+- **Apply-back never plants control files (N-52).** Files inside `.git` are
+  refused outright (including `.GIT`, `.git.`, `git~1` and zero-width variants);
+  CI pipelines, git-hook managers, editor and coding-agent settings, env loaders
+  and toolchain configs are held until `--allow-control GLOB` or a per-file
+  confirmation in the app; build manifests (`build.rs`, `package.json`,
+  `setup.py`, `Makefile`, …) until `--allow-manifest GLOB`. Executable targets
+  need `--allow-exec`; created files never get an executable bit.
+- **Apply-back never writes through links (N-17).** All I/O goes through
+  directory handles (cap-std 4.0.3, which includes the fix for
+  GHSA-hp8f-xmx4-4qrg): a symlink or junction anywhere on a path is refused;
+  replacements are temp-file + rename; the OS-reported path of every opened
+  handle is checked against the root.
+- **Restore only trusts backups this machine made.** A `.turbomerger/backups`
+  tree shipped inside a cloned repo can no longer plant files; files edited
+  since the apply are skipped, not clobbered.
+- **MCP is confined (N-18, N-19).** `turbomerger mcp --root DIR` limits what
+  clients can pack or map (default: the working directory, never `/` or the
+  home folder); outputs always land in a managed folder (the client's `output`
+  is only a file-name hint); read/grep serve that folder only; remote repos need
+  `--allow-remote`; the protocol version is negotiated instead of echoed.
+- **Output delimiters cannot be forged (N-20).** cxml content containing
+  `</document` is XML-escaped and marked `escaped="xml"` (apply-back reverses
+  it); plain-format delimiters carry a content-derived tag; control characters
+  in file names are escaped; headers say contents are untrusted data.
+  `--emit-skill` sanitizes the repo name and tree and is ignored for remote
+  sources.
+- **No absolute home paths in outputs (N-21)** — `Source: local folder "<name>"`
+  unless `--show-source-path`.
+- **Remote clones (N-22, N-23):** the token travels as an HTTP header through
+  `GIT_CONFIG_*` (never argv or `.git/config`); Git LFS is skipped; clones time
+  out after 5 minutes (`TURBOMERGER_CLONE_TIMEOUT`); a bare `owner/repo` is a
+  local path — write `gh:owner/repo` to clone; `git@-o…` hosts are refused.
+- **`--git-diff` covers only the merged files (N-24)** — sections for excluded
+  files (credential-dense notes, deleted `.env`) are dropped and listed; git
+  runs with `core.fsmonitor=false`, `--no-ext-diff`, `--no-textconv`.
+
+### Fixed
+- **Nothing vanishes silently (N-01, N-02, N-03).** `packages/`, `build/`,
+  `debug/`, `release/`, `env/`, `vendor/`, `coverage/`… are merged unless
+  `.gitignore` says otherwise; `target/` is pruned only next to a `Cargo.toml`,
+  virtualenvs only with `pyvenv.cfg`/`conda-meta`, caches with `CACHEDIR.TAG`.
+  Every pruned directory is listed with file and byte counts, every hidden file
+  and symlink is listed, and ignored entries are counted per rule. Ancestor
+  ignore files apply only inside a git worktree. Links to files inside the root
+  are merged once. New `turbomerger explain <folder> <path>`.
+- **Byte-identical output (N-14) and no text corruption (N-13, N-35).** Known
+  secrets are masked in one deterministic, parallel Aho-Corasick pass, whole
+  tokens only; unlabeled tokens are harvested only from credential dumps and
+  credential files, never from long documents (the 120-paper corpus no longer
+  gets 1,011 corrupting edits).
+- **Apply-back keeps encodings (N-15):** Windows-1252, UTF-16 and BOM files
+  round-trip byte-for-byte or are refused; characters the file's encoding
+  cannot hold are refused instead of mangled.
+- **Split outputs (N-12):** full tree and contents (with part numbers) in part
+  1, the report once, and budgets that count headers and wrappers.
+- **Text sniffing is validity-first (N-04, N-05):** UTF-8 text is never
+  "binary" (`MZ-80 notes.md`, CJK subtitles, notebooks); `.cc .cxx .hh .cu
+  .glsl .wgsl .csproj .sln .xaml .razor .qml .log .srt .vtt .eml .svg`… are text.
+- **Linux `/run/media/…` and `/run/user/<uid>/…` are usable (N-08);** folder
+  names are no longer NFKC-normalized before I/O (N-09).
+- Outputs are written atomically (temp file + rename).
+
+### Changed
+- **CLI rebuilt on clap (N-30):** typos and bad values are usage errors (exit 2,
+  nothing written); `--help`, `--version` and `completions <shell>` work without
+  a display; `--git-log` no longer swallows the next argument; new `--config`,
+  `--max-file-size`, `--show-source-path`, `--fail-on-skip`, `TURBOMERGER_*`
+  environment mirrors.
+- **Exit codes (N-31, N-53):** 3 = completed but content was not captured
+  (documents and photos without an extractor yet, too large, unreadable,
+  credential-dense) or nothing was merged — the report is still written.
+  The stdout summary gains `not_captured=N`.
+- The Merge Report groups entries into Not captured / Skipped files /
+  Directories not scanned / Ignored by rules; the app shows the same groups and
+  a "not captured" warning.
+
+### Internal
+- `fixtures/` (audit repros with the v7.7.0 baseline, apply-back poisoning,
+  pinned arXiv and photo corpora with local-only payloads), `prototypes/`
+  (reference oracles), `docs/adr/` (0001–0014).
+
+### Phase 2 — workspace, two binaries, streaming, jobs
+
+#### Added
+- **Two binaries (N-29, ADR 0015):** `turbomerger` is a console program on
+  every OS (Windows scripts now see its output and exit codes);
+  `turbomerger-gui` is the desktop app. Installers ship both (the `.deb` puts
+  both in `/usr/bin`). `turbomerger` without arguments opens the app when it is
+  installed and a display is available, else prints help. The app still runs
+  a CLI subcommand it is given (old scripts, the AppImage).
+- **Static Linux CLI:** `cargo build --release --target
+  x86_64-unknown-linux-musl -p tm-cli` gives a static binary (mimalloc) that
+  runs on any distribution, Alpine included; CI checks it.
+- **Progress, ETA, stalls and deadlines (plan §10):** `--progress
+  auto|json|none` (a status line every 5 s on a terminal; JSON lines for
+  scripts), ETA shown after `--eta-after` (default 60 s), a stall report after
+  `--stall-after` (default 10 s) naming the file, `--on-stall wait|fail`,
+  `--deadline 10m` with `--on-deadline cancel|partial`, `--keep-partial`.
+  Ctrl-C cancels cleanly (temp files removed; a second Ctrl-C quits).
+- **Exit code 4:** cancelled (nothing written) or partial (what was done is
+  written; the rest is listed as not captured).
+- **`--reproducible` (N-16):** LF line ends, NFC paths and order, no timestamps
+  — a CRLF/NFD checkout and an LF/NFC one merge to the same bytes.
+- **`--hydrate` (N-10, N-11):** OneDrive and iCloud files that are not on this
+  device are now listed as not captured instead of being downloaded; the flag
+  downloads and reads them.
+- **Token-count cache (plan 2.8):** unchanged files are not re-tokenized
+  (warm re-merges ~35 % faster); `TURBOMERGER_CACHE_DIR`,
+  `TURBOMERGER_NO_CACHE`.
+- **MCP progress and cancellation:** on the official Rust SDK (rmcp 3.4.1);
+  `notifications/progress` for clients that send a progress token, and
+  `notifications/cancelled` stops a pack.
+- **Worker host (`crates/tm-worker`):** the subprocess host for the coming PDF
+  and OCR workers — JSON-lines protocol, stall reports, per-item time budget,
+  memory cap (prlimit / setrlimit / Job Object), kill on cancel.
+
+#### Changed
+- **Desktop jobs (N-32, N-33):** each merge or scan has its own cancel token;
+  Cancel waits for the job to acknowledge; heavy work runs off the async
+  runtime with progress (elapsed, ETA, stalls) over a channel. Watch mode
+  re-merges after a change that arrives during a merge instead of dropping it.
+- **Opening files (N-28):** the app opens and reveals only outputs it wrote
+  this session; the chat-site buttons use a fixed allowlist; Explorer gets a
+  correctly quoted `/select`; Linux file managers select the file via D-Bus.
+- **Outputs (N-45):** generated names never overwrite an earlier output
+  (`…-2_merged.md`); `out/` names a folder, created when missing (v7 wrote a
+  file called `out`); the default folder falls back Downloads → home → cwd.
+- **Classification:** what a file is comes before how big it is — a large
+  binary or zero-filled file is "binary", not "too large" (which exits 3).
+- **Token counts** use tiktoken's ordinary encoding: `<|endoftext|>` in a file
+  is text, as in a chat window (ADR 0016).
+- **Windows paths (N-41):** no `\\?\` prefixes (dunce); **links (N-10):** only
+  symlinks and junctions are links — OneDrive folders are no longer pruned or
+  refused as roots.
+- **Linux + NVIDIA + Wayland (N-42):** the app disables WebKit's DMA-BUF
+  renderer there (blank window), unless you set it yourself.
+- Build output moved from `src-tauri/target` to `target/`; the version lives
+  once in the root `Cargo.toml`.
+
+#### Performance (release, Ryzen 5 5500U)
+- Streaming merge (D4, N-36, N-37): texts go to a spool file; memory holds
+  metadata only — a 3.4 GiB, 65,367-entry tree merges at 119 MB peak RSS with
+  every entry accounted for.
+- `opt-level = 3` (ADR 0016) and no exit delay: A.6 0.58 s (was 0.75),
+  A.10 0.65 s (0.95), the 3.4 GiB tree 3.5 s (4.7–5.8).
+
+#### Internal
+- Cargo workspace: `crates/tm-core` (engine, no GUI), `crates/tm-worker`,
+  `apps/tm-cli`, `apps/tm-mcp`, `src-tauri` (`tm-gui`).
+- Golden outputs (`fixtures/golden/`) pin the merged bytes of 17 runs; CI
+  compares them on Windows, macOS and Linux.
+- GUI smoke test (`fixtures/gui-smoke`): the app driven through WebDriver in a
+  virtual display, 18 checks, in Linux CI. Scale fixture `fixtures/big-tree`.
+- Dependencies: React 19, Vite 8, ESLint 10, actions/checkout 7,
+  actions/setup-node 7, toml 1, similar 3, dirs 6, phf 0.13.
+
 ## [7.7.0] - 2026-08-06
 
 Linux release — TurboMerger runs natively on Linux x64 (Debian/Ubuntu/Mint and

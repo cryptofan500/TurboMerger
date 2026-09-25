@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -13,6 +13,8 @@ interface MergeResult {
   output_paths: string[];
   files_processed: number;
   files_skipped: number;
+  /** Inputs whose content is NOT in the output (documents, photos, too large…). */
+  not_captured: number;
   total_bytes: number;
   duration_ms: number;
   files_by_extension: number;
@@ -25,42 +27,91 @@ interface MergeResult {
   skill_path: string | null;
 }
 
-interface ProgressUpdate {
-  current: number;
+/** One progress report from a running job (tm_core::progress snapshot). */
+interface JobProgress {
+  stage: "scan" | "classify" | "merge";
+  done: number;
+  /** 0 while unknown. */
   total: number;
-  current_file: string;
-  percentage: number;
+  current: string;
+  elapsed_ms: number;
+  /** Shown only after the job has run for a minute. */
+  eta_ms: number | null;
+  eta_band_ms: number | null;
+  /** Set when nothing has moved for a while. */
+  stalled_ms: number | null;
 }
 
-type Status = "ready" | "scanning" | "merging" | "done" | "error" | "cancelled";
+type Status = "ready" | "scanning" | "merging" | "cancelling" | "done" | "error" | "cancelled";
+
+const newJobId = () =>
+  typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `job-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 type Preset = "custom" | "lean" | "archive" | "docs" | "claude";
 
 const SETTINGS_KEY = "turbomerger.settings.v1";
 
+/** Settings saved by an earlier session; anything missing or malformed is ignored. */
+interface SavedSettings {
+  includeVenv?: boolean; includeTree?: boolean; contentDetection?: boolean;
+  respectGitignore?: boolean; includeHidden?: boolean; redactSecrets?: boolean;
+  format?: string; ordering?: string; maxTokens?: string; includeGlobs?: string;
+  excludeGlobs?: string; removeEmptyLines?: boolean; truncateBase64?: boolean;
+  compress?: boolean; stripComments?: boolean; gitDiff?: boolean; gitLogCount?: string;
+  emitSkill?: boolean; sourcePath?: string;
+}
+
+function loadSettings(): SavedSettings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    const s: unknown = raw ? JSON.parse(raw) : null;
+    if (!s || typeof s !== "object") return {};
+    const out: Record<string, unknown> = {};
+    const kinds: Record<keyof SavedSettings, "boolean" | "string"> = {
+      includeVenv: "boolean", includeTree: "boolean", contentDetection: "boolean",
+      respectGitignore: "boolean", includeHidden: "boolean", redactSecrets: "boolean",
+      format: "string", ordering: "string", maxTokens: "string", includeGlobs: "string",
+      excludeGlobs: "string", removeEmptyLines: "boolean", truncateBase64: "boolean",
+      compress: "boolean", stripComments: "boolean", gitDiff: "boolean",
+      gitLogCount: "string", emitSkill: "boolean", sourcePath: "string",
+    };
+    for (const [key, kind] of Object.entries(kinds)) {
+      const v = (s as Record<string, unknown>)[key];
+      if (typeof v === kind) out[key] = v;
+    }
+    return out as SavedSettings;
+  } catch {
+    return {}; // corrupt settings
+  }
+}
+
 function App() {
+  // Read once, before the first render (not setState inside an effect).
+  const [saved] = useState(loadSettings);
   const [status, setStatus] = useState<Status>("ready");
   const [version, setVersion] = useState<string>("");
-  const [sourcePath, setSourcePath] = useState<string>("");
+  const [sourcePath, setSourcePath] = useState<string>(saved.sourcePath ?? "");
   const [outputPath, setOutputPath] = useState<string>("");
 
-  const [includeVenv, setIncludeVenv] = useState(false);
-  const [includeTree, setIncludeTree] = useState(true);
-  const [contentDetection, setContentDetection] = useState(true);
-  const [respectGitignore, setRespectGitignore] = useState(true);
-  const [includeHidden, setIncludeHidden] = useState(false);
-  const [redactSecrets, setRedactSecrets] = useState(true);
-  const [format, setFormat] = useState<string>("markdown");
-  const [ordering, setOrdering] = useState<string>("path");
-  const [maxTokens, setMaxTokens] = useState<string>("");
-  const [includeGlobs, setIncludeGlobs] = useState<string>("");
-  const [excludeGlobs, setExcludeGlobs] = useState<string>("");
-  const [removeEmptyLines, setRemoveEmptyLines] = useState(false);
-  const [truncateBase64, setTruncateBase64] = useState(false);
-  const [compress, setCompress] = useState(false);
-  const [stripComments, setStripComments] = useState(false);
-  const [gitDiff, setGitDiff] = useState(false);
-  const [gitLogCount, setGitLogCount] = useState<string>("");
-  const [emitSkill, setEmitSkill] = useState(false);
+  const [includeVenv, setIncludeVenv] = useState(saved.includeVenv ?? false);
+  const [includeTree, setIncludeTree] = useState(saved.includeTree ?? true);
+  const [contentDetection, setContentDetection] = useState(saved.contentDetection ?? true);
+  const [respectGitignore, setRespectGitignore] = useState(saved.respectGitignore ?? true);
+  const [includeHidden, setIncludeHidden] = useState(saved.includeHidden ?? false);
+  const [redactSecrets, setRedactSecrets] = useState(saved.redactSecrets ?? true);
+  const [format, setFormat] = useState<string>(saved.format ?? "markdown");
+  const [ordering, setOrdering] = useState<string>(saved.ordering ?? "path");
+  const [maxTokens, setMaxTokens] = useState<string>(saved.maxTokens ?? "");
+  const [includeGlobs, setIncludeGlobs] = useState<string>(saved.includeGlobs ?? "");
+  const [excludeGlobs, setExcludeGlobs] = useState<string>(saved.excludeGlobs ?? "");
+  const [removeEmptyLines, setRemoveEmptyLines] = useState(saved.removeEmptyLines ?? false);
+  const [truncateBase64, setTruncateBase64] = useState(saved.truncateBase64 ?? false);
+  const [compress, setCompress] = useState(saved.compress ?? false);
+  const [stripComments, setStripComments] = useState(saved.stripComments ?? false);
+  const [gitDiff, setGitDiff] = useState(saved.gitDiff ?? false);
+  const [gitLogCount, setGitLogCount] = useState<string>(saved.gitLogCount ?? "");
+  const [emitSkill, setEmitSkill] = useState(saved.emitSkill ?? false);
   const [preset, setPreset] = useState<Preset>("custom");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showApply, setShowApply] = useState(false);
@@ -80,41 +131,18 @@ function App() {
 
   const [result, setResult] = useState<MergeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [progress, setProgress] = useState<ProgressUpdate | null>(null);
+  const [progress, setProgress] = useState<JobProgress | null>(null);
+  // The running merge/scan, so Cancel reaches exactly that job.
+  const [jobId, setJobId] = useState<string | null>(null);
 
   const isRemote =
     /^(https?:\/\/|git@)/.test(sourcePath.trim()) ||
     /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(sourcePath.trim());
 
-  // Load persisted settings + version on mount.
+  // Output folder + version on mount (async results, not synchronous setState).
   useEffect(() => {
     invoke<string>("get_downloads_path").then(setOutputPath).catch(console.error);
     getVersion().then(setVersion).catch(console.error);
-    try {
-      const raw = localStorage.getItem(SETTINGS_KEY);
-      if (raw) {
-        const s = JSON.parse(raw);
-        if (typeof s.includeVenv === "boolean") setIncludeVenv(s.includeVenv);
-        if (typeof s.includeTree === "boolean") setIncludeTree(s.includeTree);
-        if (typeof s.contentDetection === "boolean") setContentDetection(s.contentDetection);
-        if (typeof s.respectGitignore === "boolean") setRespectGitignore(s.respectGitignore);
-        if (typeof s.includeHidden === "boolean") setIncludeHidden(s.includeHidden);
-        if (typeof s.redactSecrets === "boolean") setRedactSecrets(s.redactSecrets);
-        if (typeof s.format === "string") setFormat(s.format);
-        if (typeof s.ordering === "string") setOrdering(s.ordering);
-        if (typeof s.maxTokens === "string") setMaxTokens(s.maxTokens);
-        if (typeof s.includeGlobs === "string") setIncludeGlobs(s.includeGlobs);
-        if (typeof s.excludeGlobs === "string") setExcludeGlobs(s.excludeGlobs);
-        if (typeof s.removeEmptyLines === "boolean") setRemoveEmptyLines(s.removeEmptyLines);
-        if (typeof s.truncateBase64 === "boolean") setTruncateBase64(s.truncateBase64);
-        if (typeof s.compress === "boolean") setCompress(s.compress);
-        if (typeof s.stripComments === "boolean") setStripComments(s.stripComments);
-        if (typeof s.gitDiff === "boolean") setGitDiff(s.gitDiff);
-        if (typeof s.gitLogCount === "string") setGitLogCount(s.gitLogCount);
-        if (typeof s.emitSkill === "boolean") setEmitSkill(s.emitSkill);
-        if (typeof s.sourcePath === "string") setSourcePath(s.sourcePath);
-      }
-    } catch { /* ignore corrupt settings */ }
   }, []);
 
   // Persist settings on change (never the PAT).
@@ -131,14 +159,15 @@ function App() {
       removeEmptyLines, truncateBase64, compress, stripComments, gitDiff,
       gitLogCount, emitSkill, sourcePath]);
 
-  // Selection is per-project: reset on source change, restore on scan.
-  useEffect(() => {
+  // Selection is per-project: a new source resets it (restored on scan).
+  const changeSource = (path: string) => {
+    setSourcePath(path);
     setScanReport(null);
     setCurateOpen(false);
     setExcluded(new Set());
     setForceInclude(new Set());
     setWatching(false);
-  }, [sourcePath]);
+  };
 
   // Persist the curation (exclusions + rescues) per project.
   const selectionKey = (src: string) => `turbomerger.selection.${src}`;
@@ -152,15 +181,8 @@ function App() {
     } catch { /* quota */ }
   }, [excluded, forceInclude, scanReport]);
 
-  // Progress + watch listeners.
+  // Watch-mode results arrive as events; job progress comes over channels.
   useEffect(() => {
-    const unlistenMerge = listen<ProgressUpdate>("merge-progress", (event) => {
-      setProgress(event.payload);
-      if (event.payload.total > 0) setStatus("merging");
-    });
-    const unlistenScan = listen<ProgressUpdate>("scan-progress", (event) => {
-      setProgress(event.payload);
-    });
     const unlistenWatch = listen<MergeResult>("watch-merged", (event) => {
       setResult(event.payload);
       setStatus("done");
@@ -170,12 +192,22 @@ function App() {
       setStatus("error");
     });
     return () => {
-      unlistenMerge.then((f) => f());
-      unlistenScan.then((f) => f());
       unlistenWatch.then((f) => f());
       unlistenWatchErr.then((f) => f());
     };
   }, []);
+
+  /** A channel that shows a job's progress; merges switch the status once files flow. */
+  const progressChannel = (merging: boolean) => {
+    const ch = new Channel<JobProgress>();
+    ch.onmessage = (p) => {
+      setProgress(p);
+      if (merging && p.stage === "merge") {
+        setStatus((s) => (s === "scanning" ? "merging" : s));
+      }
+    };
+    return ch;
+  };
 
   // Drag-and-drop a folder onto the window.
   useEffect(() => {
@@ -185,7 +217,7 @@ function App() {
         event.payload.type === "drop" &&
         event.payload.paths.length > 0
       ) {
-        setSourcePath(event.payload.paths[0]);
+        changeSource(event.payload.paths[0]);
       }
     });
     return () => { p.then((f) => f()); };
@@ -213,7 +245,7 @@ function App() {
 
   const selectSource = async () => {
     const selected = await open({ directory: true, multiple: false, title: "Select Codebase to Merge" });
-    if (selected && typeof selected === "string") setSourcePath(selected);
+    if (selected && typeof selected === "string") changeSource(selected);
   };
 
   const selectOutput = async () => {
@@ -225,10 +257,11 @@ function App() {
     if (selected) setOutputPath(selected);
   };
 
+  // Ask the running job to stop; its promise settling is the acknowledgement.
   const handleCancel = async () => {
-    await invoke("cancel_merge");
-    setStatus("cancelled");
-    setProgress(null);
+    if (!jobId) return;
+    setStatus("cancelling");
+    await invoke<boolean>("cancel_job", { job: jobId }).catch(console.error);
   };
 
   const buildOptions = () => {
@@ -267,37 +300,50 @@ function App() {
 
   const handleMerge = async () => {
     if (!sourcePath) return;
+    const job = newJobId();
     try {
-      await invoke("reset_cancel");
+      setJobId(job);
       setStatus("scanning");
       setError(null);
       setResult(null);
       setProgress(null);
 
       const options = buildOptions();
+      const progress = progressChannel(true);
       const mergeResult = isRemote
         ? await invoke<MergeResult>("pack_remote", {
             url: sourcePath.trim(),
             pat: pat || null,
             options,
+            job,
+            progress,
           })
-        : await invoke<MergeResult>("merge_folder", { options });
+        : await invoke<MergeResult>("merge_folder", { options, job, progress });
       setResult(mergeResult);
       setStatus("done");
     } catch (err) {
       const msg = String(err);
       if (msg.includes("cancelled")) setStatus("cancelled");
       else { setError(msg); setStatus("error"); }
+    } finally {
+      setJobId(null);
+      setProgress(null);
     }
   };
 
   const handleScan = async () => {
     if (!sourcePath || isRemote) return;
+    const job = newJobId();
     try {
+      setJobId(job);
       setStatus("scanning");
       setError(null);
       setProgress(null);
-      const report = await invoke<ScanReport>("scan_folder", { options: buildOptions() });
+      const report = await invoke<ScanReport>("scan_folder", {
+        options: buildOptions(),
+        job,
+        progress: progressChannel(false),
+      });
       setScanReport(report);
       // Restore this project's saved curation, dropping stale paths.
       try {
@@ -314,10 +360,13 @@ function App() {
       } catch { /* corrupt selection */ }
       setCurateOpen(true);
       setStatus("ready");
-      setProgress(null);
     } catch (err) {
-      setError(String(err));
-      setStatus("error");
+      const msg = String(err);
+      if (msg.includes("cancelled")) setStatus("cancelled");
+      else { setError(msg); setStatus("error"); }
+    } finally {
+      setJobId(null);
+      setProgress(null);
     }
   };
 
@@ -342,6 +391,8 @@ function App() {
 
   const openThing = (path: string) => invoke("open_file", { path }).catch(console.error);
   const openFolder = (path: string) => invoke("open_folder", { path }).catch(console.error);
+  const openWeb = (site: "claude" | "chatgpt" | "gemini") =>
+    invoke("open_web", { site }).catch(console.error);
 
   const formatBytes = (b: number) =>
     b < 1024 ? `${b} B` : b < 1048576 ? `${(b / 1024).toFixed(1)} KB` : `${(b / 1048576).toFixed(1)} MB`;
@@ -355,7 +406,13 @@ function App() {
     : claude <= 1000000 ? "over Claude 200k — split or use Gemini 1M"
     : "over 1M — splitting required";
 
-  const isWorking = status === "scanning" || status === "merging";
+  const isWorking = status === "scanning" || status === "merging" || status === "cancelling";
+  const formatClock = (ms: number) => {
+    const s = Math.round(ms / 1000);
+    return s >= 60 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s` : `${s}s`;
+  };
+  const stageLabel = (p: JobProgress) =>
+    p.stage === "scan" ? "Scanning directory..." : p.stage === "classify" ? "Classifying files..." : p.current;
 
   return (
     <div className="app">
@@ -372,7 +429,7 @@ function App() {
               type="text"
               className="input"
               value={sourcePath}
-              onChange={(e) => setSourcePath(e.target.value)}
+              onChange={(e) => changeSource(e.target.value)}
               placeholder="Folder, owner/repo, or GitHub URL — or drag a folder here..."
               disabled={isWorking || watching}
             />
@@ -531,7 +588,9 @@ function App() {
 
         <section className="section">
           {isWorking ? (
-            <button className="btn btn-danger btn-full" onClick={handleCancel}>CANCEL</button>
+            <button className="btn btn-danger btn-full" onClick={handleCancel} disabled={status === "cancelling" || !jobId}>
+              {status === "cancelling" ? "CANCELLING…" : "CANCEL"}
+            </button>
           ) : (
             <div className="merge-row">
               <button className="btn btn-primary merge-main" onClick={handleMerge} disabled={!sourcePath || watching}>
@@ -595,14 +654,28 @@ function App() {
         {isWorking && (
           <section className="section">
             <div className="progress-container">
-              <div className="progress-bar" style={{ width: `${progress?.percentage || 0}%` }} />
+              <div
+                className="progress-bar"
+                style={{ width: `${progress && progress.total > 0 ? (progress.done / progress.total) * 100 : 0}%` }}
+              />
             </div>
             <p className="status-text">
-              {status === "scanning" ? "Scanning directory..." : progress?.current_file}
+              {status === "cancelling" ? "Cancelling…" : progress ? stageLabel(progress) : "Scanning directory..."}
             </p>
-            {progress && progress.total > 0 && (
+            {progress && (
               <p className="progress-text">
-                {progress.current.toLocaleString()} / {progress.total.toLocaleString()} files ({progress.percentage.toFixed(1)}%)
+                {progress.total > 0
+                  ? `${progress.done.toLocaleString()} / ${progress.total.toLocaleString()} files (${((progress.done / progress.total) * 100).toFixed(1)}%)`
+                  : `${progress.done.toLocaleString()} entries`}
+                {` · ${formatClock(progress.elapsed_ms)}`}
+                {progress.eta_ms !== null && ` · ETA ${formatClock(progress.eta_ms)}`}
+                {progress.eta_ms !== null && progress.eta_band_ms !== null && progress.eta_band_ms >= 1000 &&
+                  ` ± ${formatClock(progress.eta_band_ms)}`}
+              </p>
+            )}
+            {progress && progress.stalled_ms !== null && (
+              <p className="progress-text" style={{ color: "var(--warning)" }}>
+                Stalled on {progress.current || "the scan"} for {formatClock(progress.stalled_ms)} — Cancel stops it
               </p>
             )}
           </section>
@@ -625,6 +698,12 @@ function App() {
               {result.files_skipped_binary > 0 && `, ${result.files_skipped_binary.toLocaleString()} binary`}
               {result.files_unreadable > 0 && `, ${result.files_unreadable.toLocaleString()} unreadable`}
             </p>
+            {result.not_captured > 0 && (
+              <p className="detection-breakdown" style={{ color: "var(--warning)" }}>
+                ⚠ {result.not_captured.toLocaleString()} input{result.not_captured === 1 ? "" : "s"} not
+                captured (documents, photos, too large, unreadable…) — see “Not captured” in the Merge Report
+              </p>
+            )}
             {result.secrets_redacted > 0 && (
               <p className="detection-breakdown" style={{ color: "var(--warning)" }}>
                 ⚠ {result.secrets_redacted.toLocaleString()} secret{result.secrets_redacted === 1 ? "" : "s"} redacted — see Merge Report in the output
@@ -643,9 +722,9 @@ function App() {
               <button className="btn btn-secondary" onClick={() => openFolder(result.output_path)}>Show in Folder</button>
             </div>
             <div className="action-buttons">
-              <button className="btn btn-secondary" onClick={() => openThing("https://claude.ai/new")}>claude.ai</button>
-              <button className="btn btn-secondary" onClick={() => openThing("https://chatgpt.com")}>chatgpt.com</button>
-              <button className="btn btn-secondary" onClick={() => openThing("https://gemini.google.com/app")}>gemini</button>
+              <button className="btn btn-secondary" onClick={() => openWeb("claude")}>claude.ai</button>
+              <button className="btn btn-secondary" onClick={() => openWeb("chatgpt")}>chatgpt.com</button>
+              <button className="btn btn-secondary" onClick={() => openWeb("gemini")}>gemini</button>
             </div>
             {result.output_paths.map((p) => <p className="output-path" key={p}>{p}</p>)}
           </section>

@@ -1,0 +1,22 @@
+{
+  "format_version": 1,
+  "source": "spot test #2, 2026-09-24 (prototypes/photo_ocr_spottest.py, PP-OCRv6 small, 2000 px, 3 processes x 2 threads)",
+  "photos": 6,
+  "text_lines": 656,
+  "stickers": 27,
+  "stickers_partly_visible": 2,
+  "check_strings": { "total": 134, "min_found": 133 },
+  "sticker_to_table_row": { "total": 27, "min_matched": 27 },
+  "quantities_consistent": { "visible": 21, "min_consistent": 21 },
+  "barcodes": { "read": 23, "min_equal_printed_digits": 21, "digits_hidden_and_flagged": 2 },
+  "flags": {
+    "sticker_cut_by_edge": 6,
+    "sticker_half_outside": 1,
+    "partly_covered_by_hand": 2,
+    "header_text_cut": 4,
+    "barcode_digits_hidden": 2,
+    "low_confidence_items": 2,
+    "annotation_ink": 1
+  },
+  "wall_time_s": { "prototype_this_laptop": 15.0, "rust_gate": 20.0 }
+}

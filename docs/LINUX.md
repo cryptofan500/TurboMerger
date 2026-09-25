@@ -116,17 +116,19 @@ npm run tauri:build:linux
 Outputs:
 
 ```text
-src-tauri/target/release/turbomerger
-src-tauri/target/release/bundle/deb/*.deb
-src-tauri/target/release/bundle/appimage/*.AppImage
+target/release/turbomerger-gui        # the desktop app
+target/release/turbomerger            # the command line (also inside the .deb)
+target/release/bundle/deb/*.deb
+target/release/bundle/appimage/*.AppImage
 ```
 
 ### 4. Verify the bundle
 
 ```bash
-dpkg --info src-tauri/target/release/bundle/deb/*.deb
-file src-tauri/target/release/bundle/appimage/*.AppImage
-./src-tauri/target/release/turbomerger --help >/dev/null && echo "binary runs"
+dpkg --info target/release/bundle/deb/*.deb
+dpkg-deb -c target/release/bundle/deb/*.deb | grep usr/bin/   # turbomerger + turbomerger-gui
+file target/release/bundle/appimage/*.AppImage
+./target/release/turbomerger --help >/dev/null && echo "binary runs"
 ```
 
 ## Smoke test
@@ -182,9 +184,9 @@ sudo apt install git
 
 ### A dependency reports the wrong architecture
 
-Do not copy `node_modules` or `src-tauri/target` from Windows or macOS.
+Do not copy `node_modules` or `target` from Windows or macOS.
 
 ```bash
-rm -rf node_modules src-tauri/target
+rm -rf node_modules target
 npm ci
 ```

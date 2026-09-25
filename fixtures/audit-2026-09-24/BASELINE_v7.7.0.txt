@@ -1,0 +1,80 @@
+# /usr/bin/turbomerger v7.7.0 on Linux x64, 2026-09-24 (Toronto) — `$SP` = scratch dir
+
+### A.1
+merged=2 scan_skipped=120 merge_skipped=0 redacted=0 tokens_o200k=14184 parts=1
+out=$SP/arxiv_out.md
+exit=0
+### A.2
+merged=2 scan_skipped=4 merge_skipped=2 redacted=0 tokens_o200k=41 parts=1
+out=$SP/fx_out.md
+exit=0
+exit=0
+4
+6:> Source: $SP/fx
+### A.3
+`merge $SP/fx --includ-hidden -q` → exit=0 and a file named `--includ-hidden` in the cwd (the typo became the output path)
+`merge $SP/fx out.md --max-tokens abc` → out=out.md, exit=0 (invalid number ignored)
+
+thread 'main' (2769178) panicked at /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.35.3/src/platform_impl/linux/event_loop.rs:217:53:
+Failed to initialize gtk backend!: BoolError { message: "Failed to initialize GTK", filename: "/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk-0.18.2/src/rt.rs", function: "gtk::rt::init", line: 141 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+a03_cli_parsing.sh: line 11: 2769178 Aborted                 (core dumped) env -u DISPLAY -u WAYLAND_DISPLAY "$TM" --version
+exit=134
+### A.4
+6 parts (split_out.part1-of-6.md … part6-of-6.md), exit=0
+"### Skipped files" appears in 6 of 6 parts
+part 1 "Project Structure" lists 1 of 6 files; parts 2-6 list none
+### A.5
+      5 The old value was [REDACTED] and the rotated value is [REDACTED] today.
+      7 The old value was [REDACTED] and the rotated value is [REDACTED]W8nB3c today.
+2
+### A.7
+error: Security error: Access denied: system path
+exit=1
+error: Security error: Path validation failed: No such file or directory (os error 2)
+exit=1
+error: Security error: Path validation failed: No such file or directory (os error 2)
+exit=1
+### A.8
+exit=0
+WRITTEN BY APPLY-BACK
+modify menu.txt +1 -1
+applied menu.txt
+backup=$SP/enc/root/.turbomerger/backups/2026-09-24T19-22-22Z
+undo: turbomerger apply "$SP/enc/root" --restore
+exit=0
+6c696e65206f6e6520636166efbfbd0a
+### A.9
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2099-01-01","serverInfo":{"name":"turbomerger","version":"7.7.0"}}}
+{"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"merged=2 skipped=1 secrets_redacted=2 tokens_o200k=36 (~42 Claude est.) parts=1\noutput: ~/Downloads/ai-scratch/stateful/stateful-claude-claude-opus-5-5-20260924T190637Z/claude-1000/-home-pawel-Documents/232ffa97-2206-4606-9321-33a5f5ac
+total 12
+drwxrwxr-x  2 pawel pawel 4096 Sep 24 15:22 .
+drwxrwxr-x 10 pawel pawel 4096 Sep 24 15:22 ..
+-rw-rw-r--  1 pawel pawel  895 Sep 24 15:22 .bashrc_probe
+### A.11
+modify src/main.rs +3 -1
+modify .git/hooks/pre-commit +1 -1
+create .GIT/hooks/post-checkout +2 -0
+create .github/workflows/ci.yml +6 -0
+create .vscode/tasks.json +11 -0
+create .claude/settings.json +1 -0
+create build.rs +3 -0
+modify docs/note.md +1 -1
+applied src/main.rs
+applied .git/hooks/pre-commit
+applied .GIT/hooks/post-checkout
+applied .github/workflows/ci.yml
+applied .vscode/tasks.json
+applied .claude/settings.json
+applied build.rs
+applied docs/note.md
+backup=$SP/poison/root/.turbomerger/backups/2026-09-24T19-22-23Z
+undo: turbomerger apply "$SP/poison/root" --restore
+exit=0
+-rwxrwxr-x 1 pawel pawel 64 Sep 24 15:22 $SP/poison/root/.git/hooks/pre-commit
+#!/bin/sh
+echo "POISON: hook payload ran" > /tmp/tm_poison_hook
+WRITTEN BY APPLY-BACK
+### A.14
+no text files found
+exit=1

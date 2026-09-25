@@ -1,25 +1,17 @@
-pub mod applyback;
-mod commands;
-pub mod compress;
-pub mod config;
-pub mod mcp;
-pub mod merger;
-pub mod remote;
-pub mod repomap;
-pub mod scanner;
-pub mod security;
-pub mod tokens;
+//! TurboMerger desktop app: a Tauri shell over `tm-core`. The console
+//! command line is the separate `turbomerger` binary (`apps/tm-cli`).
 
-pub use commands::{run_apply_cli, run_cli, run_map_cli, ApplyArgs, CliArgs, MapArgs};
-pub use mcp::run_mcp;
+mod commands;
 
 use std::sync::Mutex;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    tm_core::cache::enable(None);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(Mutex::new(commands::AppState::default()))
+        .manage(commands::Jobs::default())
+        .manage(commands::Outputs::default())
         .manage(Mutex::new(commands::WatchState::default()))
         .manage(Mutex::new(commands::ApplyUiState::default()))
         .invoke_handler(tauri::generate_handler![
@@ -29,11 +21,11 @@ pub fn run() {
             commands::repo_map,
             commands::start_watch,
             commands::stop_watch,
-            commands::cancel_merge,
-            commands::reset_cancel,
+            commands::cancel_job,
             commands::get_downloads_path,
             commands::open_file,
             commands::open_folder,
+            commands::open_web,
             commands::preview_apply,
             commands::apply_accepted,
             commands::restore_backup,

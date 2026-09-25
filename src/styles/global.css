@@ -443,6 +443,12 @@ body {
 .badge-modify { background: rgba(88, 166, 255, 0.15); color: var(--accent); }
 .badge-create { background: rgba(63, 185, 80, 0.15); color: var(--success); }
 .badge-blocked { background: rgba(248, 81, 73, 0.15); color: var(--danger); }
+.badge-control { background: rgba(248, 81, 73, 0.22); color: var(--danger); font-weight: 600; }
+.badge-manifest { background: rgba(210, 153, 34, 0.18); color: #d29922; font-weight: 600; }
+.apply-confirm { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0 2px; padding: 6px 8px; border-radius: 6px; font-size: 12px; line-height: 1.4; cursor: pointer; }
+.apply-confirm input { margin-top: 2px; }
+.apply-confirm-control { background: rgba(248, 81, 73, 0.10); border: 1px solid rgba(248, 81, 73, 0.45); }
+.apply-confirm-manifest { background: rgba(210, 153, 34, 0.10); border: 1px solid rgba(210, 153, 34, 0.45); }
 .diffstat-add { color: var(--success); font-family: monospace; }
 .diffstat-del { color: var(--danger); font-family: monospace; }
 

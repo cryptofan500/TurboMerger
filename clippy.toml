@@ -1,0 +1,7 @@
+# N-41: std's canonicalize returns verbatim `\\?\C:\…` paths on Windows, which
+# leak into git arguments and outputs. dunce::canonicalize avoids them
+# wherever Windows allows.
+disallowed-methods = [
+  { path = "std::fs::canonicalize", reason = "use dunce::canonicalize (no \\\\?\\ prefixes on Windows, N-41)" },
+  { path = "std::path::Path::canonicalize", reason = "use dunce::canonicalize (no \\\\?\\ prefixes on Windows, N-41)" },
+]

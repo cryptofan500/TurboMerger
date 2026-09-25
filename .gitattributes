@@ -15,3 +15,6 @@
 *.jpg binary
 *.jpeg binary
 *.gif binary
+
+# Golden outputs are compared byte for byte (CRLF content included): no EOL conversion.
+fixtures/golden/** -text

@@ -1,232 +1,173 @@
-//! Tauri command handlers + a headless CLI path (shared merge core).
+//! Tauri command handlers. The work itself is `tm_core`; this module owns
+//! the desktop specifics:
+//!
+//! - Jobs (N-32): every merge or scan gets a job id from the UI and its own
+//!   `CancelToken`; `cancel_job` cancels that job only, and the UI treats the
+//!   job's promise settling as the acknowledgement.
+//! - Nothing heavy runs on an async worker or the main thread (N-33): the
+//!   work goes to `spawn_blocking`, and progress (with ETA and stall
+//!   reports) streams back over a `tauri::ipc::Channel`.
+//! - Watch mode: one worker thread merges on demand; changes that arrive
+//!   during a merge trigger one more merge afterwards instead of being lost.
+//! - `open_file` / `open_folder` only open outputs this session wrote, and
+//!   `open_web` only the three chat sites (N-28).
 
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use chrono::Local;
-use tauri::{AppHandle, Emitter, State};
+use tauri::ipc::Channel;
+use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::merger::{MergeConfig, Ordering as MergeOrdering, OutputFormat};
-use crate::scanner::{self, ScanOptions};
-use crate::security;
+use tm_core::job::{resolve_job, run_merge, JobError, MergeOptions, MergeResult, Progress, Stage};
+use tm_core::progress::{Snapshot, Tracker};
+use tm_core::{scanner, security, CancelToken};
 
-/// Application state for cancellation
-pub struct AppState {
-    pub cancel_flag: Arc<AtomicBool>,
-}
+/// When a job's ETA may be shown (plan §10.3: early rates mislead).
+const ETA_AFTER: Duration = Duration::from_secs(60);
+/// No progress for this long is reported as a stall.
+const STALL_AFTER: Duration = Duration::from_secs(10);
 
-impl Default for AppState {
-    fn default() -> Self {
-        Self {
-            cancel_flag: Arc::new(AtomicBool::new(false)),
+/// Running jobs, by the id the UI chose.
+#[derive(Default)]
+pub struct Jobs(Mutex<HashMap<String, CancelToken>>);
+
+impl Jobs {
+    fn start(&self, id: &str) -> Result<CancelToken, String> {
+        let mut jobs = self.0.lock().map_err(|e| e.to_string())?;
+        if jobs.contains_key(id) {
+            return Err(format!("job {} is already running", id));
+        }
+        let token = CancelToken::new();
+        jobs.insert(id.to_string(), token.clone());
+        Ok(token)
+    }
+    fn end(&self, id: &str) {
+        if let Ok(mut jobs) = self.0.lock() {
+            jobs.remove(id);
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct MergeResult {
-    pub output_path: String,
-    pub output_paths: Vec<String>,
-    pub files_processed: usize,
-    pub files_skipped: usize,
-    pub total_bytes: usize,
-    pub duration_ms: u64,
-    pub files_by_extension: usize,
-    pub files_by_content: usize,
-    pub files_skipped_binary: usize,
-    pub files_unreadable: usize,
-    pub secrets_redacted: usize,
-    pub tokens_o200k: usize,
-    pub tokens_claude_est: usize,
-    pub skill_path: Option<String>,
-}
+/// Every file a merge wrote in this session — the only paths `open_file`
+/// and `open_folder` will hand to the OS (N-28).
+#[derive(Default)]
+pub struct Outputs(Mutex<HashSet<PathBuf>>);
 
-#[derive(Debug, Serialize, Clone)]
-pub struct ProgressUpdate {
-    pub current: usize,
-    pub total: usize,
-    pub current_file: String,
-    pub percentage: f32,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct MergeOptions {
-    pub folder_path: String,
-    pub output_path: Option<String>,
-    pub include_venv: bool,
-    pub include_tree: bool,
-    pub content_detection: bool,
-    #[serde(default = "default_true")]
-    pub respect_gitignore: bool,
-    #[serde(default)]
-    pub include_hidden: bool,
-    #[serde(default = "default_true")]
-    pub redact_secrets: bool,
-    #[serde(default)]
-    pub format: Option<String>,
-    #[serde(default)]
-    pub ordering: Option<String>,
-    #[serde(default)]
-    pub max_tokens: Option<usize>,
-    #[serde(default)]
-    pub include_globs: Vec<String>,
-    #[serde(default)]
-    pub exclude_globs: Vec<String>,
-    #[serde(default)]
-    pub remove_empty_lines: bool,
-    #[serde(default)]
-    pub truncate_base64: bool,
-    /// Signatures-only mode: elide function bodies via tree-sitter (T2-3).
-    #[serde(default)]
-    pub compress: bool,
-    /// Remove comments via tree-sitter (T2-4).
-    #[serde(default)]
-    pub strip_comments: bool,
-    /// Append `git diff HEAD` as a final section (T2-5).
-    #[serde(default)]
-    pub git_diff: bool,
-    /// Append `git log -n N` as a final section; 0 = off (T2-5).
-    #[serde(default)]
-    pub git_log_count: usize,
-    /// Write `.claude/skills/<repo>/SKILL.md` into the scanned repo (T3-4).
-    #[serde(default)]
-    pub emit_skill: bool,
-    /// Exact relative paths to merge (curated in the file tree). None = all.
-    #[serde(default)]
-    pub selected_paths: Option<Vec<String>>,
-    /// Relative paths rescued from scan-level skips ("include anyway").
-    /// Merge-level safety (binary check, credential-dense exclusion,
-    /// redaction) still applies to these.
-    #[serde(default)]
-    pub force_include: Vec<String>,
-}
-
-/// Everything needed to run a merge, resolved from UI options + config file.
-pub(crate) struct ResolvedJob {
-    pub(crate) root: PathBuf,
-    pub(crate) output_path: PathBuf,
-    pub(crate) scan_options: ScanOptions,
-    pub(crate) merge_config: MergeConfig,
-}
-
-pub(crate) fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
-    let root = security::validate_and_canonicalize(&options.folder_path)
-        .map_err(|e| format!("Security error: {}", e))?;
-    if !root.exists() || !root.is_dir() {
-        return Err("Invalid folder path".to_string());
-    }
-
-    let config = crate::config::load_from_dir(&root);
-    let format = OutputFormat::from_str_lenient(options.format.as_deref().unwrap_or("markdown"));
-
-    // Output naming in one place, at merge time.
-    let folder_name = root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(security::sanitize_filename)
-        .unwrap_or_else(|| "merged".to_string());
-    let timestamp = Local::now().format("%Y-%m-%dT%H-%M-%S");
-    let output_name = format!(
-        "{}_{}_merged.{}",
-        folder_name,
-        timestamp,
-        format.extension()
-    );
-    let output_path = match &options.output_path {
-        Some(p) if !p.is_empty() => {
-            let pb = PathBuf::from(p);
-            if pb.is_dir() {
-                pb.join(&output_name)
-            } else {
-                pb
+impl Outputs {
+    fn record(&self, result: &MergeResult) {
+        if let Ok(mut set) = self.0.lock() {
+            for p in result.output_paths.iter().chain(result.skill_path.iter()) {
+                let p = PathBuf::from(p);
+                set.insert(dunce::canonicalize(&p).unwrap_or(p));
             }
         }
-        _ => dirs::download_dir()
-            .unwrap_or_else(|| root.parent().unwrap_or(&root).to_path_buf())
-            .join(&output_name),
-    };
-
-    let mut include_globs = options.include_globs.clone();
-    include_globs.extend(config.filter.include.clone());
-    let mut exclude_globs = options.exclude_globs.clone();
-    exclude_globs.extend(config.filter.exclude.clone());
-
-    let scan_options = ScanOptions {
-        include_venv: options.include_venv || config.scanning.include_venvs,
-        content_sniff: options.content_detection && config.scanning.content_sniff,
-        include_hidden: options.include_hidden || config.scanning.include_hidden,
-        respect_gitignore: options.respect_gitignore,
-        max_file_size: config.scanning.max_file_size_mb * 1024 * 1024,
-        extra_text_exts: config.extensions.include,
-        extra_skip_exts: config.extensions.exclude,
-        extra_binary_exts: config.extensions.binary,
-        include_globs,
-        exclude_globs,
-    };
-
-    let merge_config = MergeConfig {
-        include_tree: options.include_tree,
-        redact: options.redact_secrets,
-        format,
-        ordering: MergeOrdering::from_str_lenient(options.ordering.as_deref().unwrap_or("path")),
-        max_tokens: options.max_tokens.filter(|&t| t > 0),
-        remove_empty_lines: options.remove_empty_lines,
-        truncate_base64: options.truncate_base64,
-        compress: options.compress,
-        strip_comments: options.strip_comments,
-        git_diff: options.git_diff,
-        git_log: options.git_log_count,
-        emit_skill: options.emit_skill,
-    };
-
-    Ok(ResolvedJob {
-        root,
-        output_path,
-        scan_options,
-        merge_config,
-    })
+    }
+    fn allows(&self, path: &str) -> bool {
+        let p = PathBuf::from(path);
+        let p = dunce::canonicalize(&p).unwrap_or(p);
+        self.0.lock().map(|set| set.contains(&p)).unwrap_or(false)
+    }
 }
 
-/// Apply force-include rescues and the curated selection to a scan result.
-/// Force-included paths are validated to stay inside the root; selection is
-/// an exact relative-path filter.
-fn apply_selection(
-    root: &std::path::Path,
-    files: &mut Vec<PathBuf>,
-    skipped: &mut Vec<scanner::SkipEntry>,
-    selected_paths: &Option<Vec<String>>,
-    force_include: &[String],
-) {
-    for rel in force_include {
-        let candidate = root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let Ok(canon) = candidate.canonicalize() else {
-            continue;
-        };
-        // std canonicalize yields \\?\-prefixed paths on Windows; compare
-        // against the canonicalized root the same way.
-        let Ok(root_canon) = root.canonicalize() else {
-            continue;
-        };
-        if !canon.starts_with(&root_canon) || !candidate.is_file() {
-            continue;
-        }
-        if !files.contains(&candidate) {
-            files.push(candidate);
-            skipped.retain(|s| s.path != *rel);
+/// What the UI shows while a job runs.
+#[derive(Debug, Clone, Serialize)]
+pub struct JobProgress {
+    pub stage: Stage,
+    pub done: usize,
+    pub total: usize,
+    pub current: String,
+    pub elapsed_ms: u64,
+    pub eta_ms: Option<u64>,
+    pub eta_band_ms: Option<u64>,
+    pub stalled_ms: Option<u64>,
+}
+
+impl From<Snapshot> for JobProgress {
+    fn from(s: Snapshot) -> Self {
+        let ms = |d: Duration| d.as_millis() as u64;
+        JobProgress {
+            stage: s.stage,
+            done: s.done,
+            total: s.total,
+            current: s.current,
+            elapsed_ms: ms(s.elapsed),
+            eta_ms: s.eta.map(ms),
+            eta_band_ms: s.eta_band.map(ms),
+            stalled_ms: s.stalled_for.map(ms),
         }
     }
-    if let Some(sel) = selected_paths {
-        let want: std::collections::HashSet<&str> = sel.iter().map(|s| s.as_str()).collect();
-        files.retain(|f| want.contains(scanner::relative_display(root, f).as_str()));
+}
+
+/// Feeds a job's progress to its channel: every event goes to the tracker;
+/// the UI gets at most ten updates a second, plus a tick every second so
+/// the ETA and stall reports stay current when nothing arrives.
+struct Reporter {
+    tracker: Arc<Tracker>,
+    channel: Channel<JobProgress>,
+    last: Mutex<Instant>,
+    /// Dropping it ends the ticker at once (no sleep to wait out).
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    ticker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Reporter {
+    fn start(channel: Channel<JobProgress>) -> Reporter {
+        let tracker = Arc::new(Tracker::new(ETA_AFTER, STALL_AFTER));
+        let (stop, stop_rx) = std::sync::mpsc::channel::<()>();
+        let ticker = {
+            let (tracker, channel) = (tracker.clone(), channel.clone());
+            std::thread::spawn(move || {
+                while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    stop_rx.recv_timeout(Duration::from_secs(1))
+                {
+                    let _ = channel.send(tracker.snapshot().into());
+                }
+            })
+        };
+        Reporter {
+            tracker,
+            channel,
+            last: Mutex::new(Instant::now() - Duration::from_secs(1)),
+            stop: Some(stop),
+            ticker: Some(ticker),
+        }
     }
-    files.sort();
+
+    fn on(&self, p: Progress) {
+        self.tracker.update(&p);
+        let mut last = self.last.lock().expect("reporter");
+        if last.elapsed() >= Duration::from_millis(100) {
+            *last = Instant::now();
+            let _ = self.channel.send(self.tracker.snapshot().into());
+        }
+    }
+}
+
+impl Drop for Reporter {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(t) = self.ticker.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Run blocking work off the async runtime, as one registered job.
+async fn job<T, F>(jobs: &Jobs, id: &str, work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(CancelToken) -> Result<T, String> + Send + 'static,
+{
+    let token = jobs.start(id)?;
+    let result = tauri::async_runtime::spawn_blocking(move || work(token))
+        .await
+        .map_err(|e| format!("job failed: {}", e));
+    jobs.end(id);
+    result?
 }
 
 #[derive(Debug, Serialize)]
@@ -249,63 +190,93 @@ pub struct ScanReport {
 /// tree, the treemap, and the skip drill-in. Token counts are on raw content
 /// (pre-redaction/slimming) — close enough for curation.
 #[tauri::command]
-pub async fn scan_folder(app: AppHandle, options: MergeOptions) -> Result<ScanReport, String> {
-    let start = std::time::Instant::now();
-    let job = resolve_job(&options)?;
+pub async fn scan_folder(
+    jobs: State<'_, Jobs>,
+    options: MergeOptions,
+    job: String,
+    progress: Channel<JobProgress>,
+) -> Result<ScanReport, String> {
+    self::job(&jobs, &job, move |token| {
+        let start = Instant::now();
+        let resolved = resolve_job(&options)?;
+        let reporter = Reporter::start(progress);
+        let on_scan = |p: scanner::ScanProgress| {
+            reporter.on(match p {
+                scanner::ScanProgress::Walked(n) => Progress {
+                    stage: Stage::Scan,
+                    done: n,
+                    total: 0,
+                    current: String::new(),
+                },
+                scanner::ScanProgress::Classified { done, total } => Progress {
+                    stage: Stage::Classify,
+                    done,
+                    total,
+                    current: String::new(),
+                },
+            })
+        };
+        let scan = scanner::scan_with(
+            &resolved.root,
+            &resolved.scan_options,
+            token.flag(),
+            &on_scan,
+        )
+        .map_err(|e| {
+            if e.is::<tm_core::Cancelled>() {
+                JobError::Cancelled.to_string()
+            } else {
+                format!("Scan failed: {}", e)
+            }
+        })?;
 
-    let _ = app.emit(
-        "scan-progress",
-        ProgressUpdate {
-            current: 0,
-            total: 0,
-            current_file: "Scanning directory...".to_string(),
-            percentage: 0.0,
-        },
-    );
-
-    let scan = scanner::scan_text_files(&job.root, &job.scan_options)
-        .map_err(|e| format!("Scan failed: {}", e))?;
-
-    use rayon::prelude::*;
-    let total = scan.files.len();
-    let counter = std::sync::atomic::AtomicUsize::new(0);
-    let mut included: Vec<ScanEntry> = scan
-        .files
-        .par_iter()
-        .map(|path| {
-            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            let tokens = std::fs::read(path)
-                .map(|bytes| crate::tokens::count(&String::from_utf8_lossy(&bytes)))
-                .unwrap_or(0);
-            let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if done.is_multiple_of(32) || done == total {
-                let _ = app.emit(
-                    "scan-progress",
-                    ProgressUpdate {
-                        current: done,
+        use rayon::prelude::*;
+        let total = scan.files.len();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let included: Vec<Option<ScanEntry>> = scan
+            .files
+            .par_iter()
+            .map(|path| {
+                if token.is_cancelled() {
+                    return None;
+                }
+                let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                let tokens = std::fs::read(path)
+                    .map(|bytes| tm_core::cache::count(&String::from_utf8_lossy(&bytes)))
+                    .unwrap_or(0);
+                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                let rel = scanner::relative_display(&resolved.root, path);
+                if done.is_multiple_of(32) || done == total {
+                    reporter.on(Progress {
+                        stage: Stage::Merge,
+                        done,
                         total,
-                        current_file: scanner::relative_display(&job.root, path),
-                        percentage: (done as f32 / total as f32) * 100.0,
-                    },
-                );
-            }
-            ScanEntry {
-                path: scanner::relative_display(&job.root, path),
-                size,
-                tokens,
-            }
+                        current: rel.clone(),
+                    });
+                }
+                Some(ScanEntry {
+                    path: rel,
+                    size,
+                    tokens,
+                })
+            })
+            .collect();
+        if token.is_cancelled() {
+            return Err(JobError::Cancelled.to_string());
+        }
+        let _ = tm_core::cache::save();
+        let mut included: Vec<ScanEntry> = included.into_iter().flatten().collect();
+        included.sort_by(|a, b| a.path.cmp(&b.path));
+        let total_tokens = included.iter().map(|e| e.tokens).sum();
+        Ok(ScanReport {
+            root: resolved.root.to_string_lossy().to_string(),
+            included,
+            skipped: scan.skipped,
+            total_tokens,
+            duration_ms: start.elapsed().as_millis() as u64,
         })
-        .collect();
-    included.sort_by(|a, b| a.path.cmp(&b.path));
-    let total_tokens = included.iter().map(|e| e.tokens).sum();
-
-    Ok(ScanReport {
-        root: job.root.to_string_lossy().to_string(),
-        included,
-        skipped: scan.skipped,
-        total_tokens,
-        duration_ms: start.elapsed().as_millis() as u64,
     })
+    .await
 }
 
 /// Build an aider-style repo map (tags → PageRank → budgeted signatures).
@@ -314,14 +285,18 @@ pub async fn repo_map(
     options: MergeOptions,
     token_budget: Option<usize>,
 ) -> Result<String, String> {
-    let job = resolve_job(&options)?;
-    let scan = scanner::scan_text_files(&job.root, &job.scan_options)
-        .map_err(|e| format!("Scan failed: {}", e))?;
-    Ok(crate::repomap::build_repo_map(
-        &job.root,
-        &scan.files,
-        token_budget.unwrap_or(1024),
-    ))
+    tauri::async_runtime::spawn_blocking(move || {
+        let job = resolve_job(&options)?;
+        let scan = scanner::scan_text_files(&job.root, &job.scan_options)
+            .map_err(|e| format!("Scan failed: {}", e))?;
+        Ok(tm_core::repomap::build_repo_map(
+            &job.root,
+            &scan.files,
+            token_budget.unwrap_or(1024),
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -331,183 +306,104 @@ pub fn get_downloads_path() -> Result<String, String> {
         .ok_or_else(|| "Could not find Downloads folder".to_string())
 }
 
+/// Cancel one running job. `false` when no such job is running (it may
+/// have just finished).
 #[tauri::command]
-pub fn cancel_merge(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
-    state
-        .lock()
-        .map_err(|e| e.to_string())?
-        .cancel_flag
-        .store(true, Ordering::Relaxed);
-    Ok(())
-}
-
-#[tauri::command]
-pub fn reset_cancel(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
-    state
-        .lock()
-        .map_err(|e| e.to_string())?
-        .cancel_flag
-        .store(false, Ordering::Relaxed);
-    Ok(())
+pub fn cancel_job(jobs: State<'_, Jobs>, job: String) -> Result<bool, String> {
+    let jobs = jobs.0.lock().map_err(|e| e.to_string())?;
+    Ok(match jobs.get(&job) {
+        Some(token) => {
+            token.cancel();
+            true
+        }
+        None => false,
+    })
 }
 
 #[tauri::command]
 pub async fn merge_folder(
-    app: AppHandle,
-    state: State<'_, Mutex<AppState>>,
+    jobs: State<'_, Jobs>,
+    outputs: State<'_, Outputs>,
     options: MergeOptions,
+    job: String,
+    progress: Channel<JobProgress>,
 ) -> Result<MergeResult, String> {
-    let cancel_flag = {
-        let state = state.lock().map_err(|e| e.to_string())?;
-        state.cancel_flag.clone()
-    };
-    cancel_flag.store(false, Ordering::Relaxed);
-    do_merge(&app, &cancel_flag, &options)
+    let result = self::job(&jobs, &job, move |token| {
+        let reporter = Reporter::start(progress);
+        run_merge(&options, None, &token, &|p| reporter.on(p))
+            .map(|run| run.result)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    outputs.record(&result);
+    Ok(result)
 }
 
 /// Pack a remote repo: shallow-clone (temp, self-cleaning) then run the
 /// normal merge pipeline over the checkout. `pat` stays in memory only.
 #[tauri::command]
 pub async fn pack_remote(
-    app: AppHandle,
-    state: State<'_, Mutex<AppState>>,
+    jobs: State<'_, Jobs>,
+    outputs: State<'_, Outputs>,
     url: String,
     pat: Option<String>,
     options: MergeOptions,
+    job: String,
+    progress: Channel<JobProgress>,
 ) -> Result<MergeResult, String> {
-    let (clone_url, name) = crate::remote::parse_remote(&url)
-        .ok_or("Not a recognizable repo reference (URL or owner/repo)")?;
-    let _ = app.emit(
-        "merge-progress",
-        ProgressUpdate {
-            current: 0,
+    let result = self::job(&jobs, &job, move |token| {
+        let (clone_url, name) = tm_core::remote::parse_remote(&url)
+            .ok_or("Not a recognizable repo reference (URL or owner/repo)")?;
+        let reporter = Reporter::start(progress);
+        reporter.on(Progress {
+            stage: Stage::Scan,
+            done: 0,
             total: 0,
-            current_file: format!("Cloning {} (shallow)...", clone_url),
-            percentage: 0.0,
-        },
-    );
-    let checkout = crate::remote::clone_shallow(&clone_url, &name, pat.as_deref())?;
-
-    let cancel_flag = {
-        let state = state.lock().map_err(|e| e.to_string())?;
-        state.cancel_flag.clone()
-    };
-    cancel_flag.store(false, Ordering::Relaxed);
-
-    let mut opts = options;
-    opts.folder_path = checkout.path.to_string_lossy().to_string();
-    do_merge(&app, &cancel_flag, &opts)
-    // checkout drops here: temp clone deleted.
-}
-
-/// The shared merge core: scan → curate → merge with progress events.
-fn do_merge(
-    app: &AppHandle,
-    cancel_flag: &std::sync::atomic::AtomicBool,
-    options: &MergeOptions,
-) -> Result<MergeResult, String> {
-    let start = std::time::Instant::now();
-    let job = resolve_job(options)?;
-
-    let _ = app.emit(
-        "merge-progress",
-        ProgressUpdate {
-            current: 0,
-            total: 0,
-            current_file: "Scanning directory...".to_string(),
-            percentage: 0.0,
-        },
-    );
-
-    let scan = scanner::scan_text_files(&job.root, &job.scan_options)
-        .map_err(|e| format!("Scan failed: {}", e))?;
-    let scan_stats = scan.stats;
-    let mut scan_skips = scan.skipped;
-    let mut files = scan.files;
-    apply_selection(
-        &job.root,
-        &mut files,
-        &mut scan_skips,
-        &options.selected_paths,
-        &options.force_include,
-    );
-    if files.is_empty() {
-        return Err("No text files found in directory".to_string());
-    }
-
-    let mut cfg = job.merge_config;
-    cfg.include_tree = cfg.include_tree && files.len() < 50_000;
-
-    let outcome = crate::merger::merge_files_with_progress(
-        &job.root,
-        &files,
-        &job.output_path,
-        &cfg,
-        cancel_flag,
-        |current, total, file_name| {
-            let _ = app.emit(
-                "merge-progress",
-                ProgressUpdate {
-                    current,
-                    total,
-                    current_file: file_name.to_string(),
-                    percentage: (current as f32 / total as f32) * 100.0,
-                },
-            );
-        },
-        &scan_skips,
-    )
-    .map_err(|e| format!("Merge failed: {}", e))?;
-
-    if cancel_flag.load(Ordering::Relaxed) {
-        for p in &outcome.outputs {
-            let _ = std::fs::remove_file(p);
+            current: format!("Cloning {} (shallow)...", clone_url),
+        });
+        let checkout = tm_core::remote::clone_shallow(&clone_url, &name, pat.as_deref())?;
+        if token.is_cancelled() {
+            return Err(JobError::Cancelled.to_string());
         }
-        return Err("Operation cancelled by user".to_string());
-    }
-
-    Ok(MergeResult {
-        output_path: outcome
-            .outputs
-            .first()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default(),
-        output_paths: outcome
-            .outputs
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect(),
-        files_processed: outcome.files_processed,
-        files_skipped: outcome.files_skipped + scan_skips.len(),
-        total_bytes: outcome.total_bytes,
-        duration_ms: start.elapsed().as_millis() as u64,
-        files_by_extension: scan_stats.by_extension,
-        files_by_content: scan_stats.by_content,
-        files_skipped_binary: scan_stats.skipped_binary,
-        files_unreadable: scan_stats.unreadable,
-        secrets_redacted: outcome.secrets_redacted,
-        tokens_o200k: outcome.tokens_o200k,
-        tokens_claude_est: crate::tokens::claude_estimate(outcome.tokens_o200k),
-        skill_path: outcome
-            .skill
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string()),
+        let mut opts = options;
+        opts.folder_path = checkout.path.to_string_lossy().to_string();
+        opts.source_label = Some(clone_url);
+        opts.remote = true;
+        run_merge(&opts, None, &token, &|p| reporter.on(p))
+            .map(|run| run.result)
+            .map_err(|e| e.to_string())
+        // checkout drops here: temp clone deleted.
     })
+    .await?;
+    outputs.record(&result);
+    Ok(result)
 }
 
 // ============================================================================
 // WATCH MODE (T2-6)
 // ============================================================================
 
-/// Holds the live watcher; dropping the debouncer stops watching.
+/// The live watch: dropping it stops the watcher, ends the worker thread and
+/// cancels a merge in flight.
 #[derive(Default)]
 pub struct WatchState {
-    debouncer: Option<notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>>,
+    active: Option<ActiveWatch>,
+}
+
+struct ActiveWatch {
+    _debouncer: notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>,
+    cancel: CancelToken,
+}
+
+impl Drop for ActiveWatch {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 /// Filesystem events that must NOT retrigger a watch merge: VCS/app state,
 /// Finder metadata, and our own outputs.
-fn watch_event_is_relevant(path: &std::path::Path) -> bool {
+fn watch_event_is_relevant(path: &Path) -> bool {
     if path
         .components()
         .any(|c| matches!(c.as_os_str().to_str(), Some(".git" | ".turbomerger")))
@@ -523,72 +419,10 @@ fn watch_event_is_relevant(path: &std::path::Path) -> bool {
     true
 }
 
-/// One watch-triggered merge to a fixed output path (no timestamp — the
-/// point is a stable file that overwrites in place).
-fn run_watch_merge(
-    options: &MergeOptions,
-    output: &std::path::Path,
-) -> Result<MergeResult, String> {
-    let start = std::time::Instant::now();
-    let job = resolve_job(options)?;
-    let scan = scanner::scan_text_files(&job.root, &job.scan_options)
-        .map_err(|e| format!("Scan failed: {}", e))?;
-    let scan_stats = scan.stats;
-    let mut scan_skips = scan.skipped;
-    let mut files = scan.files;
-    apply_selection(
-        &job.root,
-        &mut files,
-        &mut scan_skips,
-        &options.selected_paths,
-        &options.force_include,
-    );
-    if files.is_empty() {
-        return Err("No text files found in directory".to_string());
-    }
-    let cancel = AtomicBool::new(false);
-    let outcome = crate::merger::merge_files_with_progress(
-        &job.root,
-        &files,
-        output,
-        &job.merge_config,
-        &cancel,
-        |_, _, _| {},
-        &scan_skips,
-    )
-    .map_err(|e| format!("Merge failed: {}", e))?;
-    Ok(MergeResult {
-        output_path: outcome
-            .outputs
-            .first()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default(),
-        output_paths: outcome
-            .outputs
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect(),
-        files_processed: outcome.files_processed,
-        files_skipped: outcome.files_skipped + scan_skips.len(),
-        total_bytes: outcome.total_bytes,
-        duration_ms: start.elapsed().as_millis() as u64,
-        files_by_extension: scan_stats.by_extension,
-        files_by_content: scan_stats.by_content,
-        files_skipped_binary: scan_stats.skipped_binary,
-        files_unreadable: scan_stats.unreadable,
-        secrets_redacted: outcome.secrets_redacted,
-        tokens_o200k: outcome.tokens_o200k,
-        tokens_claude_est: crate::tokens::claude_estimate(outcome.tokens_o200k),
-        skill_path: outcome
-            .skill
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string()),
-    })
-}
-
 fn emit_watch_result(app: &AppHandle, result: &Result<MergeResult, String>) {
     match result {
         Ok(r) => {
+            app.state::<Outputs>().record(r);
             let _ = app.emit("watch-merged", r.clone());
         }
         Err(e) => {
@@ -598,13 +432,9 @@ fn emit_watch_result(app: &AppHandle, result: &Result<MergeResult, String>) {
 }
 
 /// Start watching `options.folder_path`; re-merge (debounced 300 ms) on
-/// changes. Returns the stable output path.
+/// changes into one stable output. Returns that output's path.
 #[tauri::command]
-pub fn start_watch(
-    app: AppHandle,
-    watch: State<'_, Mutex<WatchState>>,
-    options: MergeOptions,
-) -> Result<String, String> {
+pub async fn start_watch(app: AppHandle, options: MergeOptions) -> Result<String, String> {
     let job = resolve_job(&options)?;
     let folder_name = job
         .root
@@ -619,27 +449,52 @@ pub fn start_watch(
     );
     let output = job.output_path.with_file_name(stable_name);
     let root = job.root.clone();
+    let cancel = CancelToken::new();
 
     // Merge once up front so the output exists before the first change.
-    let first = run_watch_merge(&options, &output);
+    let first = {
+        let (options, output, cancel) = (options.clone(), output.clone(), cancel.clone());
+        tauri::async_runtime::spawn_blocking(move || {
+            run_merge(&options, Some(&output), &cancel, &|_| {})
+                .map(|r| r.result)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    };
     emit_watch_result(&app, &first);
     first?;
 
+    // Changes become signals; one worker merges per burst, and a change that
+    // lands during a merge makes it run again (nothing is dropped).
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    {
+        let (app, options, output, cancel) =
+            (app.clone(), options.clone(), output.clone(), cancel.clone());
+        std::thread::spawn(move || {
+            while rx.recv().is_ok() {
+                while rx.try_recv().is_ok() {}
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let result = run_merge(&options, Some(&output), &cancel, &|_| {})
+                    .map(|r| r.result)
+                    .map_err(|e| e.to_string());
+                if cancel.is_cancelled() {
+                    break;
+                }
+                emit_watch_result(&app, &result);
+            }
+        });
+    }
     let app2 = app.clone();
-    let opts2 = options.clone();
-    let out2 = output.clone();
-    let busy = Arc::new(Mutex::new(()));
     let mut debouncer = notify_debouncer_mini::new_debouncer(
-        std::time::Duration::from_millis(300),
+        Duration::from_millis(300),
         move |res: notify_debouncer_mini::DebounceEventResult| match res {
             Ok(events) => {
-                if !events.iter().any(|e| watch_event_is_relevant(&e.path)) {
-                    return;
+                if events.iter().any(|e| watch_event_is_relevant(&e.path)) {
+                    let _ = tx.send(());
                 }
-                // A merge already running: skip; the next change re-fires.
-                let Ok(_guard) = busy.try_lock() else { return };
-                let result = run_watch_merge(&opts2, &out2);
-                emit_watch_result(&app2, &result);
             }
             Err(e) => {
                 let _ = app2.emit("watch-error", format!("watch error: {}", e));
@@ -652,14 +507,18 @@ pub fn start_watch(
         .watch(&root, notify::RecursiveMode::Recursive)
         .map_err(|e| format!("watch failed: {}", e))?;
 
-    watch.lock().map_err(|e| e.to_string())?.debouncer = Some(debouncer);
+    let state = app.state::<Mutex<WatchState>>();
+    state.lock().map_err(|e| e.to_string())?.active = Some(ActiveWatch {
+        _debouncer: debouncer,
+        cancel,
+    });
     Ok(output.to_string_lossy().to_string())
 }
 
 #[tauri::command]
 pub fn stop_watch(watch: State<'_, Mutex<WatchState>>) -> Result<(), String> {
-    // Dropping the debouncer shuts the watcher thread down.
-    watch.lock().map_err(|e| e.to_string())?.debouncer.take();
+    // Dropping the watch stops the watcher and its worker.
+    watch.lock().map_err(|e| e.to_string())?.active.take();
     Ok(())
 }
 
@@ -676,597 +535,204 @@ pub struct ApplyUiState {
 
 struct PendingApply {
     root: PathBuf,
-    ready: Vec<crate::applyback::ReadyFile>,
+    ready: Vec<tm_core::applyback::ReadyFile>,
 }
 
 /// Parse a pasted LLM reply against `root` and return per-file diffs.
 /// Dry-run: nothing is written; the appliable set is parked in state.
 #[tauri::command]
-pub fn preview_apply(
-    state: State<'_, Mutex<ApplyUiState>>,
+pub async fn preview_apply(
+    app: AppHandle,
     root: String,
     reply: String,
-) -> Result<crate::applyback::Preview, String> {
-    let root =
-        security::validate_and_canonicalize(&root).map_err(|e| format!("Security error: {}", e))?;
-    if !root.is_dir() {
-        return Err("Target root is not a folder".to_string());
-    }
-    let changes = crate::applyback::parse_reply(&reply);
-    if changes.is_empty() {
-        return Err(
-            "No file changes recognized. Supported: `## path` + fenced code block, \
-             cxml <source> documents, and unified diffs (--- / +++ / @@)."
-                .to_string(),
-        );
-    }
-    let built = crate::applyback::build_preview(&root, &changes)?;
-    state.lock().map_err(|e| e.to_string())?.pending = Some(PendingApply {
-        root,
-        ready: built.ready,
-    });
-    Ok(built.preview)
+) -> Result<tm_core::applyback::Preview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = security::validate_and_canonicalize(&root)
+            .map_err(|e| format!("Security error: {}", e))?;
+        if !root.is_dir() {
+            return Err("Target root is not a folder".to_string());
+        }
+        let changes = tm_core::applyback::parse_reply(&reply);
+        if changes.is_empty() {
+            return Err(
+                "No file changes recognized. Supported: `## path` + fenced code block, \
+                 cxml <source> documents, and unified diffs (--- / +++ / @@)."
+                    .to_string(),
+            );
+        }
+        let built = tm_core::applyback::build_preview(
+            &root,
+            &changes,
+            &tm_core::applyback::ApplyPolicy::default(),
+        )?;
+        let state = app.state::<Mutex<ApplyUiState>>();
+        state.lock().map_err(|e| e.to_string())?.pending = Some(PendingApply {
+            root,
+            ready: built.ready,
+        });
+        Ok(built.preview)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Write the accepted subset of the last preview (with backups). One-shot:
-/// the pending preview is consumed; re-parse for another round.
+/// the pending preview is consumed; re-parse for another round. `confirm`
+/// lists control/manifest files the user confirmed one by one in the UI —
+/// without it they are refused like on the CLI.
 #[tauri::command]
-pub fn apply_accepted(
-    state: State<'_, Mutex<ApplyUiState>>,
+pub async fn apply_accepted(
+    app: AppHandle,
     root: String,
     accept: Vec<String>,
-) -> Result<crate::applyback::ApplyOutcome, String> {
-    let pending = state
-        .lock()
-        .map_err(|e| e.to_string())?
-        .pending
-        .take()
-        .ok_or("Nothing parsed — paste a reply and preview it first")?;
-    let root =
-        security::validate_and_canonicalize(&root).map_err(|e| format!("Security error: {}", e))?;
-    if root != pending.root {
-        return Err("Preview is for a different folder — re-parse the reply".to_string());
-    }
-    let want: std::collections::HashSet<&str> = accept.iter().map(|s| s.as_str()).collect();
-    let files: Vec<crate::applyback::ReadyFile> = pending
-        .ready
-        .into_iter()
-        .filter(|f| want.contains(f.rel_path.as_str()))
-        .collect();
-    if files.is_empty() {
-        return Err("No accepted files to apply".to_string());
-    }
-    crate::applyback::apply_files(&root, &files)
+    confirm: Option<Vec<String>>,
+) -> Result<tm_core::applyback::ApplyOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let pending = app
+            .state::<Mutex<ApplyUiState>>()
+            .lock()
+            .map_err(|e| e.to_string())?
+            .pending
+            .take()
+            .ok_or("Nothing parsed — paste a reply and preview it first")?;
+        let root = security::validate_and_canonicalize(&root)
+            .map_err(|e| format!("Security error: {}", e))?;
+        if root != pending.root {
+            return Err("Preview is for a different folder — re-parse the reply".to_string());
+        }
+        let want: HashSet<&str> = accept.iter().map(|s| s.as_str()).collect();
+        let files: Vec<tm_core::applyback::ReadyFile> = pending
+            .ready
+            .into_iter()
+            .filter(|f| want.contains(f.rel_path.as_str()))
+            .collect();
+        if files.is_empty() {
+            return Err("No accepted files to apply".to_string());
+        }
+        let mut policy = tm_core::applyback::ApplyPolicy::default();
+        policy.confirmed = confirm
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| want.contains(c.as_str()))
+            .collect();
+        tm_core::applyback::apply_files(&root, &files, &policy)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Reverse the most recent apply for `root` from its backup manifest.
 #[tauri::command]
-pub fn restore_backup(root: String) -> Result<crate::applyback::RestoreOutcome, String> {
-    let root =
-        security::validate_and_canonicalize(&root).map_err(|e| format!("Security error: {}", e))?;
-    crate::applyback::restore_last(&root)
+pub async fn restore_backup(root: String) -> Result<tm_core::applyback::RestoreOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = security::validate_and_canonicalize(&root)
+            .map_err(|e| format!("Security error: {}", e))?;
+        tm_core::applyback::restore_last(&root, &tm_core::applyback::ApplyPolicy::default())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
+// ============================================================================
+// OPENING THINGS (N-28)
+// ============================================================================
+
+/// Open an output of this session with its default application.
 #[tauri::command]
-pub fn open_file(path: String) -> Result<(), String> {
+pub fn open_file(outputs: State<'_, Outputs>, path: String) -> Result<(), String> {
+    if !outputs.allows(&path) {
+        return Err("Only files this session wrote can be opened".to_string());
+    }
     open::that(&path).map_err(|e| format!("Failed to open file: {}", e))
 }
 
-/// Reveal a file in Explorer (selects it rather than opening the parent blindly)
+/// Open one of the chat sites the result panel links to.
 #[tauri::command]
-pub fn open_folder(path: String) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        std::process::Command::new("explorer.exe")
-            .arg(format!("/select,{}", path))
-            .spawn()
-            .map_err(|e| format!("Failed to open folder: {}", e))?;
-        Ok(())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg("-R")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| format!("Failed to open folder in Finder: {}", e))?;
-        Ok(())
-    }
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    {
-        let pb = PathBuf::from(&path);
-        let folder = pb.parent().unwrap_or(&pb);
-        open::that(folder).map_err(|e| format!("Failed to open folder: {}", e))
-    }
+pub fn open_web(site: String) -> Result<(), String> {
+    let url = match site.as_str() {
+        "claude" => "https://claude.ai/new",
+        "chatgpt" => "https://chatgpt.com",
+        "gemini" => "https://gemini.google.com/app",
+        _ => return Err(format!("Unknown site: {}", site)),
+    };
+    open::that(url).map_err(|e| format!("Failed to open {}: {}", url, e))
 }
 
-// ============================================================================
-// HEADLESS CLI  —  turbomerger merge <src> [out] [--flags]
-// ============================================================================
-
-pub struct CliArgs {
-    pub src: String,
-    pub out: Option<String>,
-    pub format: Option<String>,
-    pub ordering: Option<String>,
-    pub max_tokens: Option<usize>,
-    pub no_redact: bool,
-    pub no_gitignore: bool,
-    pub include_hidden: bool,
-    pub include_venv: bool,
-    pub remove_empty_lines: bool,
-    pub truncate_base64: bool,
-    pub compress: bool,
-    pub strip_comments: bool,
-    pub git_diff: bool,
-    pub git_log: usize,
-    pub emit_skill: bool,
-    pub include_globs: Vec<String>,
-    pub exclude_globs: Vec<String>,
-    pub quiet: bool,
+/// Reveal an output of this session in the file manager, selected.
+#[tauri::command]
+pub fn open_folder(outputs: State<'_, Outputs>, path: String) -> Result<(), String> {
+    if !outputs.allows(&path) {
+        return Err("Only files this session wrote can be shown".to_string());
+    }
+    reveal(Path::new(&path))
 }
 
-impl CliArgs {
-    /// Parse `merge <src> [out] [--flags]`. Returns None if argv isn't a CLI run.
-    pub fn parse(argv: &[String]) -> Option<CliArgs> {
-        let mut it = argv.iter().skip(1);
-        if it.next().map(|s| s.as_str()) != Some("merge") {
-            return None;
-        }
-        let mut a = CliArgs {
-            src: String::new(),
-            out: None,
-            format: None,
-            ordering: None,
-            max_tokens: None,
-            no_redact: false,
-            no_gitignore: false,
-            include_hidden: false,
-            include_venv: false,
-            remove_empty_lines: false,
-            truncate_base64: false,
-            compress: false,
-            strip_comments: false,
-            git_diff: false,
-            git_log: 0,
-            emit_skill: false,
-            include_globs: Vec::new(),
-            exclude_globs: Vec::new(),
-            quiet: false,
-        };
-        let mut positionals: Vec<String> = Vec::new();
-        while let Some(arg) = it.next() {
-            match arg.as_str() {
-                "--format" => a.format = it.next().cloned(),
-                "--ordering" => a.ordering = it.next().cloned(),
-                "--max-tokens" => a.max_tokens = it.next().and_then(|s| s.parse().ok()),
-                "--include" => {
-                    if let Some(g) = it.next() {
-                        a.include_globs.push(g.clone());
-                    }
-                }
-                "--exclude" => {
-                    if let Some(g) = it.next() {
-                        a.exclude_globs.push(g.clone());
-                    }
-                }
-                "--no-redact" => a.no_redact = true,
-                "--no-gitignore" => a.no_gitignore = true,
-                "--include-hidden" => a.include_hidden = true,
-                "--include-venv" => a.include_venv = true,
-                "--remove-empty-lines" => a.remove_empty_lines = true,
-                "--truncate-base64" => a.truncate_base64 = true,
-                "--compress" => a.compress = true,
-                "--strip-comments" => a.strip_comments = true,
-                "--git-diff" => a.git_diff = true,
-                "--git-log" => a.git_log = it.next().and_then(|s| s.parse().ok()).unwrap_or(10),
-                "--emit-skill" => a.emit_skill = true,
-                "--quiet" | "-q" => a.quiet = true,
-                other => positionals.push(other.to_string()),
-            }
-        }
-        if positionals.is_empty() {
-            eprintln!("usage: turbomerger merge <src_dir> [out] [--format md|xml|cxml|json|plain] [--ordering path|entry-first|important-last] [--max-tokens N] [--include GLOB] [--exclude GLOB] [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--remove-empty-lines] [--truncate-base64] [--compress] [--strip-comments] [--git-diff] [--git-log N] [--emit-skill]");
-            return Some(a); // src empty -> run_cli reports error
-        }
-        a.src = positionals[0].clone();
-        a.out = positionals.get(1).cloned();
-        Some(a)
-    }
+#[cfg(windows)]
+fn reveal(path: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    // One argument, quoted the way Explorer parses it: `/select,"C:\a b\c.md"`.
+    // std's own quoting would wrap all of `/select,…` in quotes, which
+    // Explorer does not understand. Paths cannot contain `"` on Windows.
+    let path = path.to_string_lossy();
+    let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
+    std::process::Command::new("explorer.exe")
+        .raw_arg(format!("/select,\"{}\"", path))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open folder: {}", e))
 }
 
-// ============================================================================
-// HEADLESS CLI  —  turbomerger map <src> [out] [--tokens N] [--flags]
-// ============================================================================
-
-pub struct MapArgs {
-    pub src: String,
-    pub out: Option<String>,
-    pub tokens: usize,
-    pub no_gitignore: bool,
-    pub include_hidden: bool,
-    pub include_venv: bool,
-    pub include_globs: Vec<String>,
-    pub exclude_globs: Vec<String>,
+#[cfg(target_os = "macos")]
+fn reveal(path: &Path) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open folder in Finder: {}", e))
 }
 
-impl MapArgs {
-    /// Parse `map <src> [out] [--flags]`. Returns None if argv isn't a map run.
-    pub fn parse(argv: &[String]) -> Option<MapArgs> {
-        let mut it = argv.iter().skip(1);
-        if it.next().map(|s| s.as_str()) != Some("map") {
-            return None;
-        }
-        let mut a = MapArgs {
-            src: String::new(),
-            out: None,
-            tokens: 1024,
-            no_gitignore: false,
-            include_hidden: false,
-            include_venv: false,
-            include_globs: Vec::new(),
-            exclude_globs: Vec::new(),
-        };
-        let mut positionals: Vec<String> = Vec::new();
-        while let Some(arg) = it.next() {
-            match arg.as_str() {
-                "--tokens" | "--max-tokens" => {
-                    if let Some(t) = it.next().and_then(|s| s.parse().ok()) {
-                        a.tokens = t;
-                    }
-                }
-                "--include" => {
-                    if let Some(g) = it.next() {
-                        a.include_globs.push(g.clone());
-                    }
-                }
-                "--exclude" => {
-                    if let Some(g) = it.next() {
-                        a.exclude_globs.push(g.clone());
-                    }
-                }
-                "--no-gitignore" => a.no_gitignore = true,
-                "--include-hidden" => a.include_hidden = true,
-                "--include-venv" => a.include_venv = true,
-                other => positionals.push(other.to_string()),
-            }
-        }
-        if positionals.is_empty() {
-            eprintln!("usage: turbomerger map <src_dir> [out] [--tokens N] [--include GLOB] [--exclude GLOB] [--no-gitignore] [--include-hidden] [--include-venv]");
-            return Some(a); // src empty -> run_map_cli reports error
-        }
-        a.src = positionals[0].clone();
-        a.out = positionals.get(1).cloned();
-        Some(a)
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn reveal(path: &Path) -> Result<(), String> {
+    // The freedesktop file-manager interface selects the file (Nautilus,
+    // Nemo, Dolphin, Thunar…); without it, open the parent folder.
+    let shown = std::process::Command::new("dbus-send")
+        .args([
+            "--session",
+            "--print-reply",
+            "--dest=org.freedesktop.FileManager1",
+            "--type=method_call",
+            "/org/freedesktop/FileManager1",
+            "org.freedesktop.FileManager1.ShowItems",
+        ])
+        .arg(format!("array:string:{}", file_uri(path)))
+        .arg("string:")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if shown {
+        return Ok(());
     }
+    let folder = path.parent().unwrap_or(path);
+    open::that(folder).map_err(|e| format!("Failed to open folder: {}", e))
 }
 
-/// Run a headless repo-map. Prints to stdout (or writes `out`). Exit code.
-pub fn run_map_cli(a: MapArgs) -> i32 {
-    if a.src.is_empty() {
-        return 2;
-    }
-    let (src_root, _checkout) = match resolve_cli_source(&a.src) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            return 1;
-        }
-    };
-    let options = MergeOptions {
-        folder_path: src_root,
-        output_path: None,
-        include_venv: a.include_venv,
-        include_tree: false,
-        content_detection: true,
-        respect_gitignore: !a.no_gitignore,
-        include_hidden: a.include_hidden,
-        redact_secrets: true,
-        format: None,
-        ordering: None,
-        max_tokens: None,
-        include_globs: a.include_globs,
-        exclude_globs: a.exclude_globs,
-        remove_empty_lines: false,
-        truncate_base64: false,
-        compress: false,
-        strip_comments: false,
-        git_diff: false,
-        git_log_count: 0,
-        emit_skill: false,
-        selected_paths: None,
-        force_include: Vec::new(),
-    };
-    let job = match resolve_job(&options) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            return 1;
-        }
-    };
-    let scan = match scanner::scan_text_files(&job.root, &job.scan_options) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("scan failed: {}", e);
-            return 1;
-        }
-    };
-    let map = crate::repomap::build_repo_map(&job.root, &scan.files, a.tokens);
-    match a.out {
-        Some(out) if !out.is_empty() => {
-            if let Err(e) = std::fs::write(&out, &map) {
-                eprintln!("write failed: {}", e);
-                return 1;
-            }
-            println!("out={}", out);
-        }
-        _ => print!("{}", map),
-    }
-    0
-}
-
-/// Resolve a CLI source: an existing local path passes through; otherwise a
-/// remote-looking ref is shallow-cloned (PAT via TURBOMERGER_PAT env, never
-/// argv). Returns (root_path, checkout guard to keep alive).
-pub(crate) fn resolve_cli_source(
-    src: &str,
-) -> Result<(String, Option<crate::remote::RemoteCheckout>), String> {
-    if std::path::Path::new(src).exists() {
-        return Ok((src.to_string(), None));
-    }
-    if let Some((url, name)) = crate::remote::parse_remote(src) {
-        let pat = std::env::var("TURBOMERGER_PAT").ok();
-        eprintln!("cloning {} (shallow)...", url);
-        let co = crate::remote::clone_shallow(&url, &name, pat.as_deref())?;
-        let path = co.path.to_string_lossy().to_string();
-        return Ok((path, Some(co)));
-    }
-    Err(format!("source not found: {}", src))
-}
-
-/// Run a headless merge. Returns process exit code.
-pub fn run_cli(a: CliArgs) -> i32 {
-    if a.src.is_empty() {
-        return 2;
-    }
-    let (src_root, _checkout) = match resolve_cli_source(&a.src) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            return 1;
-        }
-    };
-    let options = MergeOptions {
-        folder_path: src_root,
-        output_path: a.out,
-        include_venv: a.include_venv,
-        include_tree: true,
-        content_detection: true,
-        respect_gitignore: !a.no_gitignore,
-        include_hidden: a.include_hidden,
-        redact_secrets: !a.no_redact,
-        format: a.format,
-        ordering: a.ordering,
-        max_tokens: a.max_tokens,
-        include_globs: a.include_globs,
-        exclude_globs: a.exclude_globs,
-        remove_empty_lines: a.remove_empty_lines,
-        truncate_base64: a.truncate_base64,
-        compress: a.compress,
-        strip_comments: a.strip_comments,
-        git_diff: a.git_diff,
-        git_log_count: a.git_log,
-        emit_skill: a.emit_skill,
-        selected_paths: None,
-        force_include: Vec::new(),
-    };
-
-    let job = match resolve_job(&options) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            return 1;
-        }
-    };
-
-    let scan = match scanner::scan_text_files(&job.root, &job.scan_options) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("scan failed: {}", e);
-            return 1;
-        }
-    };
-    if scan.files.is_empty() {
-        eprintln!("no text files found");
-        return 1;
-    }
-    let cancel = AtomicBool::new(false);
-    let progress = |_c: usize, _t: usize, _f: &str| {};
-    match crate::merger::merge_files_with_progress(
-        &job.root,
-        &scan.files,
-        &job.output_path,
-        &job.merge_config,
-        &cancel,
-        progress,
-        &scan.skipped,
-    ) {
-        Ok(o) => {
-            if !a.quiet {
-                // Aggregate, non-secret output only.
-                println!(
-                    "merged={} scan_skipped={} merge_skipped={} redacted={} tokens_o200k={} parts={}",
-                    o.files_processed,
-                    scan.skipped.len(),
-                    o.files_skipped,
-                    o.secrets_redacted,
-                    o.tokens_o200k,
-                    o.outputs.len()
-                );
-                for p in &o.outputs {
-                    println!("out={}", p.display());
-                }
-                if let Some(s) = &o.skill {
-                    println!("skill={}", s.display());
-                }
-            }
-            0
-        }
-        Err(e) => {
-            eprintln!("merge failed: {}", e);
-            1
-        }
-    }
-}
-
-// ============================================================================
-// HEADLESS CLI  —  turbomerger apply <root> --from reply.md [--yes] | --restore
-// ============================================================================
-
-pub struct ApplyArgs {
-    pub root: String,
-    pub from: Option<String>,
-    pub yes: bool,
-    pub restore: bool,
-}
-
-impl ApplyArgs {
-    /// Parse `apply <root> [--from FILE] [--yes] [--restore]`.
-    pub fn parse(argv: &[String]) -> Option<ApplyArgs> {
-        let mut it = argv.iter().skip(1);
-        if it.next().map(|s| s.as_str()) != Some("apply") {
-            return None;
-        }
-        let mut a = ApplyArgs {
-            root: String::new(),
-            from: None,
-            yes: false,
-            restore: false,
-        };
-        while let Some(arg) = it.next() {
-            match arg.as_str() {
-                "--from" => a.from = it.next().cloned(),
-                "--yes" | "-y" => a.yes = true,
-                "--restore" => a.restore = true,
-                other if a.root.is_empty() => a.root = other.to_string(),
-                _ => {}
-            }
-        }
-        if a.root.is_empty() {
-            eprintln!(
-                "usage: turbomerger apply <root> --from reply.md [--yes]   (dry-run without --yes)"
-            );
-            eprintln!(
-                "       turbomerger apply <root> --restore                 (undo the last apply)"
-            );
-        }
-        Some(a)
-    }
-}
-
-/// Run a headless apply/restore. Prints paths + counts only (never content —
-/// pasted replies can embed secrets). Exit code.
-pub fn run_apply_cli(a: ApplyArgs) -> i32 {
-    if a.root.is_empty() {
-        return 2;
-    }
-    let root = match security::validate_and_canonicalize(&a.root) {
-        Ok(r) if r.is_dir() => r,
-        Ok(_) => {
-            eprintln!("error: root is not a folder");
-            return 1;
-        }
-        Err(e) => {
-            eprintln!("error: {}", e);
-            return 1;
-        }
-    };
-
-    if a.restore {
-        return match crate::applyback::restore_last(&root) {
-            Ok(r) => {
-                for p in &r.restored {
-                    println!("restored {}", p);
-                }
-                for p in &r.deleted {
-                    println!("deleted  {}", p);
-                }
-                println!("from={}", r.backup_dir);
-                0
-            }
-            Err(e) => {
-                eprintln!("restore failed: {}", e);
-                1
-            }
-        };
-    }
-
-    let Some(from) = a.from.as_deref() else {
-        eprintln!("error: --from <reply file> is required (or --restore)");
-        return 2;
-    };
-    let reply = match std::fs::read_to_string(from) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("error: cannot read {}: {}", from, e);
-            return 1;
-        }
-    };
-    let changes = crate::applyback::parse_reply(&reply);
-    if changes.is_empty() {
-        eprintln!("no file changes recognized in {}", from);
-        return 1;
-    }
-    let built = match crate::applyback::build_preview(&root, &changes) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            return 1;
-        }
-    };
-    for f in &built.preview.files {
-        if f.identical {
-            println!("same   {} (already matches disk)", f.rel_path);
-        } else if f.ok {
-            println!("{:6} {} +{} -{}", f.action, f.rel_path, f.adds, f.dels);
+/// `file://` URI with percent-encoding for everything outside the
+/// unreserved set and `/` (also `,`, which dbus-send splits arrays on).
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn file_uri(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::from("file://");
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
         } else {
-            println!("SKIP   {} — {}", f.rel_path, f.note);
+            out.push_str(&format!("%{:02X}", b));
         }
     }
-    if built.ready.is_empty() {
-        println!("nothing to apply");
-        return 0;
-    }
-    if !a.yes {
-        println!(
-            "dry-run: {} file(s) would be written — pass --yes to apply (backups are taken)",
-            built.ready.len()
-        );
-        return 0;
-    }
-    match crate::applyback::apply_files(&root, &built.ready) {
-        Ok(o) => {
-            for p in &o.applied {
-                println!("applied {}", p);
-            }
-            for f in &o.failed {
-                eprintln!("failed  {} — {}", f.rel_path, f.reason);
-            }
-            if let Some(b) = &o.backup_dir {
-                println!("backup={}", b);
-                println!("undo: turbomerger apply \"{}\" --restore", root.display());
-            }
-            if o.failed.is_empty() {
-                0
-            } else {
-                1
-            }
-        }
-        Err(e) => {
-            eprintln!("apply failed: {}", e);
-            1
-        }
-    }
+    out
 }
 
 #[cfg(test)]
@@ -1275,7 +741,6 @@ mod tests {
 
     #[test]
     fn watch_event_filter_ignores_git_and_own_outputs() {
-        use std::path::Path;
         assert!(!watch_event_is_relevant(Path::new(
             "C:/repo/.git/index.lock"
         )));
@@ -1296,43 +761,40 @@ mod tests {
     }
 
     #[test]
-    fn selection_filters_and_force_include_rescues() {
+    fn only_session_outputs_may_be_opened() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
-        std::fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
-        std::fs::write(root.join("notes.txt"), "hello\n").unwrap();
+        let out = tmp.path().join("r_merged.md");
+        std::fs::write(&out, "x").unwrap();
+        let outputs = Outputs::default();
+        assert!(!outputs.allows(&out.to_string_lossy()));
+        outputs.record(&MergeResult {
+            output_path: out.to_string_lossy().to_string(),
+            output_paths: vec![out.to_string_lossy().to_string()],
+            files_processed: 1,
+            files_skipped: 0,
+            total_bytes: 1,
+            duration_ms: 0,
+            files_by_extension: 1,
+            files_by_content: 0,
+            files_skipped_binary: 0,
+            files_unreadable: 0,
+            secrets_redacted: 0,
+            tokens_o200k: 1,
+            tokens_claude_est: 1,
+            skill_path: None,
+            not_captured: 0,
+        });
+        assert!(outputs.allows(&out.to_string_lossy()));
+        assert!(!outputs.allows("/etc/passwd"));
+        assert!(!outputs.allows(&tmp.path().to_string_lossy()));
+    }
 
-        let mut files = vec![root.join("a.rs"), root.join("b.rs")];
-        let mut skipped = vec![crate::scanner::SkipEntry {
-            path: "notes.txt".into(),
-            reason: "test skip".into(),
-        }];
-
-        // Force-include rescues the skipped file and clears its skip entry.
-        apply_selection(
-            &root,
-            &mut files,
-            &mut skipped,
-            &None,
-            &["notes.txt".to_string(), "../escape.txt".to_string()],
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn file_uris_are_percent_encoded() {
+        assert_eq!(
+            file_uri(Path::new("/home/a b/ü#1,2.md")),
+            "file:///home/a%20b/%C3%BC%231%2C2.md"
         );
-        assert!(files.iter().any(|f| f.ends_with("notes.txt")));
-        assert!(skipped.is_empty());
-        assert_eq!(files.len(), 3, "path traversal must not add files");
-
-        // Selection keeps exactly the named subset.
-        apply_selection(
-            &root,
-            &mut files,
-            &mut skipped,
-            &Some(vec!["a.rs".to_string(), "notes.txt".to_string()]),
-            &[],
-        );
-        let rels: Vec<String> = files
-            .iter()
-            .map(|f| crate::scanner::relative_display(&root, f))
-            .collect();
-        assert_eq!(rels, vec!["a.rs", "notes.txt"]);
     }
 }

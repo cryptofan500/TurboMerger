@@ -1,0 +1,58 @@
+[package]
+name = "tm-core"
+description = "TurboMerger core: scan, extract, redact, count, pack and apply back — no GUI"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+edition = "2021"
+publish = false
+
+[dependencies]
+aho-corasick.workspace = true
+anyhow.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+chardetng.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+dunce.workspace = true
+encoding_rs.workspace = true
+globset.workspace = true
+ignore.workspace = true
+phf.workspace = true
+rayon.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+tempfile.workspace = true
+tiktoken-rs.workspace = true
+toml.workspace = true
+twox-hash.workspace = true
+tree-sitter.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true
+unicode-normalization.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Win32_Foundation: GetFinalPathNameByHandleW (apply-back post-open verification)
+windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# O_NONBLOCK for apply-back reads (a FIFO swapped in must not hang the preview)
+libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# F_GETPATH for apply-back post-open verification
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
