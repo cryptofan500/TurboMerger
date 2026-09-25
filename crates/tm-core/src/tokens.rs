@@ -1,4 +1,8 @@
-//! Real token counting via tiktoken (o200k_base — GPT-4o/4.1/5, o-series).
+//! Exact o200k_base token counts (GPT-4o/4.1/5, o-series) via tiktoken's
+//! ordinary encoding: special-token strings such as `<|endoftext|>` count as
+//! the text they are, which is how a chat window tokenizes pasted content.
+//! (`bpe-openai` counts the same and is ~20 % faster, but adds 28 MB to every
+//! binary — ADR 0016.)
 //!
 //! Anthropic ships no offline Claude tokenizer; o200k undercounts Claude by
 //! ~15-20% on code, so the UI labels the Claude figure as an estimate
@@ -6,15 +10,13 @@
 
 use std::io::{self, Read};
 use std::path::Path;
-use std::sync::LazyLock;
-use tiktoken_rs::CoreBPE;
 
-static BPE: LazyLock<CoreBPE> =
-    LazyLock::new(|| tiktoken_rs::o200k_base().expect("o200k_base tokenizer"));
+static BPE: std::sync::LazyLock<tiktoken_rs::CoreBPE> =
+    std::sync::LazyLock::new(|| tiktoken_rs::o200k_base().expect("o200k_base tokenizer"));
 
 /// Exact o200k_base token count for `text`.
 pub fn count(text: &str) -> usize {
-    BPE.encode_with_special_tokens(text).len()
+    BPE.encode_ordinary(text).len()
 }
 
 /// Rough Claude-token estimate (o200k tends to undercount Claude on code).
@@ -26,8 +28,7 @@ pub fn claude_estimate(o200k: usize) -> usize {
 /// same total as counting the whole: just after a `\n` that is followed by
 /// neither whitespace nor `/`. No o200k pre-token spans such a point — none
 /// of the pattern's alternatives continues past a newline except
-/// `[\r\n/]*` (hence the `/`) and the whitespace runs — and special tokens
-/// contain no newline.
+/// `[\r\n/]*` (hence the `/`) and the whitespace runs.
 fn safe_cut(text: &str, near: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut i = near.min(bytes.len());
@@ -121,6 +122,13 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn special_token_strings_count_as_text() {
+        // A chat UI does not parse `<|endoftext|>` in pasted text as one
+        // special token; neither do we.
+        assert!(count("<|endoftext|>") > 1);
     }
 
     #[test]

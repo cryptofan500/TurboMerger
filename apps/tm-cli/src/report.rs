@@ -4,7 +4,6 @@
 //! only the final summary.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -48,7 +47,8 @@ pub struct ReporterConfig {
 }
 
 pub struct Reporter {
-    stop: Arc<AtomicBool>,
+    /// Dropping it wakes and ends the reporter thread at once.
+    stop: Option<std::sync::mpsc::Sender<()>>,
     handle: Option<JoinHandle<()>>,
     /// Why the run was stopped early, if the reporter stopped it.
     pub stopped_by: Arc<std::sync::Mutex<Option<&'static str>>>,
@@ -131,9 +131,9 @@ fn status_line(s: &Snapshot) -> String {
 impl Reporter {
     pub fn start(tracker: Arc<Tracker>, token: CancelToken, cfg: ReporterConfig) -> Reporter {
         use std::io::IsTerminal;
-        let stop = Arc::new(AtomicBool::new(false));
+        let (stop, stop_rx) = std::sync::mpsc::channel::<()>();
         let stopped_by = Arc::new(std::sync::Mutex::new(None));
-        let (stop2, stopped2) = (stop.clone(), stopped_by.clone());
+        let stopped2 = stopped_by.clone();
         let tty = std::io::stderr().is_terminal();
         let handle = std::thread::spawn(move || {
             let started = Instant::now();
@@ -143,8 +143,10 @@ impl Reporter {
             let mut deadline_fired = false;
             let mut drew_status = false;
             let mut err = std::io::stderr();
-            while !stop2.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(200));
+            // Wake every 200 ms, or at once when `finish` drops the sender.
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                stop_rx.recv_timeout(Duration::from_millis(200))
+            {
                 let snap = tracker.snapshot();
                 if let Some(d) = cfg
                     .deadline
@@ -224,14 +226,14 @@ impl Reporter {
             }
         });
         Reporter {
-            stop,
+            stop: Some(stop),
             handle: Some(handle),
             stopped_by,
         }
     }
 
     pub fn finish(mut self) -> Option<&'static str> {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.take();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }

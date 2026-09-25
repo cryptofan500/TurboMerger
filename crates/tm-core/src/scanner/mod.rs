@@ -1141,6 +1141,11 @@ pub fn scan_with(
     // What the walk filter left out: directories (with counts), hidden files,
     // and symlinks (resolved below).
     let pruned = std::mem::take(&mut *pruned.lock().expect("prune recorder"));
+    // Walk 2 attributes what ignore rules hid; with no ignore file anywhere
+    // (and no ancestor rules), there is nothing for it to find (D4).
+    let ignore_files_present = use_ancestors
+        || seen.iter().any(|p| names_ignore_file(p))
+        || pruned.iter().any(|p| names_ignore_file(&p.path));
     let mut budget = COUNT_CAP_TOTAL;
     let candidate_rels: HashSet<String> = candidates
         .iter()
@@ -1205,7 +1210,7 @@ pub fn scan_with(
     }
 
     // Walk 2: everything ignore rules or user globs hid, counted per rule.
-    if options.respect_gitignore || overrides.is_some() {
+    if (options.respect_gitignore && ignore_files_present) || overrides.is_some() {
         let ignored = find_ignored(root, &seen, include_venv, include_hidden, cancel);
         if cancel.load(AtomicOrd::Relaxed) {
             return stop();
@@ -1327,6 +1332,14 @@ pub fn scan_with(
         stats,
         skipped,
     })
+}
+
+/// An ignore file, or a `.git` directory (its `info/exclude`).
+fn names_ignore_file(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some(".gitignore" | ".ignore" | ".turbomergerignore" | ".git")
+    )
 }
 
 fn o_has_whitelist(options: &ScanOptions) -> bool {

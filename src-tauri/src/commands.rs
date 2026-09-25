@@ -15,7 +15,7 @@
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -109,24 +109,22 @@ struct Reporter {
     tracker: Arc<Tracker>,
     channel: Channel<JobProgress>,
     last: Mutex<Instant>,
-    stop: Arc<AtomicBool>,
+    /// Dropping it ends the ticker at once (no sleep to wait out).
+    stop: Option<std::sync::mpsc::Sender<()>>,
     ticker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Reporter {
     fn start(channel: Channel<JobProgress>) -> Reporter {
         let tracker = Arc::new(Tracker::new(ETA_AFTER, STALL_AFTER));
-        let stop = Arc::new(AtomicBool::new(false));
+        let (stop, stop_rx) = std::sync::mpsc::channel::<()>();
         let ticker = {
-            let (tracker, channel, stop) = (tracker.clone(), channel.clone(), stop.clone());
+            let (tracker, channel) = (tracker.clone(), channel.clone());
             std::thread::spawn(move || {
-                let mut last_tick = Instant::now();
-                while !stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(100));
-                    if last_tick.elapsed() >= Duration::from_secs(1) {
-                        last_tick = Instant::now();
-                        let _ = channel.send(tracker.snapshot().into());
-                    }
+                while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    stop_rx.recv_timeout(Duration::from_secs(1))
+                {
+                    let _ = channel.send(tracker.snapshot().into());
                 }
             })
         };
@@ -134,7 +132,7 @@ impl Reporter {
             tracker,
             channel,
             last: Mutex::new(Instant::now() - Duration::from_secs(1)),
-            stop,
+            stop: Some(stop),
             ticker: Some(ticker),
         }
     }
@@ -151,7 +149,7 @@ impl Reporter {
 
 impl Drop for Reporter {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.take();
         if let Some(t) = self.ticker.take() {
             let _ = t.join();
         }

@@ -69,6 +69,7 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage
 panic = "abort"
 codegen-units = 1
 lto = true
-opt-level = "z"
+# 3, not "z": 25-30 % faster merges for +8 % binary size (ADR 0016, N-39).
+opt-level = 3
 strip = true
 overflow-checks = true  # SECURITY: Prevent integer overflow in release builds
