@@ -45,8 +45,10 @@ pub struct ScanningConfig {
     pub include_hidden: bool,
     /// Include virtual environments (venv, node_modules, __pycache__, etc.)
     pub include_venvs: bool,
-    /// Skip files larger than this (in MB). This is the REAL absolute cap
-    /// (v7.1 silently overrode anything above a hardcoded 2 MB).
+    /// Skip files larger than this (in MB). `0`, the default, means no cap:
+    /// every text file and document is captured whatever its size — big ones
+    /// are streamed through the spool in segments, so memory stays bounded.
+    /// (v7.1 silently dropped anything above a hardcoded 2 MB.)
     pub max_file_size_mb: u64,
     /// Enable content-based binary detection for unknown extensions
     pub content_sniff: bool,
@@ -57,7 +59,7 @@ impl Default for ScanningConfig {
         Self {
             include_hidden: false,
             include_venvs: false,
-            max_file_size_mb: 2,
+            max_file_size_mb: 0,
             content_sniff: true,
         }
     }
@@ -109,7 +111,7 @@ mod tests {
         assert!(config.extensions.binary.is_empty());
         assert!(!config.scanning.include_hidden);
         assert!(!config.scanning.include_venvs);
-        assert_eq!(config.scanning.max_file_size_mb, 2);
+        assert_eq!(config.scanning.max_file_size_mb, 0);
         assert!(config.scanning.content_sniff);
     }
 
@@ -156,7 +158,7 @@ max_file_size_mb = 25
     fn test_missing_file_returns_default() {
         let config = load_from_dir(Path::new("/nonexistent/path/that/does/not/exist"));
         assert!(config.scanning.content_sniff);
-        assert_eq!(config.scanning.max_file_size_mb, 2);
+        assert_eq!(config.scanning.max_file_size_mb, 0);
     }
 
     #[test]

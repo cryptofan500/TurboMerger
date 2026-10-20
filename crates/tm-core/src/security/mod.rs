@@ -220,20 +220,7 @@ fn is_blocked_macos_path(canonical: &Path) -> bool {
 /// given — v7.7.0 NFKC-normalized it first, so folders with full-width or
 /// NFD names failed with "No such file or directory" (N-09).
 pub fn validate_and_canonicalize(path: &str) -> Result<PathBuf, SecurityError> {
-    let path = PathBuf::from(path);
-
-    if has_reparse_point_in_path(&path)? {
-        return Err(SecurityError::ReparsePointDetected);
-    }
-
-    let canonical =
-        dunce::canonicalize(&path).map_err(|e| SecurityError::ValidationFailed(e.to_string()))?;
-
-    if has_reparse_point_in_path(&canonical)? {
-        return Err(SecurityError::ReparsePointDetected);
-    }
-
-    let long_path = normalize_to_long_path(&canonical)?;
+    let long_path = canonicalize_any_source(path)?;
 
     #[cfg(target_os = "macos")]
     if is_blocked_macos_path(&long_path) {
@@ -257,6 +244,43 @@ pub fn validate_and_canonicalize(path: &str) -> Result<PathBuf, SecurityError> {
     }
 
     Ok(long_path)
+}
+
+/// `validate_and_canonicalize` without the protected-system-folder check: a
+/// whole-computer run a person asked for (CLI `--allow-system-paths`). The
+/// path is still canonical, long-named and free of reparse points.
+pub fn canonicalize_any_source(path: &str) -> Result<PathBuf, SecurityError> {
+    let path = PathBuf::from(path);
+
+    if has_reparse_point_in_path(&path)? {
+        return Err(SecurityError::ReparsePointDetected);
+    }
+
+    let canonical =
+        dunce::canonicalize(&path).map_err(|e| SecurityError::ValidationFailed(e.to_string()))?;
+
+    if has_reparse_point_in_path(&canonical)? {
+        return Err(SecurityError::ReparsePointDetected);
+    }
+
+    normalize_to_long_path(&canonical)
+}
+
+/// The top of a file system — `/`, `C:\`, or a mount point such as a USB
+/// drive — so a scan of it covers a whole drive.
+pub fn is_filesystem_root(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return true;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(path), std::fs::metadata(parent)) {
+            return a.dev() != b.dev();
+        }
+    }
+    let _ = parent;
+    false
 }
 
 /// Sanitizes a filename by removing dangerous characters (filesystem name only —
@@ -407,12 +431,76 @@ pub fn is_valid_text_window(data: &[u8]) -> bool {
     }
 }
 
+/// UTF-16 text in `data` (a sniff window): its encoding and how many bytes of
+/// byte-order mark to skip. With a BOM the window must still read as text;
+/// without one, ASCII-range UTF-16 has a zero byte in every second position —
+/// MetaTrader `.ini`/`.set`/`.mqh` files and many Windows exports look like
+/// that. Both used to be dropped as binary (half their bytes are NUL) unless
+/// the extension happened to be a known text one.
+pub fn utf16_text_encoding(data: &[u8]) -> Option<(&'static encoding_rs::Encoding, usize)> {
+    let (enc, bom_len) = match data {
+        [0xFF, 0xFE, ..] => (encoding_rs::UTF_16LE, 2),
+        [0xFE, 0xFF, ..] => (encoding_rs::UTF_16BE, 2),
+        _ => (bomless_utf16(data)?, 0),
+    };
+    reads_as_utf16_text(enc, &data[bom_len..]).then_some((enc, bom_len))
+}
+
+/// A window from the middle of a file already known to be `enc` (UTF-16)
+/// still reads as text — the scanner's check that a text header does not sit
+/// on a binary body.
+pub fn utf16_window_is_text(enc: &'static encoding_rs::Encoding, window: &[u8]) -> bool {
+    reads_as_utf16_text(enc, window)
+}
+
+/// One byte parity at least 70 % zeros and the other at most 5 %.
+fn bomless_utf16(data: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let n = data.len() & !1;
+    if n < 16 {
+        return None;
+    }
+    let (mut zero_even, mut zero_odd) = (0usize, 0usize);
+    for (i, &b) in data[..n].iter().enumerate() {
+        if b == 0 {
+            if i % 2 == 0 {
+                zero_even += 1;
+            } else {
+                zero_odd += 1;
+            }
+        }
+    }
+    let half = n / 2;
+    if zero_odd * 10 >= half * 7 && zero_even * 20 <= half {
+        Some(encoding_rs::UTF_16LE)
+    } else if zero_even * 10 >= half * 7 && zero_odd * 20 <= half {
+        Some(encoding_rs::UTF_16BE)
+    } else {
+        None
+    }
+}
+
+/// At most 5 % of the decoded window is replacement or control characters
+/// (tab, CR, LF and form feed are text). A surrogate pair cut by the window
+/// edge costs one replacement character, well inside the margin.
+fn reads_as_utf16_text(enc: &'static encoding_rs::Encoding, body: &[u8]) -> bool {
+    let (text, _) = enc.decode_without_bom_handling(&body[..body.len() & !1]);
+    let (mut total, mut bad) = (0usize, 0usize);
+    for c in text.chars() {
+        total += 1;
+        if c == '\u{FFFD}' || (c.is_control() && !matches!(c, '\t' | '\n' | '\r' | '\u{c}')) {
+            bad += 1;
+        }
+    }
+    bad * 20 <= total
+}
+
 /// Binary detection: validity first, then magic bytes and byte statistics.
 /// Well-formed UTF-8 is text even when it happens to start with a magic
 /// number — v7.7.0 dropped `MZ-80 emulator notes` and `BZ-1234 ticket`
-/// Markdown files as executables/archives (N-04).
+/// Markdown files as executables/archives (N-04). UTF-16 text (with or
+/// without a byte-order mark) is text too.
 pub fn is_binary_content(data: &[u8]) -> bool {
-    if data.is_empty() || is_valid_text_window(data) {
+    if data.is_empty() || is_valid_text_window(data) || utf16_text_encoding(data).is_some() {
         return false;
     }
 

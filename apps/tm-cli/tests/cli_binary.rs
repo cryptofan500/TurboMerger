@@ -76,8 +76,8 @@ fn exit_codes_follow_the_contract() {
     );
     assert_eq!(o.status.code(), Some(3));
 
-    // A.1: documents without an extractor are NOT captured → 3, and the
-    // report says so.
+    // A.1: a document whose text cannot be extracted (this stub PDF has no
+    // valid structure) is NOT captured → 3, and the report says so.
     let docs = tmp.path().join("docs");
     fs::create_dir_all(&docs).unwrap();
     fs::write(docs.join("paper.pdf"), "%PDF-1.7\n").unwrap();

@@ -265,17 +265,25 @@ const RUNS: &[Run] = &[
         ext: "xml",
         args: &["--ordering", "important-last", "--format", "cxml"],
     },
+    // Redaction is opt-in (`--redact`); these two pin what it masks and holds.
     Run {
         name: "secrets-md",
         fixture: "golden_secrets",
         ext: "md",
-        args: &[],
+        args: &["--redact"],
     },
     Run {
         name: "secrets-json",
         fixture: "golden_secrets",
         ext: "json",
-        args: &["--format", "json"],
+        args: &["--redact", "--format", "json"],
+    },
+    // The default: nothing masked, sensitive-name files included, exit 0.
+    Run {
+        name: "secrets-default-md",
+        fixture: "golden_secrets",
+        ext: "md",
+        args: &[],
     },
     Run {
         name: "split-md",

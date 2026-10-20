@@ -139,10 +139,27 @@ pub struct ScanArgs {
     /// Download cloud files that are not on this device (OneDrive, iCloud) and read them
     #[arg(long)]
     pub hydrate: bool,
-    /// Per-file size cap in MB (default 2, or the config file's value)
+    /// Per-file size cap in MB (default: none — every file is taken whatever its
+    /// size, big ones streamed; or the config file's value). 0 = no cap
     #[arg(long, value_name = "MB", env = "TURBOMERGER_MAX_FILE_SIZE",
-          value_parser = clap::value_parser!(u64).range(1..=4096))]
+          value_parser = clap::value_parser!(u64).range(0..=1_048_576))]
     pub max_file_size: Option<u64>,
+    /// Extract text from image-only document pages (scanned PDFs) with an
+    /// external OCR command ($TURBOMERGER_OCR_CMD, default `monaddoc`). Off by default.
+    #[arg(long)]
+    pub extract_images_text: bool,
+    /// Mask secrets (API keys, tokens, private keys, passwords) and leave
+    /// credential files (.env, key material, credential dumps) out. Off by
+    /// default: every text file is taken as it is
+    #[arg(long, conflicts_with = "no_redact")]
+    pub redact: bool,
+    /// Do not redact secrets (the default; kept so older scripts still run)
+    #[arg(long, hide = true)]
+    pub no_redact: bool,
+    /// Accept a protected system folder as the source (C:\Windows, /usr, /etc,
+    /// …) for whole-computer runs. A drive root (C:\, /) is accepted anyway
+    #[arg(long)]
+    pub allow_system_paths: bool,
 }
 
 #[derive(Args, Debug)]
@@ -161,9 +178,6 @@ pub struct MergeCmd {
     pub max_tokens: Option<u64>,
     #[command(flatten)]
     pub scan: ScanArgs,
-    /// Do not redact secrets (the output may then contain credentials)
-    #[arg(long)]
-    pub no_redact: bool,
     #[arg(long)]
     pub remove_empty_lines: bool,
     #[arg(long)]
@@ -398,6 +412,9 @@ fn merge_options(src_root: String, scan: &ScanArgs) -> MergeOptions {
         .map(|p| p.to_string_lossy().to_string());
     o.max_file_size_mb = scan.max_file_size;
     o.hydrate = scan.hydrate;
+    o.extract_images_text = scan.extract_images_text;
+    o.redact_secrets = scan.redact && !scan.no_redact;
+    o.allow_system_paths = scan.allow_system_paths;
     o
 }
 
@@ -428,7 +445,6 @@ fn run_merge(a: MergeCmd) -> i32 {
     let remote_label = source.remote_label.clone();
     let mut options = merge_options(source.root.clone(), &a.scan);
     options.output_path = a.out.as_ref().map(|p| p.to_string_lossy().to_string());
-    options.redact_secrets = !a.no_redact;
     options.format = Some(a.format.as_str().to_string());
     options.ordering = Some(a.ordering.as_str().to_string());
     options.max_tokens = a.max_tokens.map(|t| t as usize);

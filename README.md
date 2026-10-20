@@ -117,13 +117,16 @@ timestamped Markdown, Claude XML, XML, JSON, or plain-text snapshot containing:
 
 - a directory tree and linked contents;
 - every included text file in collision-safe fences;
+- the extracted text of PDFs, Word/PowerPoint/OpenDocument files, spreadsheets
+  and EPUBs — so a folder of papers or reports is merged, not dropped;
 - exact `o200k_base` token counts and context-window hints;
 - optional token-budget splitting and signature-only compression;
 - optional Git diff (of the merged files only) and recent-commit context; and
 - a merge report that accounts for every input: what was **not captured**
-  (documents and photos without an extractor yet, files too large, unreadable),
-  what was skipped on purpose, which directories were not scanned (with file
-  counts), and how many entries each ignore rule hid.
+  (photos and legacy binary Office files without an extractor yet, documents
+  whose text could not be parsed, files too large, unreadable), what was
+  skipped on purpose, which directories were not scanned (with file counts),
+  and how many entries each ignore rule hid.
 
 Split outputs carry the full tree and a contents list with part numbers in
 part 1, the report once, and every part within the token budget. Headers name
@@ -141,6 +144,15 @@ the source folder, never your absolute home path (`--show-source-path` opts in).
   `gh:owner/repo` into a self-cleaning temporary directory (Git LFS skipped,
   5-minute timeout; a private-repo token travels in an HTTP header, never in the
   URL or the clone's config).
+- **Documents into text** — PDFs (reading-order aware, two-column papers kept
+  in order), Word/PowerPoint/OpenDocument files, spreadsheets, and EPUBs have
+  their text extracted and merged like any file. Pure Rust, so it behaves
+  identically on Windows, macOS and Linux with nothing extra to install.
+  Scanned PDFs with no text layer can be OCR'd with `--extract-images-text`
+  (an external OCR command, off by default).
+- **No silent size drops** — the per-file cap defaults to 50 MB and
+  `--max-file-size 0` removes it entirely; oversized text still flows into the
+  token-budget split, so nothing is lost.
 - **Compression and repo maps** — tree-sitter signatures plus a ranked,
   budget-aware Aider-style repository map.
 - **Watch mode** — debounced regeneration while ignoring Git state, Finder
@@ -170,6 +182,7 @@ turbomerger merge <folder|URL|gh:owner/repo> [out]
     [--max-tokens N] [--include GLOB] [--exclude GLOB] [--config FILE] [--max-file-size MB]
     [--compress] [--strip-comments] [--git-diff] [--git-log [N]] [--emit-skill]
     [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--hydrate]
+    [--extract-images-text]
     [--show-source-path] [--reproducible] [--fail-on-skip] [--quiet]
     [--progress auto|json|none] [--eta-after DUR] [--stall-after DUR] [--on-stall wait|fail]
     [--deadline DUR] [--on-deadline cancel|partial] [--keep-partial]
@@ -227,7 +240,7 @@ binary = ["dat"]
 [scanning]
 include_hidden = false
 include_venvs = false
-max_file_size_mb = 2
+max_file_size_mb = 50   # 0 = unlimited (capture every file whatever its size)
 content_sniff = true
 ```
 

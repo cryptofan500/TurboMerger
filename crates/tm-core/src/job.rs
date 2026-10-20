@@ -53,7 +53,11 @@ pub struct MergeOptions {
     pub respect_gitignore: bool,
     #[serde(default)]
     pub include_hidden: bool,
-    #[serde(default = "default_true")]
+    /// Mask secrets in the output and leave credential files (`.env`, key
+    /// material, credential dumps) out. Off by default — every text file is
+    /// taken as it is (CLI `--redact`, desktop toggle); the MCP server forces
+    /// it on.
+    #[serde(default)]
     pub redact_secrets: bool,
     #[serde(default)]
     pub format: Option<String>,
@@ -114,11 +118,21 @@ pub struct MergeOptions {
     /// Read (download) cloud files that are not on this device (N-10/N-11).
     #[serde(default)]
     pub hydrate: bool,
+    /// OCR image-only document pages (scanned PDFs) via the external OCR
+    /// command. Off by default (CLI `--extract-images-text`).
+    #[serde(default)]
+    pub extract_images_text: bool,
+    /// Accept a protected operating-system folder as the source
+    /// (`C:\Windows`, `/usr`, `/etc`, …) for whole-computer runs (CLI
+    /// `--allow-system-paths`). Never set by the MCP server.
+    #[serde(default)]
+    pub allow_system_paths: bool,
 }
 
 impl MergeOptions {
-    /// The defaults every shell starts from: tree on, redaction on,
-    /// `.gitignore` respected, content sniffing on.
+    /// The defaults every shell starts from: tree on, redaction off (every
+    /// text file is taken), `.gitignore` respected, content sniffing on, no
+    /// size cap.
     pub fn for_folder(folder_path: impl Into<String>) -> MergeOptions {
         MergeOptions {
             folder_path: folder_path.into(),
@@ -128,7 +142,7 @@ impl MergeOptions {
             content_detection: true,
             respect_gitignore: true,
             include_hidden: false,
-            redact_secrets: true,
+            redact_secrets: false,
             format: None,
             ordering: None,
             max_tokens: None,
@@ -150,6 +164,8 @@ impl MergeOptions {
             max_file_size_mb: None,
             reproducible: false,
             hydrate: false,
+            extract_images_text: false,
+            allow_system_paths: false,
         }
     }
 }
@@ -163,8 +179,12 @@ pub struct ResolvedJob {
 }
 
 pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
-    let root = security::validate_and_canonicalize(&options.folder_path)
-        .map_err(|e| format!("Security error: {}", e))?;
+    let root = if options.allow_system_paths {
+        security::canonicalize_any_source(&options.folder_path)
+    } else {
+        security::validate_and_canonicalize(&options.folder_path)
+    }
+    .map_err(|e| format!("Security error: {}", e))?;
     if !root.exists() || !root.is_dir() {
         return Err("Invalid folder path".to_string());
     }
@@ -225,6 +245,9 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         include_globs,
         exclude_globs,
         hydrate: options.hydrate,
+        protect_secrets: options.redact_secrets,
+        whole_drive: options.allow_system_paths || security::is_filesystem_root(&root),
+        ocr_images: options.extract_images_text,
     };
 
     let merge_config = MergeConfig {
@@ -244,6 +267,8 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         show_source_path: options.show_source_path,
         remote: options.remote,
         reproducible: options.reproducible,
+        extract_images_text: options.extract_images_text,
+        max_file_size: config.scanning.max_file_size_mb * 1024 * 1024,
     };
 
     Ok(ResolvedJob {

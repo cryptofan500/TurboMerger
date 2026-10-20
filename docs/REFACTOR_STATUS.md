@@ -13,7 +13,11 @@ and its numbers in `fixtures/audit-2026-09-24/RESULTS_phase-<N>.txt`.
 [x] D1 macOS build   [x] D2 Windows run   [x] D3 GUI clicked through (fixtures/gui-smoke)
 [x] Phase 2  2.1 [x] 2.2 [x] 2.3 [x] 2.4 [x] 2.5 [x] 2.6 [x] 2.7 [x] 2.8 [x] 2.9 [x] 2.10 [x] 2.11 [x] 2.12 [x]  gate [x]   2026-09-24
 [ ] Phase 5  policy [ ] rules [ ] masking v2 [ ] N-07 [ ] placeholders+D9 [ ] verifier [ ] boundary tests [ ]  gate [ ]
-[ ] Phase 3  tm-pdf [ ] renderer ADR [ ] bundle [ ] extractors [ ] quality gate [ ] tests [ ]  gate [ ]
+[~] Phase 3  tm-pdf [ ] renderer ADR [ ] bundle [ ] extractors [x] quality gate [ ] tests [x]  gate [ ]
+             part 1 (text) 2026-10-19: PDF (pdf_oxide), docx/pptx/odt/odp/epub (quick-xml),
+             xls/xlsx/ods (calamine) extracted into the merge; 50 MB default cap + unlimited;
+             --extract-images-text OCR bridge. Remaining: PDFium figure rendering, renderer
+             gate, bundle layout, tm-pdf worker offload.
 [ ] Phase 6  toolchain bump [ ] tm-ocr [ ] HEIC ADR [ ] layout [ ] scanned PDFs [ ] synthetic fixture [ ]  gate [ ]
 [ ] Phase 4  profiles [ ] packing v2 [ ] tokens per target [ ] digest/index [ ] skeleton+density [ ]  gate [ ]
 [ ] Phase 7  calibrate [ ] media plugins [ ] converter hook [ ]  gate [ ]

@@ -55,7 +55,7 @@ fn a5_output_is_byte_identical_across_runs_and_never_leaks_a_tail() {
 }
 
 #[test]
-fn n13_a_paper_that_trips_the_density_rule_does_not_rewrite_other_papers() {
+fn n13_a_security_paper_is_not_a_dump_and_rewrites_nothing() {
     // v1 N-13: papers flagged "credential-dense" (author e-mail lines, login
     // vocabulary) donated every letter+digit token to repo-wide masking:
     // `4,096-token` → `4,0[REDACTED]`, `Opus-4.8 medium` → `[REDACTED] medium`.
@@ -76,13 +76,21 @@ fn n13_a_paper_that_trips_the_density_rule_does_not_rewrite_other_papers() {
     fs::write(root.join("2608.00003.txt"), other).unwrap();
 
     let text = merge_to_string(&root, &tmp.path().join("papers.md"));
-    // The scenario holds: the flagged paper trips the density rule (N-07,
-    // content classes arrive in Phase 5) …
+    // A credential dump needs one indicator line in ten; three author/login
+    // lines in a 124-line paper are not a dump, so the paper is kept …
     assert!(
-        text.contains("`2608.00001.txt` — credential-dense"),
-        "fixture must trip the density rule"
+        !text.contains("`2608.00001.txt` — credential-dense"),
+        "a security paper is not a credential dump"
     );
-    // … yet donates nothing to repo-wide masking.
+    // … with its own model names and numbers intact (the residency-folder
+    // complaint: research text masked away) …
+    assert!(
+        text.contains(
+            "Paragraph 60: we evaluate Opus-4.8 medium and claude-fable-5 with a 4,096-token window, following arXiv:2210.03629 and gpt-4o-mini-2024-07-18 baselines."
+        ),
+        "the paper's own text must survive: {text}"
+    );
+    // … and it donates nothing to repo-wide masking.
     assert!(
         !text.contains("Propagated known secret"),
         "no value may be masked repo-wide from a paper"
@@ -112,6 +120,12 @@ fn credential_dump_values_are_masked_only_as_whole_tokens() {
     )
     .unwrap();
     let text = merge_to_string(&root, &tmp.path().join("dump.md"));
+    // Every line is a credential, so this IS a dump: excluded and harvested.
+    // (n13 above is the counterpart — the density path must still fire.)
+    assert!(
+        text.contains("`accounts.md` — credential-dense"),
+        "a real dump must trip the density rule: {text}"
+    );
     assert!(
         text.contains(
             "rotated [REDACTED] today; build id xsvcKey-Zx9Kq2Mv7Rt4Lp8Wb99 is unrelated."

@@ -8,6 +8,30 @@ Stops the silent content loss, corruption and write-anywhere paths found in the
 2026-09-24 audit (`TURBOMERGER_refactor_september24_2026_v2.md`, findings N-xx).
 Every fix ships with its repro turned into a test (96 → 156 Rust tests).
 
+### Added
+- **Document text extraction (Phase 3, part 1; ADR 0005).** PDFs, Word
+  (`.docx`), PowerPoint (`.pptx`), OpenDocument (`.odt`/`.ods`/`.odp`),
+  spreadsheets (`.xls`/`.xlsx`/`.xlsm`/`.xlsb`) and EPUBs now have their text
+  extracted and merged, instead of being reported as "not captured". PDF text
+  uses `pdf_oxide` (reading-order aware, so two-column papers stay in order);
+  spreadsheets use `calamine`; the OOXML/ODF/EPUB formats are parsed from their
+  zip-of-XML with `quick-xml`. All pure Rust — identical on Windows, macOS and
+  Linux, offline, with no native library or Python (ADR 0006). A folder of
+  arXiv PDFs that merged as `not_captured=N` now merges their full text.
+- **Opt-in OCR for scanned PDFs** via `--extract-images-text`, which hands
+  image-only pages to an external OCR command (`$TURBOMERGER_OCR_CMD`, default
+  `monaddoc`). Off by default.
+- Legacy binary Office formats (`.doc`, `.ppt`) and photos remain "not
+  captured" (a later phase), but are still recorded with a reason, never
+  dropped silently.
+
+### Changed
+- **Per-file size cap now 50 MB by default (was 2 MB), `0` = unlimited.** The
+  old 2 MB default silently dropped large text files and data; the new default
+  matches Repomix/Gitingest, and `--max-file-size 0` (or `max_file_size_mb = 0`
+  in `turbomerger.toml`) captures everything. Oversized text still flows into
+  the token-budget split, so nothing is lost.
+
 ### Security
 - **Apply-back never plants control files (N-52).** Files inside `.git` are
   refused outright (including `.GIT`, `.git.`, `git~1` and zero-width variants);

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+  xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+  xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0"
+  xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+  office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.presentation">
+ <office:body>
+  <office:presentation>
+   <draw:page draw:name="s1">
+    <draw:frame svg:x="1cm" svg:y="1cm" svg:width="20cm" svg:height="3cm">
+     <draw:text-box><text:p>TMPPT_TITLE_1X5</text:p><text:p>TMPPT_BODY_ONE_6R2</text:p></draw:text-box>
+    </draw:frame>
+   </draw:page>
+   <draw:page draw:name="s2">
+    <draw:frame svg:x="1cm" svg:y="1cm" svg:width="20cm" svg:height="3cm">
+     <draw:text-box><text:p>TMPPT_SLIDE_TWO_4M7</text:p><text:p>Łódź TMPPT_POLSKI_2P8</text:p></draw:text-box>
+    </draw:frame>
+   </draw:page>
+  </office:presentation>
+ </office:body>
+</office:document>

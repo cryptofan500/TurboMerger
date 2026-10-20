@@ -25,7 +25,7 @@
 //! - Entries hidden by ignore rules are counted per rule, and ancestor
 //!   ignore files apply only when the root is inside a git worktree.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrd};
@@ -272,7 +272,8 @@ pub struct ScanOptions {
     pub content_sniff: bool,
     pub include_hidden: bool,
     pub respect_gitignore: bool,
-    /// Absolute per-file cap in bytes (config `max_file_size_mb`, default 2 MB)
+    /// Absolute per-file cap in bytes (config `max_file_size_mb`); 0, the
+    /// default, means no cap — big files are streamed, never dropped.
     pub max_file_size: u64,
     pub extra_text_exts: Vec<String>,
     pub extra_skip_exts: Vec<String>,
@@ -284,6 +285,15 @@ pub struct ScanOptions {
     /// Read cloud files that are not on this device (downloads them). Off:
     /// they are recorded as not captured (N-10, N-11).
     pub hydrate: bool,
+    /// Leave credential files out by name (`.env`, key material, credential
+    /// stores). Follows secret redaction: off, every text file is taken.
+    pub protect_secrets: bool,
+    /// Whole-drive scan: skip pseudo file systems (`/proc`, `/sys`, `/dev`,
+    /// snap images, …) and the OS's swap, hibernation and recycle areas.
+    pub whole_drive: bool,
+    /// Text-from-images is on: images go to the merger for OCR instead of
+    /// being recorded as photos/binary.
+    pub ocr_images: bool,
 }
 
 impl Default for ScanOptions {
@@ -293,13 +303,16 @@ impl Default for ScanOptions {
             content_sniff: true,
             include_hidden: false,
             respect_gitignore: true,
-            max_file_size: 2 * 1024 * 1024,
+            max_file_size: 0,
             extra_text_exts: Vec::new(),
             extra_skip_exts: Vec::new(),
             extra_binary_exts: Vec::new(),
             include_globs: Vec::new(),
             exclude_globs: Vec::new(),
             hydrate: false,
+            protect_secrets: true,
+            whole_drive: false,
+            ocr_images: false,
         }
     }
 }
@@ -309,6 +322,8 @@ impl Default for ScanOptions {
 pub struct ScanStats {
     pub by_extension: usize,
     pub by_content: usize,
+    /// Documents (PDF, Office, e-book) whose text is extracted at merge time.
+    pub by_document: usize,
     pub skipped_binary: usize,
     pub unreadable: usize,
     /// Directories not descended into (dependency trees, caches, hidden…).
@@ -491,25 +506,67 @@ fn is_known_extensionless_file(name_lower: &str) -> bool {
 /// 3. Non-ASCII byte ratio >40% → binary/encoded
 /// 4. Any line >1000 chars → minified/binary
 fn sniff_file_content(path: &Path) -> Result<bool> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut buffer = vec![0u8; SNIFF_SIZE];
-    let bytes_read = reader.read(&mut buffer)?;
-
-    if bytes_read == 0 {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let head = read_window(&mut file, 0)?;
+    if head.is_empty() {
         return Ok(true); // Empty file is text
     }
-
-    buffer.truncate(bytes_read);
-
-    if crate::security::is_binary_content(&buffer) {
+    if !window_is_text(&head) {
         return Ok(false);
     }
+    // No size cap stands behind this sniff any more, so a big file is judged
+    // on its middle and its end too: a text header on a binary body (disk
+    // images, database dumps) must not be read in full.
+    if len > 4 * SNIFF_SIZE as u64 {
+        let utf16 = crate::security::utf16_text_encoding(&head).map(|(enc, _)| enc);
+        for at in [len / 2, len - SNIFF_SIZE as u64] {
+            let mut w = read_window(&mut file, at & !1)?;
+            let text = match utf16 {
+                Some(enc) => crate::security::utf16_window_is_text(enc, &w),
+                None => {
+                    // Start on a character boundary: skip UTF-8 continuation bytes.
+                    let skip = w.iter().take(3).take_while(|&&b| b & 0xC0 == 0x80).count();
+                    w.drain(..skip);
+                    window_is_text(&w)
+                }
+            };
+            if !text {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Up to `SNIFF_SIZE` bytes starting at `at`.
+fn read_window(file: &mut std::fs::File, at: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(at))?;
+    let mut buffer = Vec::with_capacity(SNIFF_SIZE);
+    file.by_ref()
+        .take(SNIFF_SIZE as u64)
+        .read_to_end(&mut buffer)?;
+    Ok(buffer)
+}
+
+/// One sniff window: binary signatures and NUL density first, then UTF-8 or
+/// UTF-16 validity, then byte statistics for legacy 8-bit encodings.
+fn window_is_text(buffer: &[u8]) -> bool {
+    let bytes_read = buffer.len();
+    if bytes_read == 0 {
+        return true;
+    }
+    if crate::security::is_binary_content(buffer) {
+        return false;
+    }
     // Well-formed UTF-8 is text: CJK prose is mostly high bytes, notebooks
-    // and generated JSON have very long lines (N-04). The statistics below
-    // are for legacy 8-bit encodings only.
-    if crate::security::is_valid_text_window(&buffer) {
-        return Ok(true);
+    // and generated JSON have very long lines (N-04). UTF-16 likewise. The
+    // statistics below are for legacy 8-bit encodings only.
+    if crate::security::is_valid_text_window(buffer)
+        || crate::security::utf16_text_encoding(buffer).is_some()
+    {
+        return true;
     }
 
     let control_count = buffer
@@ -517,12 +574,12 @@ fn sniff_file_content(path: &Path) -> Result<bool> {
         .filter(|&&b| (0x01..=0x08).contains(&b) || (0x0E..=0x1F).contains(&b))
         .count();
     if control_count * 100 > bytes_read * CONTROL_CHAR_THRESHOLD_PCT {
-        return Ok(false);
+        return false;
     }
 
     let high_byte_count = buffer.iter().filter(|&&b| b >= 0x80).count();
     if high_byte_count * 100 > bytes_read * NON_ASCII_THRESHOLD_PCT {
-        return Ok(false);
+        return false;
     }
 
     let max_line_len = buffer
@@ -530,11 +587,7 @@ fn sniff_file_content(path: &Path) -> Result<bool> {
         .map(|line| line.len())
         .max()
         .unwrap_or(0);
-    if max_line_len > MAX_LINE_LENGTH {
-        return Ok(false);
-    }
-
-    Ok(true)
+    max_line_len <= MAX_LINE_LENGTH
 }
 
 // ============================================================================
@@ -593,6 +646,130 @@ fn prune_dir_reason(
 }
 
 /// Something the walk filter left out, recorded for the report.
+/// A pipe, socket or device node, by name; `None` for files, folders, links.
+fn special_file_kind(t: std::fs::FileType) -> Option<&'static str> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if t.is_fifo() {
+            return Some("named pipe (FIFO)");
+        }
+        if t.is_socket() {
+            return Some("socket");
+        }
+        if t.is_char_device() {
+            return Some("character device");
+        }
+        if t.is_block_device() {
+            return Some("block device");
+        }
+    }
+    let _ = t;
+    None
+}
+
+/// What a whole-drive scan leaves out, by path: file systems that hold no
+/// files (`/proc`, `/sys`, `/dev`, tmpfs, cgroup, snap and docker images),
+/// network shares, and the OS's paging, hibernation, restore and recycle
+/// areas. Linux reads its mount table, so such a file system is skipped
+/// wherever it is mounted; macOS and Windows use fixed places.
+fn system_areas(root: &Path) -> HashMap<PathBuf, &'static str> {
+    let mut out: HashMap<PathBuf, &'static str> = HashMap::new();
+    let mut add = |p: PathBuf, why: &'static str| {
+        if p != root && p.starts_with(root) {
+            out.entry(p).or_insert(why);
+        }
+    };
+    #[cfg(target_os = "linux")]
+    if let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") {
+        for line in table.lines() {
+            // `36 35 98:0 /mnt1 /mnt/parent rw,noatime master:1 - ext3 /dev/root rw`
+            let Some((left, right)) = line.split_once(" - ") else {
+                continue;
+            };
+            let (Some(mount_point), Some(fstype)) =
+                (left.split(' ').nth(4), right.split(' ').next())
+            else {
+                continue;
+            };
+            if let Some(why) = linux_fs_reason(fstype) {
+                add(PathBuf::from(unescape_mount_path(mount_point)), why);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    for (p, why) in [
+        (
+            "/System/Volumes",
+            "system volumes (the data volume repeats /Users …) — not scanned",
+        ),
+        ("/Volumes", "other mounted volumes — not scanned"),
+        ("/dev", "device files — not scanned"),
+        (
+            "/private/var/vm",
+            "virtual-memory swap and sleep image — not scanned",
+        ),
+        ("/.vol", "volume-ID file system — not scanned"),
+        ("/.fseventsd", "file-system event log — not scanned"),
+        ("/.Spotlight-V100", "Spotlight index — not scanned"),
+        (
+            "/.DocumentRevisions-V100",
+            "document-version store — not scanned",
+        ),
+        ("/cores", "crash core dumps — not scanned"),
+    ] {
+        add(PathBuf::from(p), why);
+    }
+    #[cfg(windows)]
+    for name in [
+        "$Recycle.Bin",
+        "System Volume Information",
+        "pagefile.sys",
+        "hiberfil.sys",
+        "swapfile.sys",
+        "DumpStack.log.tmp",
+        "Config.Msi",
+        "$WinREAgent",
+        "$Windows.~BT",
+        "$Windows.~WS",
+    ] {
+        add(
+            root.join(name),
+            "Windows paging, hibernation, restore or recycle area — not scanned",
+        );
+    }
+    out
+}
+
+/// Why a Linux file-system type is not scanned on a whole-drive run.
+#[cfg(any(target_os = "linux", test))]
+fn linux_fs_reason(fstype: &str) -> Option<&'static str> {
+    match fstype {
+        "proc" | "sysfs" | "devtmpfs" | "devpts" | "tmpfs" | "ramfs" | "cgroup" | "cgroup2"
+        | "securityfs" | "pstore" | "efivarfs" | "bpf" | "debugfs" | "tracefs" | "configfs"
+        | "fusectl" | "mqueue" | "hugetlbfs" | "autofs" | "binfmt_misc" | "nsfs" | "rpc_pipefs"
+        | "selinuxfs" => {
+            Some("virtual file system (kernel, devices, memory) — holds no files, not scanned")
+        }
+        "squashfs" | "overlay" => {
+            Some("read-only image (snap package, container layer) — not scanned")
+        }
+        "nfs" | "nfs4" | "cifs" | "smb3" | "smbfs" | "fuse.sshfs" | "fuse.rclone" | "davfs"
+        | "fuse.gvfsd-fuse" => Some("network share — not scanned"),
+        _ => None,
+    }
+}
+
+/// `/proc/self/mountinfo` writes space, tab, newline and backslash as
+/// three-digit octal escapes.
+#[cfg(any(target_os = "linux", test))]
+fn unescape_mount_path(p: &str) -> String {
+    p.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
 struct Pruned {
     path: PathBuf,
     reason: &'static str,
@@ -608,6 +785,7 @@ fn prune_entry(
     include_venv: bool,
     include_hidden: bool,
     hydrate: bool,
+    protect_secrets: bool,
 ) -> Option<Pruned> {
     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
     let pruned = |reason: &'static str, symlink: bool| Pruned {
@@ -639,13 +817,14 @@ fn prune_entry(
             .map(|r| pruned(r, false));
     }
 
-    // Files: hidden gate (dot-prefix) with the config-file allowlist. Sensitive
-    // files (.env, *.pem, id_rsa…) are let through even when hidden so they get
-    // RECORDED as skipped-with-reason in classify().
+    // Files: hidden gate (dot-prefix) with the config-file allowlist. When
+    // secrets are protected, sensitive files (.env, *.pem, id_rsa…) are let
+    // through even when hidden so they get RECORDED as skipped-with-reason in
+    // classify(); otherwise they are hidden files like any other.
     if name_lower.starts_with('.')
         && !include_hidden
         && !is_allowlisted_dotfile(&name_lower)
-        && sensitive_reason(entry.path()).is_none()
+        && (!protect_secrets || sensitive_reason(entry.path()).is_none())
     {
         return Some(pruned("hidden file (--include-hidden to include)", false));
     }
@@ -678,23 +857,38 @@ fn is_cloud_only_dir(entry: &ignore::DirEntry) -> bool {
 enum Verdict {
     TextByExt,
     TextByContent,
+    /// A document (PDF, Office, e-book) whose text is extracted at merge time
+    /// (Phase 3, ADR 0005) instead of being read as plain bytes. The merger
+    /// re-derives the exact format from the extension, so no payload is kept.
+    Document,
     Skip(String, SkipKind),
     Unreadable,
 }
 
-/// Content-bearing formats with no extractor yet (documents: Phase 3,
-/// photos: Phase 6). They are reported as NOT captured — never as a silent
-/// "binary" skip — so a folder of PDFs or photos no longer exits 0 (N-06,
-/// N-53).
+/// Content-bearing formats whose text is not read: photos without OCR
+/// (`--extract-images-text` reads them) and archive formats TurboMerger
+/// cannot open. They are reported as NOT captured — never as a silent
+/// "binary" skip — so a folder of them no longer exits 0 (N-06, N-53).
+/// Documents (PDF, Office old and new, OpenDocument, EPUB) are handled by
+/// `crate::extract`; gzip, zip and tar by the merger's streaming path.
 fn not_yet_extractable(ext_lower: &str) -> Option<&'static str> {
     match ext_lower {
-        "pdf" | "doc" | "docx" | "odt" | "epub" | "xls" | "xlsx" | "ods" | "ppt" | "pptx"
-        | "odp" => Some("document — text extraction is not supported yet"),
         "heic" | "heif" | "jpg" | "jpeg" | "tif" | "tiff" => {
-            Some("photo — OCR is not supported yet")
+            Some("photo — its text needs OCR (--extract-images-text)")
+        }
+        "7z" | "rar" | "xz" | "bz2" | "zst" | "lz4" | "lzma" | "cab" => {
+            Some("compressed archive in a format TurboMerger cannot open — extract it first")
         }
         _ => None,
     }
+}
+
+/// gzip, zip and tar (plain or gzip): opened at merge time, their text is
+/// merged and binary members are counted (`merger::stream`).
+fn is_openable_archive(name_lower: &str) -> bool {
+    [".gz", ".tgz", ".tar", ".zip"]
+        .iter()
+        .any(|s| name_lower.ends_with(s))
 }
 
 /// Decide whether a single candidate file is merged. Runs on rayon threads.
@@ -721,15 +915,42 @@ fn classify(path: &Path, len: u64, options: &ScanOptions) -> Verdict {
     if is_minified_filename(name) {
         return Verdict::Skip("minified/bundled".into(), SkipKind::Excluded);
     }
-    if let Some(reason) = sensitive_reason(path) {
-        return Verdict::Skip(reason.to_string(), SkipKind::Excluded);
+    if options.protect_secrets {
+        if let Some(reason) = sensitive_reason(path) {
+            return Verdict::Skip(reason.to_string(), SkipKind::Excluded);
+        }
     }
     let ext_lower = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
-    if let Some(reason) = ext_lower.as_deref().and_then(not_yet_extractable) {
-        return Verdict::Skip(reason.into(), SkipKind::NotCaptured);
+    if let Some(ext) = ext_lower.as_deref() {
+        // Documents are extractable now (Phase 3, ADR 0005): route them to the
+        // merger instead of dropping them. The per-file size cap still applies
+        // (0 = unlimited) so a 2 GB PDF does not blow the run.
+        if crate::extract::DocKind::from_ext(ext).is_some() {
+            if options.max_file_size != 0 && len > options.max_file_size {
+                return Verdict::Skip(
+                    format!("too large ({} KB)", len / 1024),
+                    SkipKind::NotCaptured,
+                );
+            }
+            return Verdict::Document;
+        }
+        if is_openable_archive(&name_lower)
+            || (options.ocr_images && crate::extract::is_ocr_image(ext))
+        {
+            if options.max_file_size != 0 && len > options.max_file_size {
+                return Verdict::Skip(
+                    format!("too large ({} KB)", len / 1024),
+                    SkipKind::NotCaptured,
+                );
+            }
+            return Verdict::Document;
+        }
+        if let Some(reason) = not_yet_extractable(ext) {
+            return Verdict::Skip(reason.into(), SkipKind::NotCaptured);
+        }
     }
 
     // Known by name or extension: user overrides, binary types, text types.
@@ -767,14 +988,14 @@ fn classify(path: &Path, len: u64, options: &ScanOptions) -> Verdict {
         }
     }
 
-    // Text that is too big to capture.
-    if len > options.max_file_size {
+    // Text that is too big to capture (0 = unlimited).
+    if options.max_file_size != 0 && len > options.max_file_size {
         return Verdict::Skip(
             format!("too large ({} KB)", len / 1024),
             SkipKind::NotCaptured,
         );
     }
-    if by_content && len > LARGE_FILE_UNKNOWN_EXT {
+    if options.max_file_size != 0 && by_content && len > LARGE_FILE_UNKNOWN_EXT {
         return Verdict::Skip(
             "large file with unknown extension".into(),
             SkipKind::NotCaptured,
@@ -1105,13 +1326,40 @@ pub fn scan_with(
     let include_venv = options.include_venv;
     let include_hidden = options.include_hidden;
     let hydrate = options.hydrate;
+    let protect_secrets = options.protect_secrets;
+    let system_areas = if options.whole_drive {
+        system_areas(&root_canon)
+    } else {
+        HashMap::new()
+    };
+    // Walk 2 must skip the same areas, or it reports /proc as "ignored".
+    let walk2_areas = system_areas.clone();
     let pruned: Arc<Mutex<Vec<Pruned>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&pruned);
     builder.filter_entry(move |entry| {
         if entry.depth() == 0 {
             return true;
         }
-        match prune_entry(entry, include_venv, include_hidden, hydrate) {
+        if let Some(reason) = system_areas.get(entry.path()) {
+            if let Ok(mut v) = recorder.lock() {
+                v.push(Pruned {
+                    path: entry.path().to_path_buf(),
+                    reason,
+                    is_dir: entry.file_type().is_some_and(|t| t.is_dir()),
+                    symlink: false,
+                    // Never count inside /proc, /sys, a network share…
+                    no_count: true,
+                });
+            }
+            return false;
+        }
+        match prune_entry(
+            entry,
+            include_venv,
+            include_hidden,
+            hydrate,
+            protect_secrets,
+        ) {
             None => true,
             Some(p) => {
                 if let Ok(mut v) = recorder.lock() {
@@ -1151,6 +1399,16 @@ pub fn scan_with(
         };
         seen.insert(entry.path().to_path_buf());
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            // Pipes, sockets and devices are never opened — reading a FIFO
+            // blocks forever — but they are recorded, so every entry is
+            // accounted for.
+            if let Some(kind) = entry.file_type().and_then(special_file_kind) {
+                skipped.push(SkipEntry::new(
+                    relative_display(root, entry.path()),
+                    format!("{kind} — not a regular file, not read"),
+                    SkipKind::Excluded,
+                ));
+            }
             continue;
         }
         let path = entry.path().to_path_buf();
@@ -1264,7 +1522,15 @@ pub fn scan_with(
 
     // Walk 2: everything ignore rules or user globs hid, counted per rule.
     if (options.respect_gitignore && ignore_files_present) || overrides.is_some() {
-        let ignored = find_ignored(root, &seen, include_venv, include_hidden, cancel);
+        let ignored = find_ignored(
+            root,
+            &seen,
+            include_venv,
+            include_hidden,
+            protect_secrets,
+            walk2_areas,
+            cancel,
+        );
         if cancel.load(AtomicOrd::Relaxed) {
             return stop();
         }
@@ -1361,6 +1627,10 @@ pub fn scan_with(
                 stats.by_content += 1;
                 files.push(path);
             }
+            Verdict::Document => {
+                stats.by_document += 1;
+                files.push(path);
+            }
             Verdict::Skip(reason, kind) => {
                 if kind == SkipKind::Binary {
                     stats.skipped_binary += 1;
@@ -1439,6 +1709,8 @@ fn find_ignored(
     seen: &HashSet<PathBuf>,
     include_venv: bool,
     include_hidden: bool,
+    protect_secrets: bool,
+    system_areas: HashMap<PathBuf, &'static str>,
     cancel: &AtomicBool,
 ) -> Vec<(PathBuf, bool)> {
     let seen = Arc::new(seen.clone());
@@ -1458,8 +1730,11 @@ fn find_ignored(
             return true;
         }
         // Pruned by our own rules: already recorded by walk 1 (or inside an
-        // ignored directory, which is reported as a whole).
-        if prune_entry(entry, include_venv, include_hidden, false).is_some() {
+        // ignored directory, which is reported as a whole). Same rules as
+        // walk 1: the whole-drive areas and the secrets switch included.
+        if system_areas.contains_key(entry.path())
+            || prune_entry(entry, include_venv, include_hidden, false, protect_secrets).is_some()
+        {
             return false;
         }
         if seen.contains(entry.path()) {
@@ -1588,7 +1863,7 @@ mod tests {
         assert!(opts.content_sniff);
         assert!(!opts.include_hidden);
         assert!(opts.respect_gitignore);
-        assert_eq!(opts.max_file_size, 2 * 1024 * 1024);
+        assert_eq!(opts.max_file_size, 0, "no size cap by default");
     }
 
     #[test]
@@ -1724,5 +1999,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mount_paths_unescape_like_the_kernel_writes_them() {
+        assert_eq!(
+            unescape_mount_path("/media/pawel/My\\040Disk"),
+            "/media/pawel/My Disk"
+        );
+        assert_eq!(unescape_mount_path("/mnt/a\\134b"), "/mnt/a\\b");
+    }
+
+    #[test]
+    fn linux_fs_types_are_classified() {
+        assert!(linux_fs_reason("proc").unwrap().contains("virtual"));
+        assert!(linux_fs_reason("nfs4").unwrap().contains("network"));
+        assert!(linux_fs_reason("squashfs").unwrap().contains("read-only"));
+        // Real disks are scanned on a whole-drive run.
+        for fs in ["ext4", "btrfs", "xfs", "vfat", "ntfs3", "fuseblk"] {
+            assert_eq!(linux_fs_reason(fs), None, "{fs}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn whole_drive_areas_come_from_this_machines_mount_table() {
+        let areas = system_areas(Path::new("/"));
+        for p in ["/proc", "/sys"] {
+            assert!(
+                areas.contains_key(Path::new(p)),
+                "{p} not pruned: {areas:?}"
+            );
+        }
+        assert!(
+            !areas.contains_key(Path::new("/")),
+            "the root is never pruned"
+        );
+        // A root below the virtual mounts only prunes what lies under it.
+        assert!(system_areas(Path::new("/home"))
+            .keys()
+            .all(|p| p.starts_with("/home")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifos_are_recorded_and_never_opened() {
+        // Opening a FIFO for reading blocks forever: the scan must finish and
+        // still account for it.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pipes");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("notes.txt"), "kept\n").unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(root.join("queue"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let scan = scan_text_files(&root, &ScanOptions::default()).unwrap();
+        assert_eq!(scan.files.len(), 1);
+        let fifo = scan
+            .skipped
+            .iter()
+            .find(|s| s.path == "queue")
+            .expect("the FIFO is recorded");
+        assert!(fifo.reason.contains("named pipe"), "{}", fifo.reason);
     }
 }

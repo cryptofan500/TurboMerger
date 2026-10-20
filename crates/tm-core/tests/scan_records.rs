@@ -227,18 +227,43 @@ fn a2_every_file_is_merged_or_recorded() {
 }
 
 #[test]
-fn documents_and_photos_are_reported_as_not_captured() {
+fn documents_are_extracted_photos_still_not_captured() {
     // N-06 / N-53: PDFs and photos used to vanish as "binary" (exit 0) or
-    // leave "no text files found" (exit 1, nothing written).
+    // leave "no text files found" (exit 1, nothing written). Phase 3: modern
+    // documents are now routed to the merger for text extraction, so they are
+    // in the merged set rather than a "not captured" skip. Legacy OLE Office
+    // (.doc/.ppt) now has an extractor too. Photos still need OCR, which is
+    // off by default.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("docs");
     write(&root, "paper.pdf", "%PDF-1.7\n");
+    write(&root, "report.docx", "PK\u{3}\u{4}zip-ish");
+    write(&root, "legacy.doc", "old OLE bytes");
+    write(&root, "slides.ppt", "old OLE bytes");
     write(&root, "photo.HEIC", "not really heic");
     write(&root, "logo.png", "\u{89}PNG");
     write(&root, "notes.md", "# notes\n");
     let scan = scan_text_files(&root, &ScanOptions::default()).unwrap();
-    assert_eq!(skip(&scan, "paper.pdf").kind, SkipKind::NotCaptured);
-    assert!(skip(&scan, "paper.pdf").reason.contains("document"));
+
+    // Extractable documents are routed to the merger (text pulled at merge
+    // time), so they land in `files`, not `skipped`.
+    let files = merged(&root, &scan);
+    assert!(
+        files.contains(&"paper.pdf".to_string()),
+        "pdf merged: {files:?}"
+    );
+    assert!(
+        files.contains(&"report.docx".to_string()),
+        "docx merged: {files:?}"
+    );
+    for legacy in ["legacy.doc", "slides.ppt"] {
+        assert!(
+            files.contains(&legacy.to_string()),
+            "{legacy} merged: {files:?}"
+        );
+    }
+
+    // Photos (OCR off) and images are still recorded, never silent.
     assert_eq!(skip(&scan, "photo.HEIC").kind, SkipKind::NotCaptured);
     assert!(skip(&scan, "photo.HEIC").reason.contains("photo"));
     assert_eq!(skip(&scan, "logo.png").kind, SkipKind::Binary);

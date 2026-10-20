@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+  xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+  office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:body>
+  <office:text>
+   <text:p>TMDOC_ALPHA_7Q2 first paragraph of the legacy Word test.</text:p>
+   <text:p>Zażółć gęślą jaźń TMDOC_POLSKI_3K9</text:p>
+   <table:table table:name="T1">
+    <table:table-column table:number-columns-repeated="2"/>
+    <table:table-row>
+     <table:table-cell><text:p>TMDOC_CELL_A1</text:p></table:table-cell>
+     <table:table-cell><text:p>TMDOC_CELL_B2</text:p></table:table-cell>
+    </table:table-row>
+   </table:table>
+   <text:p>TMDOC_OMEGA_8Z4 last paragraph.</text:p>
+  </office:text>
+ </office:body>
+</office:document>

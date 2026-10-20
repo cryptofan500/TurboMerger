@@ -68,6 +68,24 @@ tree-sitter-typescript = "0.23.2"
 unicode-normalization = "0.1"
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
+# Document text extraction (Phase 3, ADR 0005). All pure-Rust, so the three
+# OSes behave identically and the product stays offline (ADR 0006) and
+# bit-rot-resistant (ADR 0002, Class 2): no native PDF library, no Python.
+#   pdf_oxide  — PDF text, reading-order aware; text-only feature set (no ICC,
+#                rendering or system fonts), legacy-crypto kept so MD5/RC4
+#                encrypted PDFs still open. PDFium rendering of figure crops is
+#                a later step (the `table-ml`/`rendering` features, tm-worker).
+#   calamine   — xls/xlsx/xlsb/ods spreadsheets.
+#   zip + quick-xml — docx/pptx/odt/odp/epub (a zip of XML parts).
+calamine = "0.36.1"
+pdf_oxide = { version = "0.3.78", default-features = false, features = ["legacy-crypto"] }
+quick-xml = "0.42.0"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+#   flate2     — gzip-compressed text (`notes.txt.gz`, `.tar.gz`), streamed.
+#   cfb        — the OLE container of legacy Word/PowerPoint (`.doc`, `.ppt`).
+flate2 = "1.1.9"
+cfb = "0.7.3"
+
 # Profiles are only honoured at the workspace root.
 [profile.release]
 panic = "abort"

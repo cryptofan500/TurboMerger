@@ -7,6 +7,7 @@ pub mod cache;
 pub mod cancel;
 pub mod compress;
 pub mod config;
+pub mod extract;
 pub mod job;
 pub mod merger;
 pub mod progress;

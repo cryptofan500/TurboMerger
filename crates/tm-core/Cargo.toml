@@ -12,9 +12,15 @@ publish = false
 [dependencies]
 aho-corasick.workspace = true
 anyhow.workspace = true
+calamine.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 chardetng.workspace = true
+pdf_oxide.workspace = true
+quick-xml.workspace = true
+zip.workspace = true
+flate2.workspace = true
+cfb.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 dunce.workspace = true

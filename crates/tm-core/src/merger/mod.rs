@@ -14,6 +14,7 @@ mod git;
 mod process;
 mod render;
 mod spool;
+mod stream;
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
@@ -108,6 +109,12 @@ pub struct MergeConfig {
     /// Same bytes on every OS (N-16): CRLF → LF in contents, NFC paths
     /// (display and order), no timestamps.
     pub reproducible: bool,
+    /// Send image-only document pages (a scanned PDF with no text layer) to the
+    /// external OCR command. Off by default (`--extract-images-text`).
+    pub extract_images_text: bool,
+    /// Per-file cap in bytes for text that only shows its size once read —
+    /// inflated gzip, archive members, streamed files. 0 = no cap.
+    pub max_file_size: u64,
 }
 
 impl Default for MergeConfig {
@@ -129,6 +136,8 @@ impl Default for MergeConfig {
             show_source_path: false,
             remote: false,
             reproducible: false,
+            extract_images_text: false,
+            max_file_size: 0,
         }
     }
 }
@@ -296,6 +305,7 @@ where
                         result: Err((String::new(), String::new(), SkipKind::Excluded)),
                         harvested: Vec::new(),
                         dense: Vec::new(),
+                        stream: false,
                     }
                 } else {
                     process::process_file(path, root, cfg)
@@ -305,10 +315,58 @@ where
         if cancelled(cancel_flag) {
             return Err(Cancelled.into());
         }
-        for p in processed {
+        for (path, p) in chunk.iter().zip(processed) {
             known_secrets.extend(p.harvested);
             dense_candidates.extend(p.dense);
             done += 1;
+            if p.stream {
+                // Archives, big gzip and files past `STREAM_ABOVE`: segment by
+                // segment straight into the spool, in this file's place in
+                // the order, so no size is too big and memory stays bounded.
+                let rel = relative_display(root, path);
+                let rel = if cfg.reproducible { nfc(&rel) } else { rel };
+                let first = blocks.len();
+                let streamed = {
+                    let mut emit = |mut b: Block, text: &str| -> std::io::Result<()> {
+                        b.span = spool.append(text)?;
+                        blocks.push(b);
+                        Ok(())
+                    };
+                    let mut read_so_far = |bytes: u64| {
+                        progress_callback(
+                            done - 1,
+                            total_files,
+                            &format!("{rel} ({} MB read)", bytes >> 20),
+                        )
+                    };
+                    let mut sink = stream::Sink {
+                        emit: &mut emit,
+                        progress: &mut read_so_far,
+                        cancel: cancel_flag,
+                    };
+                    stream::stream_source(path, &rel, stream::container_of(&rel), cfg, &mut sink)
+                };
+                progress_callback(done, total_files, &rel);
+                match streamed {
+                    Ok(out) => {
+                        known_secrets.extend(out.harvested);
+                        if let Some(b) = blocks.get_mut(first).filter(|_| !out.notes.is_empty()) {
+                            b.utf8_note = Some(out.notes.join("; "));
+                        }
+                    }
+                    Err(reason) => {
+                        let kind = if reason.starts_with("binary") {
+                            SkipKind::Binary
+                        } else if reason.starts_with("empty") {
+                            SkipKind::Excluded
+                        } else {
+                            SkipKind::NotCaptured
+                        };
+                        merge_skips.push(SkipEntry::new(rel, reason, kind));
+                    }
+                }
+                continue;
+            }
             match p.result {
                 Ok((mut b, content)) => {
                     if cfg.reproducible {
