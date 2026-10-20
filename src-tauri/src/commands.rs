@@ -15,7 +15,7 @@
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,13 +23,16 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use tm_core::job::{resolve_job, run_merge, JobError, MergeOptions, MergeResult, Progress, Stage};
-use tm_core::progress::{Snapshot, Tracker};
+use tm_core::progress::{long_run, LongRun, Snapshot, Tracker};
 use tm_core::{scanner, security, CancelToken};
 
 /// When a job's ETA may be shown (plan §10.3: early rates mislead).
 const ETA_AFTER: Duration = Duration::from_secs(60);
 /// No progress for this long is reported as a stall.
 const STALL_AFTER: Duration = Duration::from_secs(10);
+/// A run expected to take longer than this is asked "proceed or cancel?"
+/// once, after `ETA_AFTER` (plan §10.5).
+const LONG_RUN: Duration = Duration::from_secs(600);
 
 /// Running jobs, by the id the UI chose.
 #[derive(Default)]
@@ -84,6 +87,10 @@ pub struct JobProgress {
     pub eta_ms: Option<u64>,
     pub eta_band_ms: Option<u64>,
     pub stalled_ms: Option<u64>,
+    /// True on exactly one update: the run looks longer than `LONG_RUN`, so
+    /// the UI asks "proceed or cancel?" (`eta_ms` is `None` while files are
+    /// still being counted).
+    pub ask_long_run: bool,
 }
 
 impl From<Snapshot> for JobProgress {
@@ -98,7 +105,27 @@ impl From<Snapshot> for JobProgress {
             eta_ms: s.eta.map(ms),
             eta_band_ms: s.eta_band.map(ms),
             stalled_ms: s.stalled_for.map(ms),
+            ask_long_run: false,
         }
+    }
+}
+
+/// The tracker's snapshot for the UI, deciding the long-run question once
+/// for the whole job: the ticker and progress events both send, so the
+/// decision is a swap, and the update that wins it carries the question.
+fn payload(tracker: &Tracker, decided: &AtomicBool) -> JobProgress {
+    let snap = tracker.snapshot();
+    let mut ask = false;
+    if !decided.load(Ordering::Relaxed) {
+        match long_run(&snap, ETA_AFTER, LONG_RUN) {
+            LongRun::Undecided => {}
+            LongRun::Short => decided.store(true, Ordering::Relaxed),
+            LongRun::Long { .. } => ask = !decided.swap(true, Ordering::Relaxed),
+        }
+    }
+    JobProgress {
+        ask_long_run: ask,
+        ..snap.into()
     }
 }
 
@@ -109,6 +136,8 @@ struct Reporter {
     tracker: Arc<Tracker>,
     channel: Channel<JobProgress>,
     last: Mutex<Instant>,
+    /// The long-run question was settled (asked, or the run is short).
+    decided: Arc<AtomicBool>,
     /// Dropping it ends the ticker at once (no sleep to wait out).
     stop: Option<std::sync::mpsc::Sender<()>>,
     ticker: Option<std::thread::JoinHandle<()>>,
@@ -117,14 +146,15 @@ struct Reporter {
 impl Reporter {
     fn start(channel: Channel<JobProgress>) -> Reporter {
         let tracker = Arc::new(Tracker::new(ETA_AFTER, STALL_AFTER));
+        let decided = Arc::new(AtomicBool::new(false));
         let (stop, stop_rx) = std::sync::mpsc::channel::<()>();
         let ticker = {
-            let (tracker, channel) = (tracker.clone(), channel.clone());
+            let (tracker, channel, decided) = (tracker.clone(), channel.clone(), decided.clone());
             std::thread::spawn(move || {
                 while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
                     stop_rx.recv_timeout(Duration::from_secs(1))
                 {
-                    let _ = channel.send(tracker.snapshot().into());
+                    let _ = channel.send(payload(&tracker, &decided));
                 }
             })
         };
@@ -132,6 +162,7 @@ impl Reporter {
             tracker,
             channel,
             last: Mutex::new(Instant::now() - Duration::from_secs(1)),
+            decided,
             stop: Some(stop),
             ticker: Some(ticker),
         }
@@ -142,7 +173,7 @@ impl Reporter {
         let mut last = self.last.lock().expect("reporter");
         if last.elapsed() >= Duration::from_millis(100) {
             *last = Instant::now();
-            let _ = self.channel.send(self.tracker.snapshot().into());
+            let _ = self.channel.send(payload(&self.tracker, &self.decided));
         }
     }
 }
@@ -738,6 +769,31 @@ fn file_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_long_run_question_is_asked_on_exactly_one_update() {
+        // A run 70 s old, at 1 file every 10 s, with 1,000 to go: hours left.
+        let t0 = Instant::now() - Duration::from_secs(70);
+        let tracker = Tracker::starting_at(t0, ETA_AFTER, STALL_AFTER);
+        for s in 0..=70u64 {
+            let p = Progress {
+                stage: Stage::Merge,
+                done: (s / 10) as usize,
+                total: 1000,
+                current: format!("f{s}"),
+            };
+            tracker.update_at(&p, t0 + Duration::from_secs(s));
+        }
+        let decided = AtomicBool::new(false);
+        let first = payload(&tracker, &decided);
+        assert!(first.ask_long_run, "{first:?}");
+        assert!(first
+            .eta_ms
+            .is_some_and(|ms| ms > LONG_RUN.as_millis() as u64));
+        for _ in 0..3 {
+            assert!(!payload(&tracker, &decided).ask_long_run, "asked twice");
+        }
+    }
 
     #[test]
     fn watch_event_filter_ignores_git_and_own_outputs() {

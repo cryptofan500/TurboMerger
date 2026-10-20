@@ -40,6 +40,17 @@ interface JobProgress {
   eta_band_ms: number | null;
   /** Set when nothing has moved for a while. */
   stalled_ms: number | null;
+  /** True on one update only: the run looks longer than 10 minutes. */
+  ask_long_run: boolean;
+}
+
+/** The open "proceed or cancel?" question: what was known when it was asked. */
+interface LongRunQuestion {
+  /** Time left then; null while files were still being counted. */
+  etaMs: number | null;
+  elapsedMs: number;
+  /** Local clock time of the expected finish, e.g. "14:05". */
+  finish: string | null;
 }
 
 type Status = "ready" | "scanning" | "merging" | "cancelling" | "done" | "error" | "cancelled";
@@ -141,6 +152,7 @@ function App() {
   const [result, setResult] = useState<MergeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<JobProgress | null>(null);
+  const [longRun, setLongRun] = useState<LongRunQuestion | null>(null);
   // The running merge/scan, so Cancel reaches exactly that job.
   const [jobId, setJobId] = useState<string | null>(null);
 
@@ -208,9 +220,18 @@ function App() {
 
   /** A channel that shows a job's progress; merges switch the status once files flow. */
   const progressChannel = (merging: boolean) => {
+    setLongRun(null); // a new job: no question left over from the last one
     const ch = new Channel<JobProgress>();
     ch.onmessage = (p) => {
       setProgress(p);
+      if (p.ask_long_run) {
+        setLongRun({
+          etaMs: p.eta_ms,
+          elapsedMs: p.elapsed_ms,
+          finish: p.eta_ms === null ? null
+            : new Date(Date.now() + p.eta_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        });
+      }
       if (merging && p.stage === "merge") {
         setStatus((s) => (s === "scanning" ? "merging" : s));
       }
@@ -419,6 +440,7 @@ function App() {
   const isWorking = status === "scanning" || status === "merging" || status === "cancelling";
   const formatClock = (ms: number) => {
     const s = Math.round(ms / 1000);
+    if (s >= 3600) return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
     return s >= 60 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s` : `${s}s`;
   };
   const stageLabel = (p: JobProgress) =>
@@ -688,6 +710,21 @@ function App() {
               <p className="progress-text" style={{ color: "var(--warning)" }}>
                 Stalled on {progress.current || "the scan"} for {formatClock(progress.stalled_ms)} — Cancel stops it
               </p>
+            )}
+            {longRun && isWorking && status !== "cancelling" && (
+              <div className="checkbox-group" role="alertdialog" aria-label="Long run">
+                <p className="progress-text" style={{ color: "var(--warning)" }}>
+                  This is a long run:{" "}
+                  {longRun.etaMs !== null
+                    ? `about ${formatClock(longRun.etaMs)} left (finishes ≈ ${longRun.finish})`
+                    : `still counting files after ${formatClock(longRun.elapsedMs)}`}
+                  . Proceed? The ETA above keeps updating.
+                </p>
+                <button className="btn btn-primary" onClick={() => setLongRun(null)}>PROCEED</button>
+                <button className="btn btn-danger" onClick={() => { setLongRun(null); void handleCancel(); }}>
+                  CANCEL
+                </button>
+              </div>
             )}
           </section>
         )}
