@@ -18,6 +18,11 @@ and its numbers in `fixtures/audit-2026-09-24/RESULTS_phase-<N>.txt`.
              xls/xlsx/ods (calamine) extracted into the merge; 50 MB default cap + unlimited;
              --extract-images-text OCR bridge. Remaining: PDFium figure rendering, renderer
              gate, bundle layout, tm-pdf worker offload.
+             2026-10-20 (branch feature/large-input-doc-extraction, local): .doc/.ppt,
+             archives, OCR of photos and scanned pages, UTF-16, streaming, whole-drive,
+             no size cap; defaults per ADR 0017; worker pool + PDFs > 256 MiB in a
+             `__worker pdf` process with a memory budget (ADR 0018). Remaining: every
+             PDF in a reusable worker pool, PDFium rendering, renderer gate, bundle.
 [ ] Phase 6  toolchain bump [ ] tm-ocr [ ] HEIC ADR [ ] layout [ ] scanned PDFs [ ] synthetic fixture [ ]  gate [ ]
 [ ] Phase 4  profiles [ ] packing v2 [ ] tokens per target [ ] digest/index [ ] skeleton+density [ ]  gate [ ]
 [ ] Phase 7  calibrate [ ] media plugins [ ] converter hook [ ]  gate [ ]
@@ -27,6 +32,8 @@ and its numbers in `fixtures/audit-2026-09-24/RESULTS_phase-<N>.txt`.
 
 Decisions: ADRs 0002–0014 accepted by the maintainer on 2026-09-24; 0015 (two binaries)
 and 0016 (token counter, opt-level) added in Phase 2 (`docs/adr/README.md`).
+0017 (everything by default) accepted from the maintainer's 2026-10-20 instructions;
+0018 (worker pool, PDF worker) proposed 2026-10-20.
 
 Phase 2 gate (plan §17, handoff §5), measured 2026-09-24 — details in
 `fixtures/audit-2026-09-24/RESULTS_phase-2.txt`:

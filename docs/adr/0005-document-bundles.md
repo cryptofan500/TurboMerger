@@ -19,3 +19,8 @@
 - **Decision:** Document inputs produce that bundle. A typeset PDF is only available via
   an optional pandoc hook. The PDF renderer (pdf_oxide/tiny-skia vs PDFium) is picked
   by the Phase 3 gate on 200 sampled crops (visual QA >= 98 % equal, speed >= 0.8x).
+- **Implementation note (2026-10-20):** text extraction shipped first (Phase 3 part 1,
+  then the 2026-10-20 sessions): PDF via `pdf_oxide`, OOXML/ODF/EPUB via `quick-xml`,
+  spreadsheets via `calamine`, Office 97-2003 via `cfb`, opt-in OCR via an external
+  command, archives streamed. PDFs over 256 MiB parse in an isolated worker (ADR 0018).
+  The bundle layout and the renderer gate are still to do.

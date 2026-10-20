@@ -23,3 +23,5 @@ to their replacement.
 | [0014](0014-mcp-confinement.md) | MCP root confinement and version negotiation; rmcp SDK in Phase 2 | Accepted — implemented |
 | [0015](0015-two-binaries.md) | Two binaries: `turbomerger` (console CLI) and `turbomerger-gui`; workspace layout | Accepted — implemented |
 | [0016](0016-token-counter-and-opt-level.md) | Keep tiktoken (ordinary encoding) over bpe-openai; opt-level 3 | Accepted — implemented |
+| [0017](0017-everything-by-default.md) | Everything by default: redaction off, gitignored files in, no size cap | Accepted — implemented |
+| [0018](0018-worker-pool-and-pdf-worker.md) | Polite worker pool; big PDFs in an isolated worker with a memory budget | Proposed — implemented |
