@@ -318,3 +318,37 @@ async fn pack_reports_progress_to_clients_that_ask() {
         .iter()
         .all(|n| n["params"]["progressToken"] == "p-40"));
 }
+
+#[tokio::test]
+async fn repo_map_keeps_the_agent_boundary_whatever_the_defaults() {
+    // The desktop and CLI merge ignored files by default; an agent's map must
+    // not (the same boundary as pack_directory). The map also scans with
+    // credential files left out, but it only renders code symbols and no
+    // credential file is code, so that half cannot be seen here.
+    let e = env();
+    let root = e.tmp.path().join("shared").join("bounded");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("ignored")).unwrap();
+    std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn visible_fn() -> u32 {\n    1\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("ignored/gen.rs"),
+        "pub fn ignored_fn() -> u32 {\n    2\n}\n",
+    )
+    .unwrap();
+    let mut s = Session::start(e.server.clone()).await;
+    s.initialize("2025-11-25").await;
+    let (ok, map) = s
+        .tool(20, "repo_map", json!({"path": root.to_string_lossy()}))
+        .await;
+    assert!(ok, "{map}");
+    assert!(map.contains("visible_fn"), "{map}");
+    assert!(
+        !map.contains("ignored_fn"),
+        "ignored file in the map: {map}"
+    );
+}

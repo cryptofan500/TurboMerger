@@ -480,6 +480,10 @@ impl McpServer {
         let source = self.resolve_source(src)?;
         let mut options = MergeOptions::for_folder(source.root.clone());
         options.include_tree = false;
+        // The merge tool's boundary, whatever the desktop/CLI defaults are:
+        // ignore rules respected, credential files left out.
+        options.respect_gitignore = true;
+        options.redact_secrets = true;
         let job = tm_core::job::resolve_job(&options)?;
         let scan = tm_core::scanner::scan_text_files(&job.root, &job.scan_options)
             .map_err(|e| format!("scan failed: {}", e))?;

@@ -38,10 +38,6 @@ pub fn count_not_captured(scan: &[scanner::SkipEntry], merge: &[scanner::SkipEnt
         .count()
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct MergeOptions {
     pub folder_path: String,
@@ -49,7 +45,11 @@ pub struct MergeOptions {
     pub include_venv: bool,
     pub include_tree: bool,
     pub content_detection: bool,
-    #[serde(default = "default_true")]
+    /// Leave out what `.gitignore` / `.turbomergerignore` rules hide. Off by
+    /// default — ignored files are merged too (CLI `--gitignore`, desktop
+    /// toggle); build output stays out by its own markers (`target/` next to
+    /// `Cargo.toml`, `CACHEDIR.TAG`), venvs by theirs. The MCP server turns it on.
+    #[serde(default)]
     pub respect_gitignore: bool,
     #[serde(default)]
     pub include_hidden: bool,
@@ -131,8 +131,8 @@ pub struct MergeOptions {
 
 impl MergeOptions {
     /// The defaults every shell starts from: tree on, redaction off (every
-    /// text file is taken), `.gitignore` respected, content sniffing on, no
-    /// size cap.
+    /// text file is taken), files hidden by `.gitignore` included, content
+    /// sniffing on, no size cap.
     pub fn for_folder(folder_path: impl Into<String>) -> MergeOptions {
         MergeOptions {
             folder_path: folder_path.into(),
@@ -140,7 +140,7 @@ impl MergeOptions {
             include_venv: false,
             include_tree: true,
             content_detection: true,
-            respect_gitignore: true,
+            respect_gitignore: false,
             include_hidden: false,
             redact_secrets: false,
             format: None,

@@ -124,8 +124,13 @@ pub struct ScanArgs {
     /// Drop paths matching GLOB (repeatable)
     #[arg(long = "exclude", value_name = "GLOB")]
     pub exclude: Vec<String>,
-    /// Ignore .gitignore / .ignore / .turbomergerignore rules
-    #[arg(long)]
+    /// Leave out what .gitignore / .ignore / .turbomergerignore rules hide. Off by
+    /// default: ignored files are merged too (build output and virtualenvs stay
+    /// out by their own rules)
+    #[arg(long, conflicts_with = "no_gitignore")]
+    pub gitignore: bool,
+    /// Merge files hidden by ignore rules (the default; kept so older scripts still run)
+    #[arg(long, hide = true)]
     pub no_gitignore: bool,
     /// Include dot-files and dot-directories
     #[arg(long)]
@@ -144,8 +149,9 @@ pub struct ScanArgs {
     #[arg(long, value_name = "MB", env = "TURBOMERGER_MAX_FILE_SIZE",
           value_parser = clap::value_parser!(u64).range(0..=1_048_576))]
     pub max_file_size: Option<u64>,
-    /// Extract text from image-only document pages (scanned PDFs) with an
-    /// external OCR command ($TURBOMERGER_OCR_CMD, default `monaddoc`). Off by default.
+    /// Read text from pictures (png, jpg, heic, …) and from PDF pages without a
+    /// text layer with an external OCR command ($TURBOMERGER_OCR_CMD, default
+    /// `monaddoc`). Slow; off by default.
     #[arg(long)]
     pub extract_images_text: bool,
     /// Mask secrets (API keys, tokens, private keys, passwords) and leave
@@ -402,7 +408,7 @@ fn resolve_source(src: &str) -> Result<tm_core::job::ResolvedSource, String> {
 fn merge_options(src_root: String, scan: &ScanArgs) -> MergeOptions {
     let mut o = MergeOptions::for_folder(src_root);
     o.include_venv = scan.include_venv;
-    o.respect_gitignore = !scan.no_gitignore;
+    o.respect_gitignore = scan.gitignore && !scan.no_gitignore;
     o.include_hidden = scan.include_hidden;
     o.include_globs = scan.include.clone();
     o.exclude_globs = scan.exclude.clone();

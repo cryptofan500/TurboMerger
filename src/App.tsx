@@ -50,7 +50,11 @@ const newJobId = () =>
     : `job-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 type Preset = "custom" | "lean" | "archive" | "docs" | "claude";
 
-const SETTINGS_KEY = "turbomerger.settings.v1";
+const SETTINGS_KEY = "turbomerger.settings.v2";
+/** v1 saved redaction and .gitignore on; v2 starts both off (every text file
+ *  is taken). v1 is carried over once, without those two. */
+const LEGACY_SETTINGS_KEY = "turbomerger.settings.v1";
+const RESET_FROM_V1: ReadonlySet<string> = new Set(["redactSecrets", "respectGitignore"]);
 
 /** Settings saved by an earlier session; anything missing or malformed is ignored. */
 interface SavedSettings {
@@ -59,12 +63,14 @@ interface SavedSettings {
   format?: string; ordering?: string; maxTokens?: string; includeGlobs?: string;
   excludeGlobs?: string; removeEmptyLines?: boolean; truncateBase64?: boolean;
   compress?: boolean; stripComments?: boolean; gitDiff?: boolean; gitLogCount?: string;
-  emitSkill?: boolean; sourcePath?: string;
+  emitSkill?: boolean; sourcePath?: string; extractImagesText?: boolean;
 }
 
 function loadSettings(): SavedSettings {
   try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
+    let raw = localStorage.getItem(SETTINGS_KEY);
+    const fromV1 = raw === null;
+    if (fromV1) raw = localStorage.getItem(LEGACY_SETTINGS_KEY);
     const s: unknown = raw ? JSON.parse(raw) : null;
     if (!s || typeof s !== "object") return {};
     const out: Record<string, unknown> = {};
@@ -75,8 +81,10 @@ function loadSettings(): SavedSettings {
       excludeGlobs: "string", removeEmptyLines: "boolean", truncateBase64: "boolean",
       compress: "boolean", stripComments: "boolean", gitDiff: "boolean",
       gitLogCount: "string", emitSkill: "boolean", sourcePath: "string",
+      extractImagesText: "boolean",
     };
     for (const [key, kind] of Object.entries(kinds)) {
+      if (fromV1 && RESET_FROM_V1.has(key)) continue;
       const v = (s as Record<string, unknown>)[key];
       if (typeof v === kind) out[key] = v;
     }
@@ -97,9 +105,10 @@ function App() {
   const [includeVenv, setIncludeVenv] = useState(saved.includeVenv ?? false);
   const [includeTree, setIncludeTree] = useState(saved.includeTree ?? true);
   const [contentDetection, setContentDetection] = useState(saved.contentDetection ?? true);
-  const [respectGitignore, setRespectGitignore] = useState(saved.respectGitignore ?? true);
+  const [respectGitignore, setRespectGitignore] = useState(saved.respectGitignore ?? false);
   const [includeHidden, setIncludeHidden] = useState(saved.includeHidden ?? false);
-  const [redactSecrets, setRedactSecrets] = useState(saved.redactSecrets ?? true);
+  const [redactSecrets, setRedactSecrets] = useState(saved.redactSecrets ?? false);
+  const [extractImagesText, setExtractImagesText] = useState(saved.extractImagesText ?? false);
   const [format, setFormat] = useState<string>(saved.format ?? "markdown");
   const [ordering, setOrdering] = useState<string>(saved.ordering ?? "path");
   const [maxTokens, setMaxTokens] = useState<string>(saved.maxTokens ?? "");
@@ -151,13 +160,13 @@ function App() {
       includeVenv, includeTree, contentDetection, respectGitignore, includeHidden,
       redactSecrets, format, ordering, maxTokens, includeGlobs, excludeGlobs,
       removeEmptyLines, truncateBase64, compress, stripComments, gitDiff,
-      gitLogCount, emitSkill, sourcePath,
+      gitLogCount, emitSkill, sourcePath, extractImagesText,
     };
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch { /* quota */ }
   }, [includeVenv, includeTree, contentDetection, respectGitignore, includeHidden,
       redactSecrets, format, ordering, maxTokens, includeGlobs, excludeGlobs,
       removeEmptyLines, truncateBase64, compress, stripComments, gitDiff,
-      gitLogCount, emitSkill, sourcePath]);
+      gitLogCount, emitSkill, sourcePath, extractImagesText]);
 
   // Selection is per-project: a new source resets it (restored on scan).
   const changeSource = (path: string) => {
@@ -281,6 +290,7 @@ function App() {
       respect_gitignore: respectGitignore,
       include_hidden: includeHidden,
       redact_secrets: redactSecrets,
+      extract_images_text: extractImagesText,
       format,
       ordering,
       max_tokens: maxTokens ? parseInt(maxTokens, 10) || 0 : 0,
@@ -506,8 +516,9 @@ function App() {
         <section className="section">
           <label className="label">OPTIONS</label>
           {([
-            [respectGitignore, setRespectGitignore, "Respect .gitignore / .turbomergerignore"],
+            [respectGitignore, setRespectGitignore, "Respect .gitignore / .turbomergerignore (leave ignored files out)"],
             [redactSecrets, setRedactSecrets, "Redact secrets (API keys, tokens, private keys)"],
+            [extractImagesText, setExtractImagesText, "Text from pictures and scanned PDF pages (OCR — slow)"],
             [includeTree, setIncludeTree, "Directory tree + table of contents"],
             [contentDetection, setContentDetection, "Include all text files (content-based detection)"],
             [includeHidden, setIncludeHidden, "Include hidden dotfiles (beyond standard config set)"],

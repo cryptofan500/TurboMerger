@@ -100,7 +100,6 @@ pub fn thrice(v: u32) -> u32 {
 - `.hidden/` — hidden directory (--include-hidden to scan) — not scanned (1 file, 7 B)
 - `node_modules/` — dependency / tool-cache directory — not scanned (1 file, 20 B)
 
-### Ignored by rules (2)
+### Ignored by rules (1)
 
-- `--include/--exclude: user glob` — ignored — 19 files (1015 B)
-- `.gitignore: build/` — ignored — 1 file in 1 directory (10 B)
+- `--include/--exclude: user glob` — ignored — 20 files (1.0 KB)

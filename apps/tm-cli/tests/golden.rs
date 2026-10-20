@@ -203,6 +203,13 @@ const RUNS: &[Run] = &[
         ext: "md",
         args: &[],
     },
+    // Ignored files are merged by default; `--gitignore` restores leaving them out.
+    Run {
+        name: "code-gitignore-md",
+        fixture: "golden_code",
+        ext: "md",
+        args: &["--gitignore"],
+    },
     Run {
         name: "code-xml",
         fixture: "golden_code",
