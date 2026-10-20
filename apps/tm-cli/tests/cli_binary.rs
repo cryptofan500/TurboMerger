@@ -421,3 +421,82 @@ fn pdfs_parsed_in_workers_merge_to_the_same_bytes() {
         "{reasons:?}"
     );
 }
+
+#[test]
+fn metatrader_and_editor_formats_merge_by_extension_audio_video_never() {
+    // P8: "anything Notepad++ opens, not video/audio". An 800 KB EA was dropped
+    // as "large file with unknown extension" whenever a size cap was set.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("mt5");
+    fs::create_dir_all(&src).unwrap();
+    let body: String = (0..20_000)
+        .map(|i| format!("input double Lot{i}=0.1;\n"))
+        .collect();
+    fs::write(
+        src.join("EA.mq5"),
+        format!("// EA_START\n{body}// EA_END\n"),
+    )
+    .unwrap();
+    let utf16 = |s: &str, bom: bool| -> Vec<u8> {
+        let mut v = if bom { vec![0xFF, 0xFE] } else { Vec::new() };
+        v.extend(s.encode_utf16().flat_map(u16::to_le_bytes));
+        v
+    };
+    fs::write(
+        src.join("params.set"),
+        utf16("Lots=0.10\r\nSET_BOM=1\r\n", true),
+    )
+    .unwrap();
+    fs::write(
+        src.join("chart.chr"),
+        utf16("<chart>\r\nCHR_NO_BOM\r\n</chart>\r\n", false),
+    )
+    .unwrap();
+    fs::write(src.join("app.ts"), "export const TS_KEPT = 1;\n").unwrap();
+    for (name, head) in [
+        ("song.mid", &b"MThd\0\0\0\x06"[..]),
+        ("clip.3gp", &b"\0\0\0\x18ftyp3gp4"[..]),
+        ("video.m2ts", &b"\x47\x40\0\x10"[..]),
+    ] {
+        fs::write(src.join(name), head).unwrap();
+    }
+    let o = tm(
+        &[
+            "merge",
+            "mt5",
+            "mt5.json",
+            "--format",
+            "json",
+            "-q",
+            "--max-file-size",
+            "2",
+        ],
+        tmp.path(),
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let d: serde_json::Value =
+        serde_json::from_slice(&fs::read(tmp.path().join("mt5.json")).unwrap()).unwrap();
+    let text: String = d["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["content"].as_str().unwrap())
+        .collect();
+    for token in ["EA_START", "EA_END", "SET_BOM", "CHR_NO_BOM", "TS_KEPT"] {
+        assert!(text.contains(token), "{token} missing");
+    }
+    for name in ["song.mid", "clip.3gp", "video.m2ts"] {
+        let s = d["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["path"] == name)
+            .unwrap_or_else(|| panic!("{name} not recorded"));
+        assert_eq!(s["reason"], "binary extension", "{name}");
+    }
+}

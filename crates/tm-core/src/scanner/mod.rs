@@ -119,6 +119,14 @@ static TEXT_EXTENSIONS: phf::Set<&'static str> = phf_set! {
     "gitignore", "gitattributes", "editorconfig", "dockerignore",
     "diff", "patch", "prisma", "thrift", "capnp", "fbs",
     "bats", "robot", "feature",
+    // MetaTrader: MQL sources, presets, charts, templates (often UTF-16; a big
+    // EA was dropped as "large file with unknown extension" under a size cap)
+    "mq4", "mq5", "mqh", "set", "chr", "tpl",
+    // Text any editor opens: notebooks, calendars, contacts, subtitles, LaTeX
+    // styles, XML dialects, geodata, R/Quarto/MDX documents
+    "ipynb", "rtf", "ics", "vcf", "desktop", "nfo", "ass", "ssa",
+    "sty", "cls", "dtd", "xsd", "xsl", "xslt", "wsdl", "rss", "atom",
+    "kml", "gpx", "geojson", "mdx", "rmd", "qmd",
 };
 
 /// Known binary file extensions — always skip (no content sniffing needed)
@@ -132,8 +140,11 @@ static BINARY_EXTENSIONS: phf::Set<&'static str> = phf_set! {
     "tiff", "tif", "psd", "raw", "heic", "heif", "avif",
     // Audio
     "mp3", "wav", "flac", "aac", "ogg", "wma", "m4a", "opus",
-    // Video
+    "aiff", "aif", "mid", "midi", "amr",
+    // Video ("ts" is TypeScript and "sub" can be text subtitles: both stay
+    // with the text list / the sniff)
     "mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", "m4v", "mpeg", "mpg",
+    "3gp", "3g2", "mts", "m2ts", "vob",
     // Archives
     "zip", "tar", "gz", "bz2", "xz", "7z", "rar", "zst", "lz4", "lzma", "cab",
     // Documents (binary formats)
