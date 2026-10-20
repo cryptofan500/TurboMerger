@@ -4,10 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20Apple%20Silicon%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)
 
-TurboMerger turns a codebase into one structured, LLM-ready file. It is a
-local Rust + Tauri 2 desktop app with a React/TypeScript interface, gitignore-aware
-scanning, secret redaction, exact token counts, repository maps, and reviewed
-apply-back of an LLM response.
+TurboMerger turns a codebase, a document folder or a whole drive into one
+structured, LLM-ready file. It is a local Rust + Tauri 2 desktop app with a
+React/TypeScript interface, document and archive text extraction, optional OCR,
+optional gitignore handling and secret redaction, exact token counts, repository
+maps, and reviewed apply-back of an LLM response.
 
 The macOS build runs natively on Apple Silicon (`arm64`, including M1–M4) using
 WKWebView. The Windows build uses WebView2. The Linux build uses WebKitGTK.
@@ -117,14 +118,17 @@ timestamped Markdown, Claude XML, XML, JSON, or plain-text snapshot containing:
 
 - a directory tree and linked contents;
 - every included text file in collision-safe fences;
-- the extracted text of PDFs, Word/PowerPoint/OpenDocument files, spreadsheets
-  and EPUBs — so a folder of papers or reports is merged, not dropped;
+- the extracted text of PDFs, Word/PowerPoint/OpenDocument files (including
+  Office 97-2003 `.doc`/`.ppt`), spreadsheets and EPUBs, and the text members of
+  gzip, zip and tar archives — so a folder of papers or reports is merged, not
+  dropped;
+- with `--extract-images-text`, the text of photos and scanned PDF pages (OCR);
 - exact `o200k_base` token counts and context-window hints;
 - optional token-budget splitting and signature-only compression;
 - optional Git diff (of the merged files only) and recent-commit context; and
 - a merge report that accounts for every input: what was **not captured**
-  (photos and legacy binary Office files without an extractor yet, documents
-  whose text could not be parsed, files too large, unreadable), what was
+  (photos and scanned pages while OCR is off, documents whose text could not be
+  parsed, unreadable files), what was
   skipped on purpose, which directories were not scanned (with file counts),
   and how many entries each ignore rule hid.
 
@@ -134,10 +138,16 @@ the source folder, never your absolute home path (`--show-source-path` opts in).
 
 ## Highlights
 
-- **Gitignore-aware scanning** — honors `.gitignore`, `.ignore`,
-  `.git/info/exclude`, and the higher-priority `.turbomergerignore`.
-- **Secret safeguards** — excludes credential/key material, detects
-  credential-dense documents, and redacts known token formats and labeled values.
+- **Everything by default, gitignore on request** — files that `.gitignore`
+  hides are merged too; `--gitignore` (desktop: **Respect .gitignore**) honors
+  `.gitignore`, `.ignore`, `.git/info/exclude` and the higher-priority
+  `.turbomergerignore`. Build output (`target/` next to a `Cargo.toml`, folders
+  tagged `CACHEDIR.TAG`), dependency folders, VCS metadata, virtualenvs and
+  hidden files stay out by their own rules, each listed in the report.
+- **Secret redaction on request** — `--redact` (desktop: **Redact secrets**)
+  masks known token formats and labeled values and leaves credential files and
+  key material out. Off by default, so every text file is merged as it is. The
+  MCP server always redacts.
 - **Curate before merge** — tri-state file tree, token treemap, saved per-project
   selections, and explicit rescue of skipped files.
 - **Remote repository packing** — shallow-clones GitHub/GitLab URLs or
@@ -148,11 +158,24 @@ the source folder, never your absolute home path (`--show-source-path` opts in).
   in order), Word/PowerPoint/OpenDocument files, spreadsheets, and EPUBs have
   their text extracted and merged like any file. Pure Rust, so it behaves
   identically on Windows, macOS and Linux with nothing extra to install.
-  Scanned PDFs with no text layer can be OCR'd with `--extract-images-text`
-  (an external OCR command, off by default).
-- **No silent size drops** — the per-file cap defaults to 50 MB and
-  `--max-file-size 0` removes it entirely; oversized text still flows into the
-  token-budget split, so nothing is lost.
+  Photos and scanned PDF pages can be read with `--extract-images-text`
+  (an external OCR command, `monaddoc` by default or `$TURBOMERGER_OCR_CMD`;
+  slow, off by default).
+- **No size limit** — every file is taken whatever its size: big text files and
+  archive members stream in bounded memory, and the text still flows into the
+  token-budget split. `--max-file-size MB` sets a cap if you want one.
+- **Uses the machine without freezing it** — the worker pool is the logical
+  cores minus one (minus two from 8 cores) at lowered CPU and I/O priority, so
+  the desktop stays responsive (`--threads N`, `TURBOMERGER_THREADS`). PDFs over
+  256 MB parse in an isolated worker process with a memory budget (80 % of the
+  memory available; `TURBOMERGER_PDF_WORKER_MB`), so one huge or broken PDF is
+  reported instead of ending the run.
+- **Long runs ask first** — once a run is a minute old, an estimate over
+  10 minutes asks "proceed?" (desktop and terminal; `--confirm-over`, `--yes`),
+  then the ETA keeps updating.
+- **Whole drives** — a drive root (`/`, `C:\`) is accepted; virtual, network and
+  read-only system mounts are pruned, pipes and sockets are recorded unopened,
+  and protected system folders need `--allow-system-paths`.
 - **Compression and repo maps** — tree-sitter signatures plus a ranked,
   budget-aware Aider-style repository map.
 - **Watch mode** — debounced regeneration while ignoring Git state, Finder
@@ -168,7 +191,8 @@ the source folder, never your absolute home path (`--show-source-path` opts in).
 ## Use the desktop app
 
 1. Select a source folder, or enter a remote repository URL.
-2. Keep **Redact secrets** and **Respect .gitignore** enabled for the safest default.
+2. **Redact secrets** and **Respect .gitignore** are off by default (everything is
+   merged as it is). Turn them on before sharing the output.
 3. Choose a format, ordering, and optional token limit.
 4. Optionally use **Scan & curate** before merging.
 5. Merge, then open the output or reveal it in Finder/File Explorer.
@@ -181,11 +205,12 @@ turbomerger merge <folder|URL|gh:owner/repo> [out]
     [--format markdown|xml|cxml|json|plain] [--ordering path|entry-first|important-last]
     [--max-tokens N] [--include GLOB] [--exclude GLOB] [--config FILE] [--max-file-size MB]
     [--compress] [--strip-comments] [--git-diff] [--git-log [N]] [--emit-skill]
-    [--no-redact] [--no-gitignore] [--include-hidden] [--include-venv] [--hydrate]
-    [--extract-images-text]
+    [--redact] [--gitignore] [--include-hidden] [--include-venv] [--hydrate]
+    [--extract-images-text] [--allow-system-paths] [--threads N]
     [--show-source-path] [--reproducible] [--fail-on-skip] [--quiet]
     [--progress auto|json|none] [--eta-after DUR] [--stall-after DUR] [--on-stall wait|fail]
     [--deadline DUR] [--on-deadline cancel|partial] [--keep-partial]
+    [--confirm-over DUR] [--yes]
 turbomerger map <folder|URL|gh:owner/repo> [out] [--tokens N]
 turbomerger explain <folder> <path>          # why is this path (not) in the merge?
 turbomerger apply <root> --from reply.md [--yes]
@@ -213,6 +238,10 @@ with `--progress json` (`{"event":"progress"|"stall"|"deadline", "stage", "done"
 "total", "current", "elapsed_ms", "eta_ms", …}`). Durations are `90s`, `10m`,
 `1h30m`. Token counts of unchanged files come from a per-device cache
 (`TURBOMERGER_CACHE_DIR` moves it, `TURBOMERGER_NO_CACHE=1` turns it off).
+`--threads N` (or `TURBOMERGER_THREADS`, also read by the desktop app; 0 =
+automatic) sets the worker count. `TURBOMERGER_PDF_WORKER_MB` sets the PDF
+worker's memory budget in MB (0 = none). The old `--no-redact` and
+`--no-gitignore` are still accepted; they are the defaults now.
 
 The one-line summary on stdout is
 `merged=N scan_skipped=N merge_skipped=N redacted=N tokens_o200k=N parts=N not_captured=N`
@@ -249,12 +278,14 @@ UI values take precedence. Use `.turbomergerignore` for path rules.
 ## Security model
 
 - The walker does not follow symlinks/junctions (links to files inside the root
-  are merged once; every other link is listed), and broad operating-system roots
-  are rejected. Normal macOS projects under `/Users`, external volumes, Linux
-  `/run/media/…` drives and `/run/user/<uid>/…` mounts remain usable.
-- Sensitive files and credential-dense data files are never merged. Selected
-  credential documents may be read harvest-only so their values can be redacted
-  if echoed elsewhere; their contents are discarded.
+  are merged once; every other link is listed). Protected system folders
+  (`C:\Windows`, `/usr`, `/etc`, …) are refused as a source unless
+  `--allow-system-paths`; a drive root is accepted for whole-drive runs.
+- With `--redact`, sensitive files and credential-dense data files are never
+  merged; selected credential documents may be read harvest-only so their values
+  can be redacted if echoed elsewhere, and their contents are discarded. Without
+  it (the default) every text file is merged as it is; hidden files such as
+  `.env` still stay out unless `--include-hidden`.
 - Apply-back is dry-run first and does all I/O through directory handles: a
   symlink anywhere on a path is refused, never followed. It never writes inside
   `.git`, holds control files and build manifests for explicit confirmation,
@@ -263,13 +294,15 @@ UI values take precedence. Use `.turbomergerignore` for path rules.
   checks for on-disk changes, and creates backups that only this machine can
   restore from.
 - The MCP server packs only folders under its `--root` directories, writes only to
-  its own outputs folder, and needs `--allow-remote` for remote repositories.
+  its own outputs folder, always redacts, and needs `--allow-remote` for remote
+  repositories.
 - Merged file contents are marked as untrusted data, and content that could forge
   an output delimiter is escaped (cxml) or cannot match it (plain).
 - The WebView has a strict Content Security Policy and no generic filesystem plugin.
 
-No automatic redactor is perfect. Review generated output before uploading it,
-especially when disabling gitignore handling or redaction. See [SECURITY.md](SECURITY.md)
+No automatic redactor is perfect, and redaction is off by default. Review
+generated output before uploading it, and turn on `--redact` (and `--gitignore`)
+for anything you share. See [SECURITY.md](SECURITY.md)
 for reporting and safe-use guidance.
 
 ## Development

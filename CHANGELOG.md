@@ -8,6 +8,60 @@ Stops the silent content loss, corruption and write-anywhere paths found in the
 2026-09-24 audit (`TURBOMERGER_refactor_september24_2026_v2.md`, findings N-xx).
 Every fix ships with its repro turned into a test (96 → 156 Rust tests).
 
+### All text, every file (branch `feature/large-input-doc-extraction`, 2026-10-19/20)
+
+Added:
+- Office 97-2003 `.doc` and `.ppt` text (OLE compound files via `cfb`).
+- Archives: gzip (small ones inline, big ones streamed), zip (nested too), tar
+  and `.tgz`. Text members are merged as `archive!/member`.
+- OCR, opt-in (`--extract-images-text`; desktop toggle, off by default): photos
+  and the pages of scanned or mixed PDFs that have no text layer, read with
+  `monaddoc` or `$TURBOMERGER_OCR_CMD`. With OCR off, such pages are named in the
+  report instead of vanishing behind "extracted from PDF".
+- UTF-16 text files, with or without a byte-order mark.
+- Big text files stream in bounded memory, whatever their size.
+- Whole-drive runs: a drive root is accepted; virtual, network and read-only
+  mounts are pruned; pipes and sockets are recorded, never opened;
+  `--allow-system-paths` accepts protected system folders.
+- Long runs: after `--eta-after` (60 s), an estimate over `--confirm-over`
+  (10 min) asks "proceed?" on a terminal (`--yes` skips it) and in the desktop
+  app; progress also moves inside a slow chunk.
+- Worker pool sized to the logical cores minus one (minus two from 8 cores), at
+  lowered CPU and I/O priority (Linux nice 10 + I/O best-effort 7, macOS QoS
+  utility, Windows below-normal); `--threads N` / `TURBOMERGER_THREADS`.
+- PDFs over 256 MB parse in an isolated worker process (`turbomerger __worker
+  pdf`, internal) with a memory budget of 80 % of the memory available
+  (`TURBOMERGER_PDF_WORKER_MB`; Linux watches resident memory). A worker over
+  budget or crashed is reported as not captured; the merge goes on.
+- `scripts/e2e/`: a fenced thread/memory probe, a disk-vs-output coverage audit,
+  and a PDF word-parity check against poppler.
+
+Changed:
+- **Secret redaction is off by default** in the CLI and the desktop app (a
+  one-time settings migration); `--redact` turns it on, the MCP server always
+  redacts. `--no-redact` is still accepted.
+- **Files hidden by `.gitignore` are merged by default**; `--gitignore` restores
+  the old output byte for byte. Build output (`target/` next to `Cargo.toml`,
+  `CACHEDIR.TAG` folders), dependency folders and virtualenvs stay out by their
+  own rules. `--no-gitignore` is still accepted.
+- **No per-file size cap by default** (this supersedes the 50 MB default below);
+  `--max-file-size MB` still sets one.
+- Hidden files, `.env` included, stay out by default and are recorded
+  (`--include-hidden`).
+
+Fixed:
+- A PDF that needed more memory than was left killed the whole run with no
+  output (a 450 MB scan needs about 2.8 GB); now it is parsed in the worker or
+  reported.
+- Files over 64 MiB were parsed on a normal-priority helper thread, not the
+  worker pool.
+- `.ppt` slide-master template text and field placeholders no longer leak into
+  the text.
+
+Security:
+- With redaction off by default, merged output can contain secrets: review it,
+  and use `--redact` for anything you share.
+
 ### Added
 - **Document text extraction (Phase 3, part 1; ADR 0005).** PDFs, Word
   (`.docx`), PowerPoint (`.pptx`), OpenDocument (`.odt`/`.ods`/`.odp`),
@@ -26,7 +80,7 @@ Every fix ships with its repro turned into a test (96 → 156 Rust tests).
   dropped silently.
 
 ### Changed
-- **Per-file size cap now 50 MB by default (was 2 MB), `0` = unlimited.** The
+- **Per-file size cap now 50 MB by default (was 2 MB), `0` = unlimited.** (Superseded above: no cap by default.) The
   old 2 MB default silently dropped large text files and data; the new default
   matches Repomix/Gitingest, and `--max-file-size 0` (or `max_file_size_mb = 0`
   in `turbomerger.toml`) captures everything. Oversized text still flows into
