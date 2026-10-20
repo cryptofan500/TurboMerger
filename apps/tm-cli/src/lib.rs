@@ -51,6 +51,11 @@ pub const EXIT_PARTIAL: i32 = 4;
     after_help = "Run without arguments to open the desktop app. Exit codes: 0 complete, 1 error, 2 usage, 3 completed with content not captured, 4 cancelled or partial."
 )]
 pub struct Cli {
+    /// Worker threads (default: logical cores - 1, or - 2 from 8 cores; 0 = default).
+    /// Workers run at lowered CPU and I/O priority so the desktop stays responsive.
+    #[arg(long, global = true, value_name = "N", env = "TURBOMERGER_THREADS",
+          value_parser = clap::value_parser!(u16).range(0..=1024))]
+    pub threads: Option<u16>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -331,6 +336,9 @@ pub fn run(argv: &[OsString]) -> Option<i32> {
             return Some(e.exit_code());
         }
     };
+    if !matches!(cli.command, Command::Completions { .. }) {
+        tm_core::threads::init(cli.threads.map(usize::from));
+    }
     Some(match cli.command {
         Command::Merge(m) => run_merge(m),
         Command::Map(m) => run_map(m),
@@ -909,6 +917,7 @@ mod tests {
     fn flags_parse_strictly() {
         let Cli {
             command: Command::Merge(m),
+            ..
         } = parse(&[
             "merge",
             "src",
@@ -936,6 +945,7 @@ mod tests {
 
         let Cli {
             command: Command::Apply(a),
+            ..
         } = parse(&[
             "apply",
             "root",
@@ -954,6 +964,17 @@ mod tests {
             "--from or --restore required"
         );
         assert!(parse(&["apply", "root", "--restore", "--from", "x"]).is_err());
+
+        // --threads is global: before or after the subcommand.
+        for args in [
+            &["--threads", "3", "merge", "src"][..],
+            &["merge", "src", "--threads", "3"][..],
+            &["mcp", "--threads", "3"][..],
+        ] {
+            assert_eq!(parse(args).unwrap().threads, Some(3), "{args:?}");
+        }
+        assert_eq!(parse(&["merge", "src"]).unwrap().threads, None);
+        assert!(parse(&["merge", "src", "--threads", "1025"]).is_err());
     }
 
     #[test]

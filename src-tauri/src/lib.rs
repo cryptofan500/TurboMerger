@@ -7,6 +7,8 @@ use std::sync::Mutex;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Workers at lowered priority (TURBOMERGER_THREADS overrides the count).
+    tm_core::threads::init(None);
     tm_core::cache::enable(None);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

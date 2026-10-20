@@ -50,10 +50,12 @@ unicode-normalization.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # Win32_Foundation: GetFinalPathNameByHandleW (apply-back post-open verification)
-windows-sys.workspace = true
+# Win32_System_Threading: SetThreadPriority for the worker pool (threads.rs)
+windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
-# O_NONBLOCK for apply-back reads (a FIFO swapped in must not hang the preview)
+# O_NONBLOCK for apply-back reads (a FIFO swapped in must not hang the preview);
+# worker nice / I/O priority and macOS QoS (threads.rs)
 libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

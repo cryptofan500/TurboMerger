@@ -45,6 +45,8 @@ fn a3_usage_errors_exit_2_and_write_nothing() {
         vec!["merge", "../fx", "--includ-hidden", "-q"],
         vec!["merge", "../fx", "out.md", "--max-tokens", "abc"],
         vec!["merge", "../fx", "out.md", "--format", "yaml"],
+        vec!["merge", "../fx", "out.md", "--threads", "abc"],
+        vec!["merge", "../fx", "out.md", "--threads", "5000"],
     ] {
         let o = tm(&args, &cwd);
         assert_eq!(o.status.code(), Some(2), "{args:?}");
@@ -247,4 +249,54 @@ fn the_token_cache_changes_nothing_but_speed() {
         fs::read(tmp.path().join("one.md")).unwrap(),
         fs::read(tmp.path().join("three.md")).unwrap()
     );
+}
+
+#[test]
+fn the_worker_count_changes_nothing_but_speed() {
+    // P4: --threads and TURBOMERGER_THREADS size the pool; the bytes are the same.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    for i in 0..40 {
+        fs::write(
+            src.join(format!("f{i:02}.rs")),
+            format!("// file {i}\nfn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    for (out, threads) in [("one.md", "1"), ("three.md", "3"), ("auto.md", "0")] {
+        let o = tm(
+            &[
+                "merge",
+                "src",
+                out,
+                "--reproducible",
+                "-q",
+                "--threads",
+                threads,
+            ],
+            tmp.path(),
+        );
+        assert_eq!(o.status.code(), Some(0), "--threads {threads}");
+    }
+    let with_env = |value: &str, out: &str| {
+        Command::new(env!("CARGO_BIN_EXE_turbomerger"))
+            .args(["merge", "src", out, "--reproducible", "-q"])
+            .current_dir(tmp.path())
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env("TURBOMERGER_STATE_DIR", tmp.path().join("state"))
+            .env("TURBOMERGER_CACHE_DIR", tmp.path().join("cache"))
+            .env("TURBOMERGER_THREADS", value)
+            .output()
+            .expect("binary runs")
+    };
+    assert_eq!(with_env("2", "env.md").status.code(), Some(0));
+    let one = fs::read(tmp.path().join("one.md")).unwrap();
+    for other in ["three.md", "auto.md", "env.md"] {
+        assert_eq!(one, fs::read(tmp.path().join(other)).unwrap(), "{other}");
+    }
+    // An unreadable value is a usage error, like any other flag's.
+    assert_eq!(with_env("many", "bad.md").status.code(), Some(2));
+    assert!(!tmp.path().join("bad.md").exists());
 }

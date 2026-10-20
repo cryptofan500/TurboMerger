@@ -15,6 +15,7 @@ pub mod remote;
 pub mod repomap;
 pub mod scanner;
 pub mod security;
+pub mod threads;
 pub mod tokens;
 
 pub use cancel::{CancelToken, Cancelled};
