@@ -9,6 +9,8 @@ use std::sync::Mutex;
 pub fn run() {
     // Workers at lowered priority (TURBOMERGER_THREADS overrides the count).
     tm_core::threads::init(None);
+    // Big PDFs parse in `turbomerger-gui __worker pdf` (main.rs forwards it).
+    tm_cli::register_pdf_worker();
     tm_core::cache::enable(None);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

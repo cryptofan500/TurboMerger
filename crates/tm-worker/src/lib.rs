@@ -19,7 +19,10 @@
 //! `Limits::stall_after` (plan §10.4) and kills it when one item runs past
 //! `Limits::item_budget` or the job's `CancelToken` is set. Memory is capped
 //! with `prlimit(RLIMIT_AS)` on Linux, `setrlimit` on other Unixes, and a Job
-//! Object on Windows (which also ends the worker if the host dies).
+//! Object on Windows (which also ends the worker if the host dies). On Linux
+//! the host can also watch resident memory (`Limits::resident_bytes`) and
+//! stop the worker past it: an address-space cap counts reserved virtual
+//! memory too, so it refuses work that would fit in RAM.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -87,6 +90,10 @@ pub struct Limits {
     pub item_budget: Duration,
     /// Address-space cap in bytes (`None` = unlimited).
     pub memory_bytes: Option<u64>,
+    /// Kill the worker when its resident memory passes this many bytes,
+    /// checked before every wait (at least every 50 ms). Linux only; `None` =
+    /// no watch.
+    pub resident_bytes: Option<u64>,
 }
 
 impl Default for Limits {
@@ -95,6 +102,7 @@ impl Default for Limits {
             stall_after: Duration::from_secs(10),
             item_budget: Duration::from_secs(30),
             memory_bytes: None,
+            resident_bytes: None,
         }
     }
 }
@@ -126,6 +134,8 @@ pub enum WorkerError {
     Timeout { item: String, after: Duration },
     /// Killed: the job was cancelled.
     Cancelled,
+    /// Killed: resident memory passed `Limits::resident_bytes`.
+    OverMemory { used: u64, limit: u64 },
 }
 
 impl std::fmt::Display for WorkerError {
@@ -142,6 +152,12 @@ impl std::fmt::Display for WorkerError {
                 after.as_secs()
             ),
             WorkerError::Cancelled => f.write_str("cancelled"),
+            WorkerError::OverMemory { used, limit } => write!(
+                f,
+                "worker killed: it used {} MB of memory, over its {} MB budget",
+                used >> 20,
+                limit >> 20
+            ),
         }
     }
 }
@@ -343,6 +359,12 @@ impl Worker {
                 self.kill();
                 return Err(WorkerError::Cancelled);
             }
+            if let Some(limit) = self.limits.resident_bytes {
+                if let Some(used) = resident_bytes(self.child.id()).filter(|&u| u > limit) {
+                    self.kill();
+                    return Err(WorkerError::OverMemory { used, limit });
+                }
+            }
             match self.lines.recv_timeout(Duration::from_millis(50)) {
                 Ok(Ok(line)) => {
                     last_word = Instant::now();
@@ -464,6 +486,26 @@ impl Drop for Worker {
             self.kill();
         }
     }
+}
+
+/// A process's resident memory in bytes (`VmRSS`), or `None` if unknown.
+#[cfg(target_os = "linux")]
+fn resident_bytes(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let kb = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(kb << 10)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resident_bytes(_pid: u32) -> Option<u64> {
+    None
 }
 
 fn shorten(s: &str) -> String {

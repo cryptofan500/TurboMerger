@@ -21,6 +21,7 @@
 //!
 //! 5 (verification failed) is reserved for the Phase 5 verifier.
 
+mod pdf_worker;
 mod report;
 
 use std::ffi::OsString;
@@ -76,6 +77,13 @@ pub enum Command {
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+    /// Internal: an isolated parser process speaking the tm-worker protocol on
+    /// stdin/stdout, started by this program itself for big PDFs.
+    #[command(name = "__worker", hide = true)]
+    Worker {
+        /// What it parses: pdf
+        kind: String,
     },
 }
 
@@ -339,6 +347,12 @@ pub fn run(argv: &[OsString]) -> Option<i32> {
     if !matches!(cli.command, Command::Completions { .. }) {
         tm_core::threads::init(cli.threads.map(usize::from));
     }
+    if !matches!(
+        cli.command,
+        Command::Completions { .. } | Command::Worker { .. }
+    ) {
+        pdf_worker::register();
+    }
     Some(match cli.command {
         Command::Merge(m) => run_merge(m),
         Command::Map(m) => run_map(m),
@@ -349,6 +363,7 @@ pub fn run(argv: &[OsString]) -> Option<i32> {
             output_dir: m.output_dir,
             allow_remote: m.allow_remote,
         }),
+        Command::Worker { kind } => pdf_worker::serve(&kind),
         Command::Completions { shell } => {
             clap_complete::generate(
                 shell,
@@ -359,6 +374,12 @@ pub fn run(argv: &[OsString]) -> Option<i32> {
             EXIT_OK
         }
     })
+}
+
+/// Big PDFs parse in a worker process running this binary (`__worker pdf`).
+/// For front ends that do not go through [`run`] (the desktop app).
+pub fn register_pdf_worker() {
+    pdf_worker::register();
 }
 
 /// The subcommand names, for shells that forward to this CLI (the desktop
@@ -975,6 +996,21 @@ mod tests {
         }
         assert_eq!(parse(&["merge", "src"]).unwrap().threads, None);
         assert!(parse(&["merge", "src", "--threads", "1025"]).is_err());
+
+        // The PDF worker's entry point parses, but is not advertised.
+        let Cli {
+            command: Command::Worker { kind },
+            ..
+        } = parse(&["__worker", "pdf"]).unwrap()
+        else {
+            panic!("worker")
+        };
+        assert_eq!(kind, "pdf");
+        assert!(!Cli::command()
+            .render_help()
+            .to_string()
+            .contains("__worker"));
+        assert!(is_subcommand(std::ffi::OsStr::new("__worker")));
     }
 
     #[test]

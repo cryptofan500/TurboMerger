@@ -172,3 +172,26 @@ fn the_memory_cap_stops_a_runaway_worker() {
     assert!(matches!(err, WorkerError::Crashed(_)), "{err:?}");
     assert!(peak * 64 <= 512, "stopped at {} MiB", peak * 64);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_resident_budget_stops_a_runaway_worker() {
+    let mut w = worker(Limits {
+        resident_bytes: Some(256 << 20),
+        ..Limits::default()
+    });
+    let mut peak = 0u64;
+    let err = w
+        .run("oom", json!({}), &CancelToken::new(), &mut |e| {
+            if let Event::Progress { done, .. } = e {
+                peak = done;
+            }
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, WorkerError::OverMemory { used, limit } if used > limit && limit == 256 << 20),
+        "{err:?}"
+    );
+    // Checked before every wait: it stops within a chunk or two of the budget.
+    assert!(peak * 64 <= 256 + 128, "stopped at {} MiB", peak * 64);
+}

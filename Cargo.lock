@@ -4713,10 +4713,13 @@ dependencies = [
  "clap_complete",
  "ctrlc",
  "dunce",
+ "libc",
  "mimalloc",
+ "serde_json",
  "tempfile",
  "tm-core",
  "tm-mcp",
+ "tm-worker",
 ]
 
 [[package]]

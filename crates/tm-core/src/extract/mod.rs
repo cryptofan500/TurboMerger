@@ -25,10 +25,16 @@
 //! `pdf_oxide` is validated at a 100% pass rate on 3,830 adversarial PDFs
 //! (veraPDF / pdf.js / DARPA SafeDocs), and the committed hardening is to move
 //! PDF parsing into the `tm-worker` subprocess the host can cap and kill.
+//! Done for big PDFs (P4): `pdf_oxide` holds about 6.6 x the file in memory
+//! (a 450 MB scan peaked at 2.84 GiB), so a PDF over [`pdf_worker_above`]
+//! goes to the parser a front end registered with [`set_pdf_offload`] (the
+//! CLI's `__worker pdf` process). A worker that runs out of memory or
+//! crashes takes only itself down; the file is reported, the merge goes on.
 
 use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::OnceLock;
 
 mod legacy;
 mod ocr;
@@ -158,7 +164,33 @@ pub fn extract(path: &Path, kind: DocKind, opts: &ExtractOptions) -> Result<Extr
 
 // --------------------------------------------------------------------------- PDF
 
-fn extract_pdf(path: &Path, opts: &ExtractOptions) -> Result<Extracted, String> {
+/// Parses a big PDF into page texts outside this process (a worker); `None`
+/// when no worker could run it, and the PDF is parsed here as before.
+pub type PdfOffload = dyn Fn(&Path) -> Option<Result<Vec<String>, String>> + Send + Sync;
+
+static PDF_OFFLOAD: OnceLock<Box<PdfOffload>> = OnceLock::new();
+
+/// Register the out-of-process PDF parser (once per process; `false` if one
+/// was already set). Without one, every PDF is parsed in-process.
+pub fn set_pdf_offload(offload: Box<PdfOffload>) -> bool {
+    PDF_OFFLOAD.set(offload).is_ok()
+}
+
+/// PDFs larger than this many bytes go to the registered worker: 256 MiB,
+/// or `TURBOMERGER_PDF_WORKER_ABOVE_MB` (0 = every PDF; for tests).
+pub fn pdf_worker_above() -> u64 {
+    static ABOVE: OnceLock<u64> = OnceLock::new();
+    *ABOVE.get_or_init(|| {
+        std::env::var("TURBOMERGER_PDF_WORKER_ABOVE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(256 << 20, |mb| mb << 20)
+    })
+}
+
+/// The text of every page of a PDF, parsed in this process (a worker calls
+/// this too). Errors are the report's reasons.
+pub fn pdf_pages(path: &Path) -> Result<Vec<String>, String> {
     let owned = path.to_path_buf();
     // A malformed PDF must not panic the merge (debug/test: caught here;
     // release is panic=abort — see the module note).
@@ -173,10 +205,21 @@ fn extract_pdf(path: &Path, opts: &ExtractOptions) -> Result<Extracted, String> 
         }
         Ok(out)
     }));
-    let mut pages = match parsed {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(format!("PDF parse failed: {e}")),
-        Err(_) => return Err("PDF parser panicked on a malformed file".into()),
+    match parsed {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(format!("PDF parse failed: {e}")),
+        Err(_) => Err("PDF parser panicked on a malformed file".into()),
+    }
+}
+
+fn extract_pdf(path: &Path, opts: &ExtractOptions) -> Result<Extracted, String> {
+    let big = std::fs::metadata(path).is_ok_and(|m| m.len() > pdf_worker_above());
+    let offloaded = big
+        .then(|| PDF_OFFLOAD.get().and_then(|parse| parse(path)))
+        .flatten();
+    let mut pages = match offloaded {
+        Some(pages) => pages?,
+        None => pdf_pages(path)?,
     };
     let n = pages.len();
     let mut note = format!("extracted from PDF ({} page{})", n, s(n));

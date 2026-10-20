@@ -21,6 +21,13 @@ clap_complete.workspace = true
 ctrlc.workspace = true
 dunce.workspace = true
 mimalloc.workspace = true
+# big PDFs parse in a worker process (src/pdf_worker.rs)
+tm-worker.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# physical memory for the PDF worker's cap; Linux prctl / OOM score
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

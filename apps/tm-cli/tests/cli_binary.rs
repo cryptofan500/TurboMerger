@@ -300,3 +300,124 @@ fn the_worker_count_changes_nothing_but_speed() {
     assert_eq!(with_env("many", "bad.md").status.code(), Some(2));
     assert!(!tmp.path().join("bad.md").exists());
 }
+
+fn fixture_pdf(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/arxiv-mini/local/2026-08")
+        .join(name)
+}
+
+#[test]
+fn the_pdf_worker_speaks_the_protocol_and_matches_in_process_text() {
+    // P4: big PDFs parse in `turbomerger __worker pdf`.
+    let exe = Path::new(env!("CARGO_BIN_EXE_turbomerger"));
+    let mut w =
+        tm_worker::Worker::spawn(exe, &["__worker", "pdf"], tm_worker::Limits::default()).unwrap();
+    assert_eq!(w.hello.worker, "tm-pdf");
+    let pdf = fixture_pdf("2608.14352.pdf");
+    let cancel = tm_core::CancelToken::new();
+    let mut out = w
+        .run(
+            "pdf_pages",
+            serde_json::json!({ "path": pdf.to_str().unwrap() }),
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap();
+    let pages: Vec<String> = serde_json::from_value(out["pages"].take()).unwrap();
+    assert_eq!(pages, tm_core::extract::pdf_pages(&pdf).unwrap());
+    assert!(pages.iter().any(|p| !p.trim().is_empty()));
+    // A parse error is the job's error; the worker lives on.
+    let err = w
+        .run(
+            "pdf_pages",
+            serde_json::json!({ "path": "/nonexistent/x.pdf" }),
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, tm_worker::WorkerError::Failed(m) if m.starts_with("PDF parse failed")),
+        "{err:?}"
+    );
+    w.shutdown();
+}
+
+#[test]
+fn pdfs_parsed_in_workers_merge_to_the_same_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("docs");
+    fs::create_dir_all(&src).unwrap();
+    for name in ["2608.14352.pdf", "2608.15188.pdf"] {
+        fs::copy(fixture_pdf(name), src.join(name)).unwrap();
+    }
+    fs::write(src.join("notes.md"), "# notes\n").unwrap();
+    let merge = |out: &str, env: &[(&str, &str)]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_turbomerger"));
+        c.args([
+            "merge",
+            "docs",
+            out,
+            "--format",
+            "json",
+            "--reproducible",
+            "-q",
+        ])
+        .current_dir(tmp.path())
+        .env("TURBOMERGER_STATE_DIR", tmp.path().join("state"))
+        .env("TURBOMERGER_CACHE_DIR", tmp.path().join("cache"));
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        c.output().expect("binary runs")
+    };
+    assert_eq!(merge("here.json", &[]).status.code(), Some(0));
+    // Every PDF through a worker (the threshold is 256 MB by default).
+    let o = merge("worker.json", &[("TURBOMERGER_PDF_WORKER_ABOVE_MB", "0")]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(
+        fs::read(tmp.path().join("here.json")).unwrap(),
+        fs::read(tmp.path().join("worker.json")).unwrap()
+    );
+    // A worker stopped by its memory budget (here 1 MB) loses only its file.
+    let o = merge(
+        "capped.json",
+        &[
+            ("TURBOMERGER_PDF_WORKER_ABOVE_MB", "0"),
+            ("TURBOMERGER_PDF_WORKER_MB", "1"),
+        ],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let d: serde_json::Value =
+        serde_json::from_slice(&fs::read(tmp.path().join("capped.json")).unwrap()).unwrap();
+    let merged: Vec<&str> = d["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(merged, ["notes.md"]);
+    let reasons: Vec<&str> = d["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["reason"].as_str().unwrap())
+        .collect();
+    assert_eq!(reasons.len(), 2, "{reasons:?}");
+    assert!(
+        reasons
+            .iter()
+            .all(|r| r.contains("isolated worker") && r.contains("memory budget 1 MB")),
+        "{reasons:?}"
+    );
+}
