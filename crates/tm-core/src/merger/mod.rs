@@ -20,7 +20,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrd};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrd};
 
 use anyhow::Result;
 use rayon::prelude::*;
@@ -294,24 +294,51 @@ where
             continue;
         }
         // Say which chunk is in flight: a stall report can then name a file.
-        if let Some(first) = chunk.first() {
-            progress_callback(done, total_files, &relative_display(root, first));
-        }
-        let processed: Vec<process::Processed> = chunk
-            .par_iter()
-            .map(|path| {
-                if cancelled(cancel_flag) {
-                    process::Processed {
-                        result: Err((String::new(), String::new(), SkipKind::Excluded)),
-                        harvested: Vec::new(),
-                        dense: Vec::new(),
-                        stream: false,
-                    }
-                } else {
-                    process::process_file(path, root, cfg)
+        let first = chunk
+            .first()
+            .map(|p| relative_display(root, p))
+            .unwrap_or_default();
+        progress_callback(done, total_files, &first);
+        // Count files as they finish (in any order) and report every 250 ms,
+        // so a slow chunk — 64 big PDFs — still moves the progress and the
+        // ETA. A fast chunk returns at once: the wait ends on its result.
+        let finished = AtomicUsize::new(0);
+        let processed: Vec<process::Processed> = std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (chunk, finished) = (&chunk, &finished);
+            s.spawn(move || {
+                let out: Vec<process::Processed> = chunk
+                    .par_iter()
+                    .map(|path| {
+                        let p = if cancelled(cancel_flag) {
+                            process::Processed {
+                                result: Err((String::new(), String::new(), SkipKind::Excluded)),
+                                harvested: Vec::new(),
+                                dense: Vec::new(),
+                                stream: false,
+                            }
+                        } else {
+                            process::process_file(path, root, cfg)
+                        };
+                        finished.fetch_add(1, AtomicOrd::Relaxed);
+                        p
+                    })
+                    .collect();
+                let _ = tx.send(out);
+            });
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                    Ok(out) => break out,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => progress_callback(
+                        done + finished.load(AtomicOrd::Relaxed),
+                        total_files,
+                        &first,
+                    ),
+                    // The worker panicked: the scope re-raises it on exit.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Vec::new(),
                 }
-            })
-            .collect();
+            }
+        });
         if cancelled(cancel_flag) {
             return Err(Cancelled.into());
         }

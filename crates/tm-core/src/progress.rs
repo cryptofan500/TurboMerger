@@ -90,15 +90,18 @@ impl Tracker {
             s.sample_at = now;
             s.sample_done = p.done;
             s.last_change = now;
-        } else if p.done != s.done || p.current != s.current {
+            s.done = p.done;
+        } else if p.done > s.done || p.current != s.current {
             s.last_change = now;
         }
-        s.done = p.done;
+        // Within a stage `done` never goes back: files counted as they finish
+        // are reported again, in order, when their chunk is written.
+        s.done = s.done.max(p.done);
         s.total = p.total;
         s.current.clone_from(&p.current);
         let dt = now.saturating_duration_since(s.sample_at);
         if dt >= TICK {
-            let inst = p.done.saturating_sub(s.sample_done) as f64 / dt.as_secs_f64();
+            let inst = s.done.saturating_sub(s.sample_done) as f64 / dt.as_secs_f64();
             match s.rate {
                 None => s.rate = Some(inst),
                 Some(r) => {
@@ -108,7 +111,7 @@ impl Tracker {
                 }
             }
             s.sample_at = now;
-            s.sample_done = p.done;
+            s.sample_done = s.done;
         }
     }
 
@@ -143,6 +146,42 @@ impl Tracker {
             stalled_for: (quiet >= self.stall_after).then_some(quiet),
         }
     }
+}
+
+/// The long-run question (plan §10.5): once `after` has passed, is this run
+/// expected to take longer than `over`? Every shell asks it once per run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LongRun {
+    /// Too early, or no rate yet: look again on the next tick.
+    Undecided,
+    /// It will finish within `over`: never ask.
+    Short,
+    /// Ask. `eta` is the time left; `None` while files are still being
+    /// counted — a walk that outlasts `after` is a long run by itself.
+    Long { eta: Option<Duration> },
+}
+
+pub fn long_run(s: &Snapshot, after: Duration, over: Duration) -> LongRun {
+    if s.elapsed < after {
+        return LongRun::Undecided;
+    }
+    match s.eta {
+        Some(eta) if eta > over => LongRun::Long { eta: Some(eta) },
+        Some(_) => LongRun::Short,
+        None if s.stage == Stage::Scan => LongRun::Long { eta: None },
+        None => LongRun::Undecided,
+    }
+}
+
+/// Local clock time `d` from now: `14:05`, or `Wed 14:05` a day or more away.
+pub fn finish_clock(d: Duration) -> String {
+    let at = chrono::Local::now() + chrono::Duration::from_std(d).unwrap_or_default();
+    let fmt = if d >= Duration::from_secs(24 * 3600) {
+        "%a %H:%M"
+    } else {
+        "%H:%M"
+    };
+    at.format(fmt).to_string()
 }
 
 /// `1m05s`, `42s`, `1h02m`.
@@ -203,6 +242,52 @@ pub fn parse_duration(text: &str) -> Result<Duration, String> {
 mod tests {
     use super::*;
 
+    fn snap(stage: Stage, elapsed: u64, eta: Option<u64>) -> Snapshot {
+        Snapshot {
+            stage,
+            done: 1,
+            total: if stage == Stage::Scan { 0 } else { 10 },
+            current: String::new(),
+            elapsed: Duration::from_secs(elapsed),
+            eta: eta.map(Duration::from_secs),
+            eta_band: None,
+            stalled_for: None,
+        }
+    }
+
+    #[test]
+    fn long_run_is_decided_once_the_first_minute_is_over() {
+        let (after, over) = (Duration::from_secs(60), Duration::from_secs(600));
+        let at = |stage, elapsed, eta| long_run(&snap(stage, elapsed, eta), after, over);
+        assert_eq!(at(Stage::Merge, 30, Some(5000)), LongRun::Undecided);
+        assert_eq!(
+            at(Stage::Merge, 60, Some(900)),
+            LongRun::Long {
+                eta: Some(Duration::from_secs(900))
+            }
+        );
+        assert_eq!(at(Stage::Merge, 61, Some(120)), LongRun::Short);
+        // Exactly the limit is not "longer than".
+        assert_eq!(at(Stage::Merge, 61, Some(600)), LongRun::Short);
+        // Still walking after a minute: long by itself, no estimate yet.
+        assert_eq!(at(Stage::Scan, 61, None), LongRun::Long { eta: None });
+        // Merging but no rate yet: look again on the next tick.
+        assert_eq!(at(Stage::Merge, 61, None), LongRun::Undecided);
+    }
+
+    #[test]
+    fn finish_clock_is_a_time_or_a_day_and_time() {
+        let near = finish_clock(Duration::from_secs(90));
+        assert!(near.len() == 5 && near.as_bytes()[2] == b':', "{near}");
+        // "Wed 14:05": a weekday, a space, then HH:MM.
+        let far = finish_clock(Duration::from_secs(30 * 3600));
+        let (day, time) = far.split_once(' ').expect("day and time");
+        assert!(
+            day.len() == 3 && time.len() == 5 && time.as_bytes()[2] == b':',
+            "{far}"
+        );
+    }
+
     fn p(stage: Stage, done: usize, total: usize, current: &str) -> Progress {
         Progress {
             stage,
@@ -210,6 +295,21 @@ mod tests {
             total,
             current: current.to_string(),
         }
+    }
+
+    #[test]
+    fn done_never_goes_back_within_a_stage_but_resets_across_stages() {
+        // A chunk's files are counted as they finish (7), then reported again
+        // in order (3, 4, …): the count must not fall back.
+        let tr = Tracker::new(Duration::from_secs(60), Duration::from_secs(15));
+        tr.update(&p(Stage::Merge, 7, 20, "a"));
+        tr.update(&p(Stage::Merge, 3, 20, "b"));
+        assert_eq!(tr.snapshot().done, 7);
+        tr.update(&p(Stage::Merge, 9, 20, "c"));
+        assert_eq!(tr.snapshot().done, 9);
+        // A new stage counts new units from its own start.
+        tr.update(&p(Stage::Scan, 0, 0, ""));
+        assert_eq!(tr.snapshot().done, 0);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tm_core::job::Stage;
-use tm_core::progress::{human_duration, Snapshot, Tracker};
+use tm_core::progress::{finish_clock, human_duration, long_run, LongRun, Snapshot, Tracker};
 use tm_core::CancelToken;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +44,14 @@ pub struct ReporterConfig {
     pub deadline: Option<Duration>,
     pub on_deadline: DeadlineAction,
     pub on_stall: StallAction,
+    /// When the long-run question may be asked (`--eta-after`).
+    pub ask_after: Duration,
+    /// Ask "proceed?" when the run looks longer than this; `None` = never.
+    pub confirm_over: Option<Duration>,
+    /// `--yes`: report a long run, never ask.
+    pub assume_yes: bool,
+    /// `--keep-partial`: a "no" keeps what is done, like Ctrl-C.
+    pub keep_partial: bool,
 }
 
 pub struct Reporter {
@@ -135,6 +143,7 @@ impl Reporter {
         let stopped_by = Arc::new(std::sync::Mutex::new(None));
         let stopped2 = stopped_by.clone();
         let tty = std::io::stderr().is_terminal();
+        let can_ask = tty && std::io::stdin().is_terminal();
         let handle = std::thread::spawn(move || {
             let started = Instant::now();
             let mut last_status = started;
@@ -142,6 +151,8 @@ impl Reporter {
             let mut stall_reported = false;
             let mut deadline_fired = false;
             let mut drew_status = false;
+            let mut long_decided = false;
+            let mut answer: Option<std::sync::mpsc::Receiver<String>> = None;
             let mut err = std::io::stderr();
             // Wake every 200 ms, or at once when `finish` drops the sender.
             while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
@@ -204,6 +215,71 @@ impl Reporter {
                     None => stall_reported = false,
                     _ => {}
                 }
+                // The long-run question, once (plan §10.5). The run goes on
+                // while it is open; "n" stops it like Ctrl-C.
+                if let Some(over) = cfg.confirm_over.filter(|_| !long_decided) {
+                    match long_run(&snap, cfg.ask_after, over) {
+                        LongRun::Undecided => {}
+                        LongRun::Short => long_decided = true,
+                        LongRun::Long { eta } => {
+                            long_decided = true;
+                            let what = match eta {
+                                Some(eta) => format!(
+                                    "about {} left (finishes ≈ {})",
+                                    human_duration(eta),
+                                    finish_clock(eta)
+                                ),
+                                None => format!(
+                                    "still counting files after {}",
+                                    human_duration(snap.elapsed)
+                                ),
+                            };
+                            if drew_status {
+                                let _ = write!(err, "\r\x1b[K");
+                                drew_status = false;
+                            }
+                            if cfg.mode == ProgressMode::Json {
+                                let _ = err.write_all(json_line("long_run", &snap).as_bytes());
+                            } else if can_ask && !cfg.assume_yes && !cfg.quiet {
+                                let _ = write!(err, "This is a long run: {what}. Proceed? [Y/n] ");
+                                let _ = err.flush();
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                // Its own thread: a run that ends unanswered
+                                // must not wait for Enter.
+                                std::thread::spawn(move || {
+                                    let mut line = String::new();
+                                    let _ = std::io::stdin().read_line(&mut line);
+                                    let _ = tx.send(line);
+                                });
+                                answer = Some(rx);
+                            } else if !cfg.quiet {
+                                let _ = writeln!(
+                                    err,
+                                    "long run: {what} — continuing (Ctrl-C stops it)"
+                                );
+                            }
+                        }
+                    }
+                }
+                if let Some(rx) = &answer {
+                    match rx.try_recv() {
+                        Ok(line) => {
+                            answer = None;
+                            if line.trim().to_ascii_lowercase().starts_with('n') {
+                                if cfg.keep_partial {
+                                    token.finish_early();
+                                } else {
+                                    token.cancel();
+                                }
+                                *stopped2.lock().unwrap() =
+                                    Some("answered no to the long-run question");
+                            }
+                        }
+                        // No status line under an open question.
+                        Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => answer = None,
+                    }
+                }
                 match cfg.mode {
                     ProgressMode::Json if last_json.elapsed() >= Duration::from_secs(1) => {
                         last_json = Instant::now();
@@ -223,6 +299,9 @@ impl Reporter {
             if drew_status {
                 let _ = write!(err, "\r\x1b[K");
                 let _ = err.flush();
+            }
+            if answer.is_some() {
+                let _ = writeln!(err, "(finished before an answer)");
             }
         });
         Reporter {

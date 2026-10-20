@@ -237,6 +237,13 @@ pub struct MergeCmd {
     /// On Ctrl-C, write what is done (exit 4) instead of nothing
     #[arg(long)]
     pub keep_partial: bool,
+    /// Ask "proceed?" once a run looks longer than this — asked once, after
+    /// --eta-after, and only on a terminal (scripts get a note). 0 = never
+    #[arg(long, value_name = "DURATION", default_value = "10m", value_parser = duration_arg)]
+    pub confirm_over: Duration,
+    /// Never ask the long-run question; report it and keep going
+    #[arg(long)]
+    pub yes: bool,
 }
 
 fn duration_arg(s: &str) -> Result<Duration, String> {
@@ -494,6 +501,10 @@ fn run_merge(a: MergeCmd) -> i32 {
             deadline: a.deadline,
             on_deadline: a.on_deadline,
             on_stall: a.on_stall,
+            ask_after: a.eta_after,
+            confirm_over: (!a.confirm_over.is_zero()).then_some(a.confirm_over),
+            assume_yes: a.yes,
+            keep_partial: a.keep_partial,
         },
     );
     let run = tm_core::job::run_merge(&options, None, &token, &|p| tracker.update(&p));
