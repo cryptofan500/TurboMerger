@@ -69,6 +69,15 @@ pub fn init(explicit: Option<usize>) -> usize {
     })
 }
 
+/// Run `op` on a worker of the global pool and wait for it. A parallel
+/// iterator over ONE item (every file over the chunk byte budget is a
+/// chunk of its own) never splits, so rayon runs it inline on the calling
+/// thread: from a thread outside the pool, that is a normal-priority
+/// thread. Inside a worker this just calls `op`.
+pub fn on_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    rayon::scope(|_| op())
+}
+
 /// Lower the calling thread's CPU and I/O priority, best effort: a refusal
 /// leaves the thread as it was. On Linux it never raises a priority the
 /// thread already had lower (e.g. a run started under `nice 15`).
@@ -177,6 +186,27 @@ mod tests {
         assert!(names
             .iter()
             .all(|n| n.as_deref().is_some_and(|n| n.starts_with("tm-pool-"))));
+    }
+
+    #[test]
+    fn one_item_work_runs_on_the_pool_only_through_on_pool() {
+        use rayon::prelude::*;
+        // From a thread outside the pool (as the merger's chunk thread is).
+        std::thread::spawn(|| {
+            let inline: Vec<_> = [1]
+                .par_iter()
+                .map(|_| rayon::current_thread_index())
+                .collect();
+            assert_eq!(inline, [None], "a one-item par_iter runs on the caller");
+            let pooled: Vec<_> = on_pool(|| {
+                [1].par_iter()
+                    .map(|_| rayon::current_thread_index())
+                    .collect()
+            });
+            assert!(pooled[0].is_some(), "on_pool moves it onto a worker");
+        })
+        .join()
+        .unwrap();
     }
 
     /// Every worker runs at nice 10 (or the caller's, if already lower)

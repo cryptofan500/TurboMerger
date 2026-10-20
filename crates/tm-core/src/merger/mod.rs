@@ -307,23 +307,27 @@ where
             let (tx, rx) = std::sync::mpsc::channel();
             let (chunk, finished) = (&chunk, &finished);
             s.spawn(move || {
-                let out: Vec<process::Processed> = chunk
-                    .par_iter()
-                    .map(|path| {
-                        let p = if cancelled(cancel_flag) {
-                            process::Processed {
-                                result: Err((String::new(), String::new(), SkipKind::Excluded)),
-                                harvested: Vec::new(),
-                                dense: Vec::new(),
-                                stream: false,
-                            }
-                        } else {
-                            process::process_file(path, root, cfg)
-                        };
-                        finished.fetch_add(1, AtomicOrd::Relaxed);
-                        p
-                    })
-                    .collect();
+                // On the pool even when the chunk is one big file: rayon
+                // would run a one-item chunk on this normal-priority thread.
+                let out: Vec<process::Processed> = crate::threads::on_pool(|| {
+                    chunk
+                        .par_iter()
+                        .map(|path| {
+                            let p = if cancelled(cancel_flag) {
+                                process::Processed {
+                                    result: Err((String::new(), String::new(), SkipKind::Excluded)),
+                                    harvested: Vec::new(),
+                                    dense: Vec::new(),
+                                    stream: false,
+                                }
+                            } else {
+                                process::process_file(path, root, cfg)
+                            };
+                            finished.fetch_add(1, AtomicOrd::Relaxed);
+                            p
+                        })
+                        .collect()
+                });
                 let _ = tx.send(out);
             });
             loop {
@@ -673,10 +677,12 @@ fn mask_known_values(
             if cancelled(cancel_flag) {
                 return Err(Cancelled.into());
             }
-            let per_block: Vec<BTreeSet<usize>> = blocks[range.clone()]
-                .par_iter()
-                .map(|b| spool.read(b.span).map(|text| guard.present(&text)))
-                .collect::<std::io::Result<_>>()?;
+            let per_block: Vec<BTreeSet<usize>> = crate::threads::on_pool(|| {
+                blocks[range.clone()]
+                    .par_iter()
+                    .map(|b| spool.read(b.span).map(|text| guard.present(&text)))
+                    .collect::<std::io::Result<_>>()
+            })?;
             for present in &per_block {
                 for &i in present {
                     hits[i] += 1;
@@ -700,17 +706,19 @@ fn mask_known_values(
         if cancelled(cancel_flag) {
             return Err(Cancelled.into());
         }
-        let masked: Vec<Option<(String, usize, usize)>> = blocks[range.clone()]
-            .par_iter()
-            .map(|b| {
-                spool.read(b.span).map(|text| {
-                    masker.mask(&text, "[REDACTED]").map(|(m, n)| {
-                        let t = crate::cache::count(&m);
-                        (m, n, t)
+        let masked: Vec<Option<(String, usize, usize)>> = crate::threads::on_pool(|| {
+            blocks[range.clone()]
+                .par_iter()
+                .map(|b| {
+                    spool.read(b.span).map(|text| {
+                        masker.mask(&text, "[REDACTED]").map(|(m, n)| {
+                            let t = crate::cache::count(&m);
+                            (m, n, t)
+                        })
                     })
                 })
-            })
-            .collect::<std::io::Result<_>>()?;
+                .collect::<std::io::Result<_>>()
+        })?;
         for (b, m) in blocks[range].iter_mut().zip(masked) {
             if let Some((text, n, t)) = m {
                 b.span = spool.append(&text)?;
