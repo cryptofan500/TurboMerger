@@ -14,6 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
+use tm_core::extract::PdfParse;
 use tm_core::CancelToken;
 use tm_worker::{send, Limits, ToHost, ToWorker, Worker, WorkerError, PROTOCOL};
 
@@ -24,12 +25,24 @@ pub fn register() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    tm_core::extract::set_pdf_offload(Box::new(move |path| parse_in_worker(&exe, path)));
+    tm_core::extract::set_pdf_offload(Box::new(move |path, pictures| {
+        parse_in_worker(&exe, path, pictures)
+    }));
 }
 
-fn parse_in_worker(exe: &Path, path: &Path) -> Option<Result<Vec<String>, String>> {
+/// The worker's parse of `path`; with `pictures`, the worker also writes
+/// the picture of each page without text into that folder (for OCR).
+fn parse_in_worker(
+    exe: &Path,
+    path: &Path,
+    pictures: Option<&Path>,
+) -> Option<Result<PdfParse, String>> {
     // The protocol is JSON: a path that is not UTF-8 is parsed in-process.
     let path_text = path.to_str()?;
+    let pictures_text = match pictures {
+        Some(dir) => Some(dir.to_str()?),
+        None => None,
+    };
     let mb = std::fs::metadata(path).map_or(0, |m| m.len() >> 20);
     let budget = memory_budget();
     let limits = Limits {
@@ -47,9 +60,9 @@ fn parse_in_worker(exe: &Path, path: &Path) -> Option<Result<Vec<String>, String
         Err(WorkerError::Spawn(_) | WorkerError::Protocol(_)) => return None,
         Err(e) => return Some(Err(lost(mb, budget, &e))),
     };
-    let job = serde_json::json!({ "path": path_text });
+    let job = serde_json::json!({ "path": path_text, "pictures": pictures_text });
     let pages = match worker.run("pdf_pages", job, &CancelToken::new(), &mut |_| {}) {
-        Ok(mut out) => serde_json::from_value::<Vec<String>>(out["pages"].take())
+        Ok(out) => serde_json::from_value::<PdfParse>(out)
             .map_err(|e| format!("PDF worker sent unreadable pages: {e}")),
         // The parser's own reason ("PDF parse failed: …"), as in-process;
         // an allocation the address-space cap refused also says which.
@@ -177,14 +190,17 @@ pub fn serve(kind: &str) -> i32 {
         match serde_json::from_str::<ToWorker>(&line) {
             Ok(ToWorker::Job { id, kind, input }) => {
                 let path = input.get("path").and_then(Value::as_str);
+                let pictures = input.get("pictures").and_then(Value::as_str).map(Path::new);
                 let reply = match (kind.as_str(), path) {
-                    ("pdf_pages", Some(p)) => match tm_core::extract::pdf_pages(Path::new(p)) {
-                        Ok(pages) => ToHost::Result {
-                            id,
-                            output: serde_json::json!({ "pages": pages }),
-                        },
-                        Err(message) => ToHost::Error { id, message },
-                    },
+                    ("pdf_pages", Some(p)) => {
+                        match tm_core::extract::pdf_parse(Path::new(p), pictures) {
+                            Ok(parsed) => ToHost::Result {
+                                id,
+                                output: serde_json::to_value(parsed).unwrap_or_default(),
+                            },
+                            Err(message) => ToHost::Error { id, message },
+                        }
+                    }
                     _ => ToHost::Error {
                         id,
                         message: format!("unsupported job {kind:?}"),

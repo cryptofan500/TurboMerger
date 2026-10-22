@@ -2,7 +2,13 @@
 //!
 //! - ETA = remaining work ÷ EWMA(throughput), sampled on ≥ 1 s ticks
 //!   (α = 0.2), with a ± band from the EWMA variance. It is withheld until
-//!   `eta_after` has elapsed: early rates mislead (plan §10.3, `--eta-after`).
+//!   `eta_after` has elapsed: early rates mislead (plan §10.3, `--eta-after`),
+//!   and until [`MIN_DONE`] items of the stage are done (three OCR pages,
+//!   not one picture that happened to be small).
+//! - Work is bytes when the stage reports them (the merge: a thousand notes
+//!   and one 400 MB PDF are not a thousand and one equal steps), else items
+//!   (P9). Work queued for a later stage (`later_secs`: pictures waiting
+//!   for OCR) is added to the time left.
 //! - A stall is no progress (no new item, no new current file) for
 //!   `stall_after`; the snapshot says what the job is stuck on and for how
 //!   long (plan §10.4).
@@ -14,6 +20,8 @@ use crate::job::{Progress, Stage};
 
 const ALPHA: f64 = 0.2;
 const TICK: Duration = Duration::from_secs(1);
+/// Items a stage must have finished before it shows an ETA.
+const MIN_DONE: usize = 3;
 
 /// A point-in-time view of a running job.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,11 +47,19 @@ struct State {
     done: usize,
     total: usize,
     current: String,
-    /// Items per second (EWMA) and its variance.
+    /// `done` when the stage began.
+    stage_start: usize,
+    /// The work the rate measures: bytes when the stage reports them, else
+    /// items.
+    units_done: u64,
+    units_total: u64,
+    /// Seconds queued for a later stage.
+    later: u64,
+    /// Units per second (EWMA) and its variance.
     rate: Option<f64>,
     var: f64,
     sample_at: Instant,
-    sample_done: usize,
+    sample_units: u64,
 }
 
 pub struct Tracker {
@@ -66,10 +82,14 @@ impl Tracker {
                 done: 0,
                 total: 0,
                 current: String::new(),
+                stage_start: 0,
+                units_done: 0,
+                units_total: 0,
+                later: 0,
                 rate: None,
                 var: 0.0,
                 sample_at: now,
-                sample_done: 0,
+                sample_units: 0,
             }),
             eta_after,
             stall_after,
@@ -82,26 +102,36 @@ impl Tracker {
 
     pub fn update_at(&self, p: &Progress, now: Instant) {
         let mut s = self.state.lock().expect("tracker");
+        let (units_done, units_total) = if p.bytes_total > 0 {
+            (p.bytes_done, p.bytes_total)
+        } else {
+            (p.done as u64, p.total as u64)
+        };
         if p.stage != s.stage {
             // New units of work: the old rate says nothing about them.
             s.stage = p.stage;
             s.rate = None;
             s.var = 0.0;
             s.sample_at = now;
-            s.sample_done = p.done;
+            s.sample_units = units_done;
             s.last_change = now;
             s.done = p.done;
-        } else if p.done > s.done || p.current != s.current {
+            s.stage_start = p.done;
+            s.units_done = units_done;
+        } else if p.done > s.done || p.current != s.current || units_done > s.units_done {
             s.last_change = now;
         }
         // Within a stage `done` never goes back: files counted as they finish
-        // are reported again, in order, when their chunk is written.
+        // are reported again, in order, when they are written.
         s.done = s.done.max(p.done);
+        s.units_done = s.units_done.max(units_done);
+        s.units_total = units_total;
+        s.later = p.later_secs;
         s.total = p.total;
         s.current.clone_from(&p.current);
         let dt = now.saturating_duration_since(s.sample_at);
         if dt >= TICK {
-            let inst = s.done.saturating_sub(s.sample_done) as f64 / dt.as_secs_f64();
+            let inst = s.units_done.saturating_sub(s.sample_units) as f64 / dt.as_secs_f64();
             match s.rate {
                 None => s.rate = Some(inst),
                 Some(r) => {
@@ -111,7 +141,7 @@ impl Tracker {
                 }
             }
             s.sample_at = now;
-            s.sample_done = s.done;
+            s.sample_units = s.units_done;
         }
     }
 
@@ -122,13 +152,14 @@ impl Tracker {
     pub fn snapshot_at(&self, now: Instant) -> Snapshot {
         let s = self.state.lock().expect("tracker");
         let elapsed = now.saturating_duration_since(s.started);
+        let measured = s.done.saturating_sub(s.stage_start) >= MIN_DONE;
         let (eta, eta_band) = match s.rate {
-            Some(rate) if rate > 0.0 && s.total > 0 && elapsed >= self.eta_after => {
-                let left = s.total.saturating_sub(s.done) as f64;
+            Some(rate) if rate > 0.0 && s.total > 0 && measured && elapsed >= self.eta_after => {
+                let left = s.units_total.saturating_sub(s.units_done) as f64;
                 let secs = left / rate;
                 let band = secs * (s.var.sqrt() / rate).min(1.0);
                 (
-                    Some(Duration::from_secs_f64(secs)),
+                    Some(Duration::from_secs_f64(secs + s.later as f64)),
                     Some(Duration::from_secs_f64(band)),
                 )
             }
@@ -173,13 +204,18 @@ pub fn long_run(s: &Snapshot, after: Duration, over: Duration) -> LongRun {
     }
 }
 
-/// Local clock time `d` from now: `14:05`, or `Wed 14:05` a day or more away.
+/// Local clock time `d` from now: `14:05` today, or `Wed 14:05` on any other
+/// day (a run started at 23:00 that takes two hours ends tomorrow).
 pub fn finish_clock(d: Duration) -> String {
-    let at = chrono::Local::now() + chrono::Duration::from_std(d).unwrap_or_default();
-    let fmt = if d >= Duration::from_secs(24 * 3600) {
-        "%a %H:%M"
-    } else {
+    finish_clock_from(chrono::Local::now(), d)
+}
+
+fn finish_clock_from(now: chrono::DateTime<chrono::Local>, d: Duration) -> String {
+    let at = now + chrono::Duration::from_std(d).unwrap_or_default();
+    let fmt = if at.date_naive() == now.date_naive() {
         "%H:%M"
+    } else {
+        "%a %H:%M"
     };
     at.format(fmt).to_string()
 }
@@ -277,8 +313,25 @@ mod tests {
 
     #[test]
     fn finish_clock_is_a_time_or_a_day_and_time() {
-        let near = finish_clock(Duration::from_secs(90));
-        assert!(near.len() == 5 && near.as_bytes()[2] == b':', "{near}");
+        use chrono::TimeZone;
+        // 23:00 plus two hours is tomorrow: the day is named.
+        let late = chrono::Local
+            .with_ymd_and_hms(2026, 10, 21, 23, 0, 0)
+            .single()
+            .expect("a local time");
+        assert_eq!(
+            finish_clock_from(late, Duration::from_secs(2 * 3600)),
+            "Thu 01:00"
+        );
+        assert_eq!(
+            finish_clock_from(late, Duration::from_secs(30 * 60)),
+            "23:30"
+        );
+        let near = finish_clock(Duration::from_secs(1));
+        assert!(
+            near.len() == 5 && near.as_bytes()[2] == b':' || near.len() == 9,
+            "{near}"
+        );
         // "Wed 14:05": a weekday, a space, then HH:MM.
         let far = finish_clock(Duration::from_secs(30 * 3600));
         let (day, time) = far.split_once(' ').expect("day and time");
@@ -289,12 +342,7 @@ mod tests {
     }
 
     fn p(stage: Stage, done: usize, total: usize, current: &str) -> Progress {
-        Progress {
-            stage,
-            done,
-            total,
-            current: current.to_string(),
-        }
+        Progress::new(stage, done, total, current)
     }
 
     #[test]
@@ -335,6 +383,48 @@ mod tests {
             "steady rate, narrow band"
         );
         assert_eq!(snap.stalled_for, None);
+    }
+
+    /// The merge's ETA follows bytes, not files: 900 small files done and
+    /// one big file left is far from "almost done". Work queued for the OCR
+    /// stage is added on top.
+    #[test]
+    fn eta_weighs_bytes_and_adds_the_queued_ocr_time() {
+        let t0 = Instant::now();
+        let tr = Tracker::starting_at(t0, Duration::from_secs(1), Duration::from_secs(15));
+        // 1 MB per second: 900 files of 1 KB went fast, then a 100 MB file.
+        for s in 0..=10u64 {
+            let done = if s == 0 { 0 } else { 900 };
+            tr.update_at(
+                &Progress {
+                    bytes_done: s * 1_000_000,
+                    bytes_total: 110_000_000,
+                    later_secs: 50,
+                    ..p(Stage::Merge, done, 901, "big.pdf")
+                },
+                t0 + Duration::from_secs(s),
+            );
+        }
+        let eta = tr
+            .snapshot_at(t0 + Duration::from_secs(10))
+            .eta
+            .expect("an ETA")
+            .as_secs_f64();
+        // 100 MB left at 1 MB/s, plus 50 s of OCR.
+        assert!((eta - 150.0).abs() < 2.0, "{eta}");
+    }
+
+    /// No ETA until three items of the stage are done: one picture read in
+    /// a few seconds says little about the next hundred.
+    #[test]
+    fn no_eta_before_three_items_of_the_stage() {
+        let t0 = Instant::now();
+        let tr = Tracker::starting_at(t0, Duration::from_secs(0), Duration::from_secs(15));
+        tr.update_at(&p(Stage::Ocr, 0, 100, ""), t0);
+        tr.update_at(&p(Stage::Ocr, 2, 100, "a.jpg"), t0 + Duration::from_secs(5));
+        assert_eq!(tr.snapshot_at(t0 + Duration::from_secs(5)).eta, None);
+        tr.update_at(&p(Stage::Ocr, 3, 100, "b.jpg"), t0 + Duration::from_secs(7));
+        assert!(tr.snapshot_at(t0 + Duration::from_secs(7)).eta.is_some());
     }
 
     #[test]

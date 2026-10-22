@@ -233,18 +233,10 @@ pub async fn scan_folder(
         let reporter = Reporter::start(progress);
         let on_scan = |p: scanner::ScanProgress| {
             reporter.on(match p {
-                scanner::ScanProgress::Walked(n) => Progress {
-                    stage: Stage::Scan,
-                    done: n,
-                    total: 0,
-                    current: String::new(),
-                },
-                scanner::ScanProgress::Classified { done, total } => Progress {
-                    stage: Stage::Classify,
-                    done,
-                    total,
-                    current: String::new(),
-                },
+                scanner::ScanProgress::Walked(n) => Progress::new(Stage::Scan, n, 0, ""),
+                scanner::ScanProgress::Classified { done, total } => {
+                    Progress::new(Stage::Classify, done, total, "")
+                }
             })
         };
         let scan = scanner::scan_with(
@@ -278,12 +270,7 @@ pub async fn scan_folder(
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let rel = scanner::relative_display(&resolved.root, path);
                 if done.is_multiple_of(32) || done == total {
-                    reporter.on(Progress {
-                        stage: Stage::Merge,
-                        done,
-                        total,
-                        current: rel.clone(),
-                    });
+                    reporter.on(Progress::new(Stage::Merge, done, total, rel.clone()));
                 }
                 Some(ScanEntry {
                     path: rel,
@@ -386,12 +373,12 @@ pub async fn pack_remote(
         let (clone_url, name) = tm_core::remote::parse_remote(&url)
             .ok_or("Not a recognizable repo reference (URL or owner/repo)")?;
         let reporter = Reporter::start(progress);
-        reporter.on(Progress {
-            stage: Stage::Scan,
-            done: 0,
-            total: 0,
-            current: format!("Cloning {} (shallow)...", clone_url),
-        });
+        reporter.on(Progress::new(
+            Stage::Scan,
+            0,
+            0,
+            format!("Cloning {} (shallow)...", clone_url),
+        ));
         let checkout = tm_core::remote::clone_shallow(&clone_url, &name, pat.as_deref())?;
         if token.is_cancelled() {
             return Err(JobError::Cancelled.to_string());
@@ -776,12 +763,7 @@ mod tests {
         let t0 = Instant::now() - Duration::from_secs(70);
         let tracker = Tracker::starting_at(t0, ETA_AFTER, STALL_AFTER);
         for s in 0..=70u64 {
-            let p = Progress {
-                stage: Stage::Merge,
-                done: (s / 10) as usize,
-                total: 1000,
-                current: format!("f{s}"),
-            };
+            let p = Progress::new(Stage::Merge, (s / 10) as usize, 1000, format!("f{s}"));
             tracker.update_at(&p, t0 + Duration::from_secs(s));
         }
         let decided = AtomicBool::new(false);

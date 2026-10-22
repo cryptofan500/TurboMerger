@@ -305,6 +305,10 @@ pub struct ScanOptions {
     /// Text-from-images is on: images go to the merger for OCR instead of
     /// being recorded as photos/binary.
     pub ocr_images: bool,
+    /// With OCR on, read thumbnails, icons, figure crops of a Markdown
+    /// export and MonadDoc work folders too (they are left out by default:
+    /// `extract::non_content_picture`).
+    pub ocr_all_pictures: bool,
 }
 
 impl Default for ScanOptions {
@@ -324,6 +328,7 @@ impl Default for ScanOptions {
             protect_secrets: true,
             whole_drive: false,
             ocr_images: false,
+            ocr_all_pictures: false,
         }
     }
 }
@@ -948,14 +953,18 @@ fn classify(path: &Path, len: u64, options: &ScanOptions) -> Verdict {
             }
             return Verdict::Document;
         }
-        if is_openable_archive(&name_lower)
-            || (options.ocr_images && crate::extract::is_ocr_image(ext))
-        {
+        let picture = options.ocr_images && crate::extract::is_ocr_image(ext);
+        if is_openable_archive(&name_lower) || picture {
             if options.max_file_size != 0 && len > options.max_file_size {
                 return Verdict::Skip(
                     format!("too large ({} KB)", len / 1024),
                     SkipKind::NotCaptured,
                 );
+            }
+            if picture && !options.ocr_all_pictures {
+                if let Some(why) = crate::extract::non_content_picture(path) {
+                    return Verdict::Skip(why, SkipKind::Excluded);
+                }
             }
             return Verdict::Document;
         }

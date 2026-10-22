@@ -33,6 +33,7 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 similar.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 tiktoken-rs.workspace = true
 toml.workspace = true
@@ -51,7 +52,9 @@ unicode-normalization.workspace = true
 [target.'cfg(windows)'.dependencies]
 # Win32_Foundation: GetFinalPathNameByHandleW (apply-back post-open verification)
 # Win32_System_Threading: SetThreadPriority for the worker pool (threads.rs)
-windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
+# Win32_Security + Win32_System_JobObjects: an OCR engine and its children end
+# with this process (extract/child.rs)
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
 # O_NONBLOCK for apply-back reads (a FIFO swapped in must not hang the preview);

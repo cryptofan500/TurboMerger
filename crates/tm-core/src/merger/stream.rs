@@ -3,8 +3,10 @@
 //! default), gzip-compressed text, and the text members of zip and tar
 //! archives. A source is decoded with a streaming decoder (a multi-byte
 //! character split across two reads stays whole), cut into segments of at
-//! most `SEGMENT_BYTES` at line ends, and every segment is redacted, counted
-//! and spooled before the next one is read. The first segment of a file
+//! most `SEGMENT_BYTES` at line ends, and segments are redacted and counted
+//! a few at a time side by side (P9: counting is the slow part), then spooled
+//! in order before more is read, so memory stays at a few segments whatever
+//! the size. The first segment of a file
 //! carries its path; later ones are labelled continuations that the
 //! token-budget splitter can place in later parts.
 
@@ -17,9 +19,9 @@ use encoding_rs::{CoderResult, Decoder, Encoding};
 
 use super::{Block, MergeConfig};
 
-/// Plain files above this are streamed one at a time instead of being read
-/// whole in the parallel path. It equals the chunker's byte budget, so such a
-/// file is always a chunk of its own.
+/// Plain files above this are streamed (in order, by the merge's own thread,
+/// while the workers go on with the files after it) instead of being read
+/// whole.
 pub(super) const STREAM_ABOVE: u64 = 64 << 20;
 /// Gzip files that inflate (per their trailer) to more than this are
 /// streamed; smaller ones are inflated inline in the parallel path.
@@ -164,10 +166,11 @@ fn stream_text<R: Read>(
     let mut part = 0usize;
     let mut consumed = probe.len() as u64;
     let mut replaced = decode_into(&mut decoder, &probe[bom_len..], &mut pending, false);
-    let seg = Segmenter {
+    let mut seg = Segmenter {
         label,
         member,
         lang,
+        batch: Vec::new(),
     };
     let mut buf = vec![0u8; READ_STEP];
     loop {
@@ -211,18 +214,23 @@ fn stream_text<R: Read>(
     Ok(())
 }
 
-/// Labels and language shared by every segment of one stream.
+/// Labels and language shared by every segment of one stream, and the cut
+/// segments not yet emitted.
 struct Segmenter<'a> {
     label: &'a str,
     member: bool,
     lang: &'a str,
+    /// `(text, part)`: cut, waiting to be slimmed, redacted and counted
+    /// together with the next ones.
+    batch: Vec<(String, usize)>,
 }
 
 impl Segmenter<'_> {
     /// Emit every full segment in `pending` (and the remainder when `last`),
-    /// cut at the last line end inside the segment budget.
+    /// cut at the last line end inside the segment budget. Segments are
+    /// processed [`parallel_segments`] at a time and emitted in order.
     fn emit_ready(
-        &self,
+        &mut self,
         pending: &mut String,
         last: bool,
         part: &mut usize,
@@ -246,18 +254,106 @@ impl Segmenter<'_> {
             let rest = pending.split_off(cut);
             let segment = std::mem::replace(pending, rest);
             *part += 1;
+            self.batch.push((segment, *part));
+            if self.batch.len() >= parallel_segments() {
+                self.flush(cfg, sink, out)?;
+            }
+        }
+        if last {
+            self.flush(cfg, sink, out)?;
+        }
+        Ok(())
+    }
+
+    /// Slim, redact and count the cut segments side by side, then emit them
+    /// in order. Counting tokens is the slow part of a big text file (about
+    /// 13 MB/s on one core), and segments are independent. Plain threads,
+    /// not the worker pool: the merge's workers may all be waiting for this
+    /// very file to be written.
+    fn flush(
+        &mut self,
+        cfg: &MergeConfig,
+        sink: &mut Sink,
+        out: &mut Streamed,
+    ) -> Result<(), String> {
+        let batch = std::mem::take(&mut self.batch);
+        let ready: Vec<(Prepared, usize)> = if batch.len() == 1 {
+            batch
+                .into_iter()
+                .map(|(text, part)| (prepare_segment(text, cfg), part))
+                .collect()
+        } else {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = batch
+                    .into_iter()
+                    .map(|(text, part)| {
+                        s.spawn(move || {
+                            crate::threads::lower_current_thread_priority();
+                            (prepare_segment(text, cfg), part)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                    .collect()
+            })
+        };
+        for (prepared, part) in ready {
             emit_segment(
-                segment,
+                prepared,
                 self.label,
                 self.member,
-                *part,
+                part,
                 self.lang,
-                cfg,
                 sink,
                 out,
             )?;
         }
         Ok(())
+    }
+}
+
+/// Segments processed at once: the worker pool's size (`--threads`), at
+/// most 8 (8 x 16 MiB of text in memory).
+fn parallel_segments() -> usize {
+    rayon::current_num_threads().clamp(1, 8)
+}
+
+/// A segment ready to emit: its text after slimming and redaction, what was
+/// redacted, the labeled secrets it held, and its token count.
+struct Prepared {
+    text: String,
+    redactions: Vec<(&'static str, usize)>,
+    harvested: Vec<String>,
+    tokens: usize,
+}
+
+fn prepare_segment(mut text: String, cfg: &MergeConfig) -> Prepared {
+    if cfg.reproducible && text.contains('\r') {
+        text = text.replace("\r\n", "\n");
+    }
+    if cfg.truncate_base64 {
+        text = super::process::truncate_base64(&text);
+    }
+    if cfg.remove_empty_lines {
+        text = super::process::drop_empty_lines(&text);
+    }
+    let mut harvested = Vec::new();
+    let redactions = if cfg.redact {
+        harvested = crate::security::harvest_labeled_values(&text);
+        let (clean, events) = crate::security::redact_secrets(&text);
+        text = clean;
+        events.into_iter().map(|ev| (ev.rule, ev.count)).collect()
+    } else {
+        Vec::new()
+    };
+    let tokens = crate::cache::count(&text);
+    Prepared {
+        text,
+        redactions,
+        harvested,
+        tokens,
     }
 }
 
@@ -318,37 +414,23 @@ fn read_some<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-/// Slim, redact, count and emit one segment.
-#[allow(clippy::too_many_arguments)]
+/// Emit one prepared segment.
 fn emit_segment(
-    mut text: String,
+    prepared: Prepared,
     label: &str,
     member: bool,
     part: usize,
     lang: &str,
-    cfg: &MergeConfig,
     sink: &mut Sink,
     out: &mut Streamed,
 ) -> Result<(), String> {
-    if cfg.reproducible && text.contains('\r') {
-        text = text.replace("\r\n", "\n");
-    }
-    if cfg.truncate_base64 {
-        text = super::process::truncate_base64(&text);
-    }
-    if cfg.remove_empty_lines {
-        text = super::process::drop_empty_lines(&text);
-    }
-    let redactions = if cfg.redact {
-        out.harvested
-            .extend(crate::security::harvest_labeled_values(&text));
-        let (clean, events) = crate::security::redact_secrets(&text);
-        text = clean;
-        events.into_iter().map(|ev| (ev.rule, ev.count)).collect()
-    } else {
-        Vec::new()
-    };
-    let tokens = crate::cache::count(&text);
+    let Prepared {
+        text,
+        redactions,
+        harvested,
+        tokens,
+    } = prepared;
+    out.harvested.extend(harvested);
     let relative = if part == 1 {
         label.to_string()
     } else {

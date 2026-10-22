@@ -50,6 +50,8 @@ similar = "3"
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+# OCR cache keys: the SHA-256 of a picture's bytes (P7).
+sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "io-std", "sync", "time"] }
 tiktoken-rs = "0.12"

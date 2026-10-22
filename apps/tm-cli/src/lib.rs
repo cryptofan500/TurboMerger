@@ -167,6 +167,11 @@ pub struct ScanArgs {
     /// `monaddoc`). Slow; off by default.
     #[arg(long)]
     pub extract_images_text: bool,
+    /// With --extract-images-text, also read thumbnails and icons (longest side
+    /// up to 320 px), figure crops beside their Markdown (NAME_assets/) and
+    /// MonadDoc work folders, which are left out by default
+    #[arg(long, requires = "extract_images_text")]
+    pub ocr_all_pictures: bool,
     /// Mask secrets (API keys, tokens, private keys, passwords) and leave
     /// credential files (.env, key material, credential dumps) out. Off by
     /// default: every text file is taken as it is
@@ -455,6 +460,7 @@ fn merge_options(src_root: String, scan: &ScanArgs) -> MergeOptions {
     o.max_file_size_mb = scan.max_file_size;
     o.hydrate = scan.hydrate;
     o.extract_images_text = scan.extract_images_text;
+    o.ocr_all_pictures = scan.ocr_all_pictures;
     o.redact_secrets = scan.redact && !scan.no_redact;
     o.allow_system_paths = scan.allow_system_paths;
     o

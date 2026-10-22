@@ -11,6 +11,7 @@
 //! in-memory pipeline's (tests/golden.rs).
 
 mod git;
+mod pipeline;
 mod process;
 mod render;
 mod spool;
@@ -20,20 +21,62 @@ use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrd};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrd};
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use rayon::prelude::*;
 
 use crate::scanner::{SkipEntry, SkipKind};
 use crate::tokens;
+use pipeline::{Ended, Flow, Next};
 use render::RenderCtx;
 use spool::{Span, Spool};
 
-/// At most this many files, or this many bytes on disk, are processed (and
-/// held) at once.
+/// The masking passes read the spool back at most this many blocks, or
+/// this many bytes of text, at a time.
 const CHUNK_FILES: usize = 64;
 const CHUNK_BYTES: u64 = 64 << 20;
+
+/// Weight in flight while merging (`TURBOMERGER_INFLIGHT_MB` overrides it):
+/// bytes of files being read or waiting to be written, a document counted
+/// [`DOC_WEIGHT`] times (a PDF parse holds several times the file).
+const INFLIGHT_BYTES: u64 = 256 << 20;
+const DOC_WEIGHT: u64 = 4;
+/// How far ahead of the file being written the workers may run.
+const WINDOW_FILES: usize = 1024;
+
+fn pipeline_limits() -> pipeline::Limits {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    let budget = *BUDGET.get_or_init(|| {
+        std::env::var("TURBOMERGER_INFLIGHT_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&mb| mb > 0)
+            .map_or(INFLIGHT_BYTES, |mb| mb << 20)
+    });
+    pipeline::Limits {
+        budget,
+        window: WINDOW_FILES,
+    }
+}
+
+/// A file's share of the in-flight budget: its size, several times over
+/// for a document, nothing for one the merge streams itself.
+fn work_weight(path: &Path, len: u64) -> u64 {
+    let doc = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| crate::extract::DocKind::from_ext(&e).is_some());
+    if doc {
+        len.saturating_mul(DOC_WEIGHT)
+    } else if process::needs_streaming(path) {
+        0
+    } else {
+        len
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -170,6 +213,27 @@ pub struct MergeCtl<'a> {
     pub cancel: &'a AtomicBool,
     /// Stop taking new files, then write what is done.
     pub finish: Option<&'a AtomicBool>,
+    /// Live figures a front end can read while the merge runs.
+    pub watch: Option<&'a MergeWatch>,
+    /// The OCR stage's progress: pages read, pages in all, and what is
+    /// being read (or why nothing is, e.g. "waiting for memory").
+    pub on_ocr: Option<&'a OcrCallback<'a>>,
+}
+
+/// `(pages read, pages in all, what is being read)`.
+pub type OcrCallback<'a> = dyn Fn(usize, usize, &str) + Sync + 'a;
+
+/// What a merge reports besides its per-file callback: bytes for an ETA
+/// that weighs files by size, and the OCR time still to come.
+#[derive(Debug, Default)]
+pub struct MergeWatch {
+    /// Input bytes of the files finished so far.
+    pub bytes_done: AtomicU64,
+    /// Input bytes of every file to merge.
+    pub bytes_total: AtomicU64,
+    /// Seconds the OCR stage will take for the pictures queued so far, at
+    /// this machine's last measured speed.
+    pub ocr_secs: AtomicU64,
 }
 
 /// The merge stopped because its cancel flag was set; nothing was written.
@@ -218,6 +282,8 @@ where
     let ctl = MergeCtl {
         cancel: cancel_flag,
         finish: None,
+        watch: None,
+        on_ocr: None,
     };
     merge_files_ctl(root, files, output, cfg, ctl, progress_callback, scan_skips)
 }
@@ -260,7 +326,6 @@ where
     let mut spool = Spool::new_near(output)?;
     let mut blocks: Vec<Block> = Vec::with_capacity(total_files);
     let mut merge_skips: Vec<SkipEntry> = Vec::new();
-    let mut done = 0usize;
 
     // Labeled secret values harvested from every read file — INCLUDING
     // credential-dense files that are then excluded — for repo-wide
@@ -271,82 +336,99 @@ where
     let mut known_secrets: BTreeSet<String> = BTreeSet::new();
     let mut dense_candidates: BTreeSet<String> = BTreeSet::new();
 
-    // Process in parallel, a bounded chunk at a time; each chunk's texts go
-    // to the spool in order before the next chunk is read.
+    // Pictures, and the pages of PDFs that have no text layer, wait for one
+    // OCR stage after the text (P7): each distinct picture is read once, in
+    // batches, and remembered across runs.
+    let ocr = cfg
+        .extract_images_text
+        .then(|| crate::extract::OcrQueue::new(None));
+    let mut waiting: Vec<(usize, crate::extract::OcrWait)> = Vec::new();
+
+    // Sizes up front: the scheduler's weights and the byte-weighted ETA.
+    let lens: Vec<u64> = crate::threads::on_pool(|| {
+        ordered
+            .par_iter()
+            .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .collect()
+    });
+    let weights: Vec<u64> = crate::threads::on_pool(|| {
+        ordered
+            .par_iter()
+            .zip(lens.par_iter())
+            .map(|(p, &len)| work_weight(p, len))
+            .collect()
+    });
+    let watch = ctl.watch;
+    if let Some(w) = watch {
+        w.bytes_total.store(lens.iter().sum(), AtomicOrd::Relaxed);
+        w.bytes_done.store(0, AtomicOrd::Relaxed);
+    }
+    let ocr_still = |w: &MergeWatch| {
+        if let Some(q) = &ocr {
+            w.ocr_secs.store(q.pending().1 as u64, AtomicOrd::Relaxed);
+        }
+    };
+
+    // Every worker takes the next file as soon as it is free; results are
+    // written in order (pipeline.rs), so no chunk waits for its slowest file.
+    let work = |i: usize| -> process::Processed {
+        if cancelled(cancel_flag) {
+            return process::Processed::empty(false);
+        }
+        let p = process::process_file(ordered[i], root, cfg, cancel_flag, ocr.as_ref());
+        if let (Some(w), false) = (watch, p.stream) {
+            w.bytes_done.fetch_add(lens[i], AtomicOrd::Relaxed);
+        }
+        p
+    };
+    let flow = || {
+        if cancelled(cancel_flag) {
+            Flow::Cancel
+        } else if finishing() {
+            Flow::Finish
+        } else {
+            Flow::Go
+        }
+    };
+    let mut done = 0usize;
     let mut partial = false;
-    for chunk in chunk_by_size(&ordered) {
-        if cancelled(cancel_flag) {
-            return Err(Cancelled.into());
-        }
-        if partial || finishing() {
-            // Finishing early: what is left is reported, never dropped.
-            partial = true;
-            for path in chunk {
-                done += 1;
-                let rel = relative_display(root, path);
-                progress_callback(done, total_files, &rel);
-                merge_skips.push(SkipEntry::new(
-                    rel,
-                    "not processed — the run was finished early (deadline)",
-                    SkipKind::NotCaptured,
-                ));
-            }
-            continue;
-        }
-        // Say which chunk is in flight: a stall report can then name a file.
-        let first = chunk
-            .first()
-            .map(|p| relative_display(root, p))
-            .unwrap_or_default();
-        progress_callback(done, total_files, &first);
-        // Count files as they finish (in any order) and report every 250 ms,
-        // so a slow chunk — 64 big PDFs — still moves the progress and the
-        // ETA. A fast chunk returns at once: the wait ends on its result.
-        let finished = AtomicUsize::new(0);
-        let processed: Vec<process::Processed> = std::thread::scope(|s| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let (chunk, finished) = (&chunk, &finished);
-            s.spawn(move || {
-                // On the pool even when the chunk is one big file: rayon
-                // would run a one-item chunk on this normal-priority thread.
-                let out: Vec<process::Processed> = crate::threads::on_pool(|| {
-                    chunk
-                        .par_iter()
-                        .map(|path| {
-                            let p = if cancelled(cancel_flag) {
-                                process::Processed {
-                                    result: Err((String::new(), String::new(), SkipKind::Excluded)),
-                                    harvested: Vec::new(),
-                                    dense: Vec::new(),
-                                    stream: false,
-                                }
-                            } else {
-                                process::process_file(path, root, cfg)
-                            };
-                            finished.fetch_add(1, AtomicOrd::Relaxed);
-                            p
-                        })
-                        .collect()
-                });
-                let _ = tx.send(out);
-            });
-            loop {
-                match rx.recv_timeout(std::time::Duration::from_millis(250)) {
-                    Ok(out) => break out,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => progress_callback(
-                        done + finished.load(AtomicOrd::Relaxed),
-                        total_files,
-                        &first,
-                    ),
-                    // The worker panicked: the scope re-raises it on exit.
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Vec::new(),
+    progress_callback(0, total_files, "");
+    let ended = pipeline::ordered(
+        total_files,
+        pipeline_limits(),
+        &|i| weights[i],
+        &work,
+        &flow,
+        &mut |next| -> Result<()> {
+            let (i, p) = match next {
+                Next::Waiting { finished, oldest } => {
+                    // The stall line names the file the merge waits on
+                    // longest, not the first of a batch.
+                    let current = oldest
+                        .map(|o| relative_display(root, ordered[o]))
+                        .unwrap_or_default();
+                    progress_callback(finished.max(done), total_files, &current);
+                    if let Some(w) = watch {
+                        ocr_still(w);
+                    }
+                    return Ok(());
                 }
-            }
-        });
-        if cancelled(cancel_flag) {
-            return Err(Cancelled.into());
-        }
-        for (path, p) in chunk.iter().zip(processed) {
+                Next::Skipped(i) => {
+                    // Finishing early: what is left is reported, never dropped.
+                    partial = true;
+                    done += 1;
+                    let rel = relative_display(root, ordered[i]);
+                    progress_callback(done, total_files, &rel);
+                    merge_skips.push(SkipEntry::new(
+                        rel,
+                        "not processed — the run was finished early (deadline)",
+                        SkipKind::NotCaptured,
+                    ));
+                    return Ok(());
+                }
+                Next::Item(i, p) => (i, p),
+            };
+            let path = ordered[i];
             known_secrets.extend(p.harvested);
             dense_candidates.extend(p.dense);
             done += 1;
@@ -354,6 +436,7 @@ where
                 // Archives, big gzip and files past `STREAM_ABOVE`: segment by
                 // segment straight into the spool, in this file's place in
                 // the order, so no size is too big and memory stays bounded.
+                // The workers keep going on the files after it meanwhile.
                 let rel = relative_display(root, path);
                 let rel = if cfg.reproducible { nfc(&rel) } else { rel };
                 let first = blocks.len();
@@ -377,6 +460,9 @@ where
                     };
                     stream::stream_source(path, &rel, stream::container_of(&rel), cfg, &mut sink)
                 };
+                if let Some(w) = watch {
+                    w.bytes_done.fetch_add(lens[i], AtomicOrd::Relaxed);
+                }
                 progress_callback(done, total_files, &rel);
                 match streamed {
                     Ok(out) => {
@@ -396,7 +482,7 @@ where
                         merge_skips.push(SkipEntry::new(rel, reason, kind));
                     }
                 }
-                continue;
+                return Ok(());
             }
             match p.result {
                 Ok((mut b, content)) => {
@@ -404,8 +490,21 @@ where
                         b.relative = nfc(&b.relative);
                     }
                     progress_callback(done, total_files, &b.relative);
-                    b.span = spool.append(&content)?;
-                    blocks.push(b);
+                    match p.wait {
+                        // Its place in the order is kept; the text comes after
+                        // the OCR stage.
+                        Some(wait) => {
+                            blocks.push(b);
+                            waiting.push((blocks.len() - 1, wait));
+                            if let Some(w) = watch {
+                                ocr_still(w);
+                            }
+                        }
+                        None => {
+                            b.span = spool.append(&content)?;
+                            blocks.push(b);
+                        }
+                    }
                 }
                 Err((rel, reason, kind)) => {
                     let rel = if cfg.reproducible { nfc(&rel) } else { rel };
@@ -413,6 +512,52 @@ where
                     merge_skips.push(SkipEntry::new(rel, reason, kind));
                 }
             }
+            Ok(())
+        },
+    )?;
+    if ended == Ended::Cancelled || cancelled(cancel_flag) {
+        return Err(Cancelled.into());
+    }
+
+    // The OCR stage: every picture the text merge queued, a batch per engine
+    // start; then the documents that waited get their text, in their place.
+    if let (Some(queue), false) = (&ocr, waiting.is_empty()) {
+        let mut report = |p: crate::extract::OcrProgress| {
+            if let Some(on_ocr) = ctl.on_ocr {
+                on_ocr(p.done, p.total, &p.current);
+            }
+        };
+        if queue.run(cancel_flag, ctl.finish, &mut report).is_err() {
+            return Err(Cancelled.into());
+        }
+        if let Some(w) = watch {
+            w.ocr_secs.store(0, AtomicOrd::Relaxed);
+        }
+        let mut gone = vec![false; blocks.len()];
+        for (bi, wait) in waiting.drain(..) {
+            let relative = blocks[bi].relative.clone();
+            let (result, harvested) = process::finish_waiting(relative, wait, queue, cfg);
+            known_secrets.extend(harvested);
+            match result {
+                Ok((mut b, content)) => {
+                    b.span = spool.append(&content)?;
+                    blocks[bi] = b;
+                }
+                Err((rel, reason, kind)) => {
+                    if reason.contains(crate::extract::OCR_FINISHED_EARLY) {
+                        partial = true;
+                    }
+                    gone[bi] = true;
+                    merge_skips.push(SkipEntry::new(rel, reason, kind));
+                }
+            }
+        }
+        if gone.contains(&true) {
+            let mut k = 0;
+            blocks.retain(|_| {
+                k += 1;
+                !gone[k - 1]
+            });
         }
     }
 
@@ -592,27 +737,6 @@ where
     }
 
     Ok(outcome)
-}
-
-/// Consecutive runs of at most `CHUNK_FILES` files and `CHUNK_BYTES` bytes
-/// (a single larger file is a chunk of its own).
-fn chunk_by_size<'a>(files: &[&'a PathBuf]) -> Vec<Vec<&'a PathBuf>> {
-    let mut chunks = Vec::new();
-    let mut cur: Vec<&PathBuf> = Vec::new();
-    let mut bytes = 0u64;
-    for &f in files {
-        let len = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
-        if !cur.is_empty() && (cur.len() >= CHUNK_FILES || bytes + len > CHUNK_BYTES) {
-            chunks.push(std::mem::take(&mut cur));
-            bytes = 0;
-        }
-        cur.push(f);
-        bytes += len;
-    }
-    if !cur.is_empty() {
-        chunks.push(cur);
-    }
-    chunks
 }
 
 /// Blocks in consecutive runs whose texts total at most `CHUNK_BYTES`.
@@ -961,20 +1085,6 @@ mod tests {
             Ordering::from_str_lenient("important-last"),
             Ordering::ImportantLast
         );
-    }
-
-    #[test]
-    fn chunks_respect_file_and_byte_bounds() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut paths = Vec::new();
-        for i in 0..150 {
-            let p = dir.path().join(format!("f{i:03}.txt"));
-            std::fs::write(&p, "x").unwrap();
-            paths.push(p);
-        }
-        let refs: Vec<&PathBuf> = paths.iter().collect();
-        let sizes: Vec<usize> = chunk_by_size(&refs).iter().map(Vec::len).collect();
-        assert_eq!(sizes, vec![64, 64, 22]);
     }
 
     #[test]

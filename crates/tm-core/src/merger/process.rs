@@ -3,11 +3,13 @@
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
 use super::{relative_display, Block, MergeConfig, MergeSkip};
+use crate::extract::{OcrQueue, OcrWait};
 use crate::scanner::SkipKind;
 
 static BASE64_RUN: LazyLock<Regex> =
@@ -24,13 +26,37 @@ pub(super) struct Processed {
     /// The file must take the sequential streaming path instead (archives,
     /// big gzip, plain files past `STREAM_ABOVE`); `result` is unused then.
     pub(super) stream: bool,
+    /// Pages waiting for the merge's OCR stage: `result` holds the block to
+    /// keep its place in the order; [`finish_waiting`] completes it.
+    pub(super) wait: Option<OcrWait>,
+}
+
+impl Processed {
+    /// Nothing to merge here (a cancelled run, or a file for the streaming path).
+    pub(super) fn empty(stream: bool) -> Processed {
+        Processed {
+            result: Err((String::new(), String::new(), SkipKind::Excluded)),
+            harvested: Vec::new(),
+            dense: Vec::new(),
+            stream,
+            wait: None,
+        }
+    }
 }
 
 /// Read + decode + slim + redact + token-count a single already-vetted file.
 /// Also returns the secrets harvested from the decoded text — harvested
 /// BEFORE the credential-density exclusion, so an excluded credential file
-/// still teaches the propagation pass its values.
-pub(super) fn process_file(path: &Path, root: &Path, cfg: &MergeConfig) -> Processed {
+/// still teaches the propagation pass its values. `cancel` stops an OCR
+/// engine still reading this file; with `ocr`, pictures (and the scanned
+/// pages of PDFs) are queued for the merge's OCR stage instead.
+pub(super) fn process_file(
+    path: &Path,
+    root: &Path,
+    cfg: &MergeConfig,
+    cancel: &AtomicBool,
+    ocr: Option<&OcrQueue>,
+) -> Processed {
     // Test hook, debug builds only: make every file slow so the deadline,
     // partial-output and stall paths can be exercised end to end.
     #[cfg(debug_assertions)]
@@ -42,12 +68,8 @@ pub(super) fn process_file(path: &Path, root: &Path, cfg: &MergeConfig) -> Proce
     }
     let mut harvested: Vec<String> = Vec::new();
     let mut dense: Vec<String> = Vec::new();
-    let streamed = || Processed {
-        result: Err((String::new(), String::new(), SkipKind::Excluded)),
-        harvested: Vec::new(),
-        dense: Vec::new(),
-        stream: true,
-    };
+    let mut wait = None;
+    let streamed = || Processed::empty(true);
     if needs_streaming(path) {
         return streamed();
     }
@@ -78,20 +100,39 @@ pub(super) fn process_file(path: &Path, root: &Path, cfg: &MergeConfig) -> Proce
             Err(e) => Err((relative, e, SkipKind::NotCaptured)),
         }
     } else {
-        process_file_inner(path, root, cfg, &mut harvested, &mut dense)
+        let mut ctx = Inner {
+            cfg,
+            harvested: &mut harvested,
+            dense: &mut dense,
+            cancel,
+            ocr,
+            wait: &mut wait,
+        };
+        process_file_inner(path, root, &mut ctx)
     };
     Processed {
         result,
         harvested,
         dense,
         stream: false,
+        wait,
     }
+}
+
+/// What one file's processing reads and fills in.
+struct Inner<'a> {
+    cfg: &'a MergeConfig,
+    harvested: &'a mut Vec<String>,
+    dense: &'a mut Vec<String>,
+    cancel: &'a AtomicBool,
+    ocr: Option<&'a OcrQueue>,
+    wait: &'a mut Option<OcrWait>,
 }
 
 /// Archives, gzip that inflates past `GZIP_INLINE_MAX`, and plain files past
 /// `STREAM_ABOVE` take the sequential streaming path (`merger::stream`), so
 /// no file is too big to merge and memory stays bounded.
-fn needs_streaming(path: &Path) -> bool {
+pub(super) fn needs_streaming(path: &Path) -> bool {
     use super::stream::{
         container_of, gzip_inflated_size, Container, GZIP_INLINE_MAX, STREAM_ABOVE,
     };
@@ -128,11 +169,10 @@ fn inflate_limited(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
 fn process_file_inner(
     path: &Path,
     root: &Path,
-    cfg: &MergeConfig,
-    harvested: &mut Vec<String>,
-    dense: &mut Vec<String>,
+    ctx: &mut Inner<'_>,
 ) -> std::result::Result<(Block, String), MergeSkip> {
     let relative = relative_display(root, path);
+    let cfg = ctx.cfg;
 
     // Documents (PDF, Office, e-book) have their text extracted (Phase 3,
     // ADR 0005) rather than being read as raw bytes — the binary sniff below
@@ -145,7 +185,7 @@ fn process_file_inner(
         .as_deref()
         .and_then(crate::extract::DocKind::from_ext)
     {
-        return process_document(path, relative, kind, cfg, harvested);
+        return process_document(path, relative, kind, ctx);
     }
     // Text inside images, when text-from-images is on (the scanner routes
     // images here only then).
@@ -155,14 +195,9 @@ fn process_file_inner(
             .and_then(|e| e.to_str())
             .is_some_and(|e| crate::extract::is_ocr_image(&e.to_ascii_lowercase()))
     {
-        return process_document(
-            path,
-            relative,
-            crate::extract::DocKind::Image,
-            cfg,
-            harvested,
-        );
+        return process_document(path, relative, crate::extract::DocKind::Image, ctx);
     }
+    let (harvested, dense) = (&mut *ctx.harvested, &mut *ctx.dense);
 
     let file = File::open(path).map_err(|e| {
         (
@@ -342,16 +377,68 @@ fn process_document(
     path: &Path,
     relative: String,
     kind: crate::extract::DocKind,
+    ctx: &mut Inner<'_>,
+) -> std::result::Result<(Block, String), MergeSkip> {
+    use crate::extract::{DocKind, Queued};
+    let queued = match ctx.ocr {
+        Some(queue) if matches!(kind, DocKind::Pdf | DocKind::Image) => {
+            crate::extract::extract_queued(path, kind, queue, &relative)
+        }
+        _ => {
+            let opts = crate::extract::ExtractOptions {
+                ocr: ctx.cfg.extract_images_text,
+                ocr_cmd: None,
+                cancel: Some(ctx.cancel),
+            };
+            crate::extract::extract(path, kind, &opts).map(Queued::Done)
+        }
+    }
+    .map_err(|e| (relative.clone(), e, SkipKind::NotCaptured))?;
+    match queued {
+        Queued::Done(extracted) => Ok(document_block(relative, extracted, ctx.cfg, ctx.harvested)),
+        Queued::Waiting(wait) => {
+            *ctx.wait = Some(wait);
+            // Keeps the file's place in the order until the OCR stage.
+            Ok((
+                Block {
+                    relative,
+                    span: Default::default(),
+                    lang: String::new(),
+                    tokens: 0,
+                    utf8_note: None,
+                    redactions: Vec::new(),
+                    compressed: false,
+                    synthetic: false,
+                },
+                String::new(),
+            ))
+        }
+    }
+}
+
+/// A document whose pages waited for the OCR stage, completed: its block and
+/// text, or why it is not captured. Returns the secrets harvested from it.
+pub(super) fn finish_waiting(
+    relative: String,
+    wait: OcrWait,
+    queue: &OcrQueue,
+    cfg: &MergeConfig,
+) -> (std::result::Result<(Block, String), MergeSkip>, Vec<String>) {
+    let mut harvested = Vec::new();
+    let result = match crate::extract::finish_queued(wait, queue) {
+        Ok(extracted) => Ok(document_block(relative, extracted, cfg, &mut harvested)),
+        Err(e) => Err((relative, e, SkipKind::NotCaptured)),
+    };
+    (result, harvested)
+}
+
+/// An extracted document's block: redacted (when on) and counted.
+fn document_block(
+    relative: String,
+    extracted: crate::extract::Extracted,
     cfg: &MergeConfig,
     harvested: &mut Vec<String>,
-) -> std::result::Result<(Block, String), MergeSkip> {
-    let opts = crate::extract::ExtractOptions {
-        ocr: cfg.extract_images_text,
-        ocr_cmd: None,
-    };
-    let extracted = crate::extract::extract(path, kind, &opts)
-        .map_err(|e| (relative.clone(), e, SkipKind::NotCaptured))?;
-
+) -> (Block, String) {
     let mut content = extracted.text;
     if cfg.reproducible && content.contains('\r') {
         content = content.replace("\r\n", "\n");
@@ -368,7 +455,7 @@ fn process_document(
 
     let tokens = crate::cache::count(&content);
 
-    Ok((
+    (
         Block {
             relative,
             span: Default::default(),
@@ -381,7 +468,7 @@ fn process_document(
             synthetic: false,
         },
         content,
-    ))
+    )
 }
 
 /// Decode raw file bytes to a String: BOM → strict UTF-8 → chardetng-guessed

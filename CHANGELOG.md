@@ -49,6 +49,39 @@ Changed:
 - Hidden files, `.env` included, stay out by default and are recorded
   (`--include-hidden`).
 
+### OCR as a stage, and speed (2026-10-22)
+
+Added:
+- **OCR runs as its own stage, after the text.** Pictures and scanned PDF pages
+  are queued while the text merges, then read in batches of up to 64 pages per
+  OCR-engine start (the models load once per batch, not once per picture).
+  Progress counts pages; the line says what is read, or why nothing is
+  ("waiting for memory: … — close other programs, or Cancel").
+- **Each distinct picture is read once**, by the SHA-256 of its bytes: copies,
+  and scanned PDF pages made from the same photos (a page holding one JPEG is
+  read through that JPEG's own bytes), share one reading.
+- **OCR results are kept** in `<user cache>/turbomerger/ocr-v1/`
+  (`TURBOMERGER_OCR_CACHE` moves it, `off` turns it off): a second run reads
+  nothing it read before, and a cancel loses at most the batch in flight.
+- With OCR on, pictures that are not pages are left out and listed:
+  thumbnails and icons (longest side ≤ 320 px), figure crops beside their
+  Markdown (`NAME_assets/` next to `NAME….md`), MonadDoc work folders.
+  `--ocr-all-pictures` reads them too.
+- Cancel stops a running OCR engine and everything it started at once
+  (process group / Job Object), and no engine outlives TurboMerger.
+
+Changed:
+- **No more chunk barriers.** Workers take the next file as soon as they are
+  free, under a memory budget (`TURBOMERGER_INFLIGHT_MB`, default 256; documents
+  count four times their size); results are still written in order, byte for
+  byte as before. arXiv folder (120 PDFs): 6.7 s → 6.0 s, CPU 746 % → 864 %.
+- **Big text files count tokens on several threads**: one 507 MB text file
+  38.5 s → 11.7 s (CPU 96 % → 541 %), same output.
+- The ETA weighs files by size (bytes), adds the OCR time still to come, waits
+  for three finished items of a stage, and the finish time names the day when
+  it is not today. A ± as wide as half the estimate shows as "(rough)". The
+  stall line names the file the merge is actually waiting on.
+
 Fixed:
 - A PDF that needed more memory than was left killed the whole run with no
   output (a 450 MB scan needs about 2.8 GB); now it is parsed in the worker or

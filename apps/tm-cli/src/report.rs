@@ -67,6 +67,7 @@ fn stage_word(s: Stage) -> &'static str {
         Stage::Scan => "scan",
         Stage::Classify => "classify",
         Stage::Merge => "merge",
+        Stage::Ocr => "ocr",
     }
 }
 
@@ -110,15 +111,23 @@ fn serde_json_lite(event: &str, s: &Snapshot) -> String {
 fn status_line(s: &Snapshot) -> String {
     let mut line = format!("[{}] ", stage_word(s.stage));
     if s.total > 0 {
-        line.push_str(&format!("{}/{} files", s.done, s.total));
+        let unit = if s.stage == Stage::Ocr {
+            "pages"
+        } else {
+            "files"
+        };
+        line.push_str(&format!("{}/{} {unit}", s.done, s.total));
     } else {
         line.push_str(&format!("{} entries", s.done));
     }
     line.push_str(&format!(" · {}", human_duration(s.elapsed)));
     if let Some(eta) = s.eta {
         line.push_str(&format!(" · ETA {}", human_duration(eta)));
-        if let Some(b) = s.eta_band.filter(|b| b.as_secs() >= 1) {
-            line.push_str(&format!(" ± {}", human_duration(b)));
+        // A band as wide as half the estimate says "no idea yet", not ±.
+        match s.eta_band.filter(|b| b.as_secs() >= 1) {
+            Some(b) if b * 2 >= eta => line.push_str(" (rough)"),
+            Some(b) => line.push_str(&format!(" ± {}", human_duration(b))),
+            None => {}
         }
     }
     if !s.current.is_empty() {

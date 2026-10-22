@@ -319,6 +319,7 @@ fn progress_param(token: rmcp::model::ProgressToken, p: &Progress) -> ProgressNo
         Stage::Scan => format!("scanning ({} entries)", p.done),
         Stage::Classify => "classifying files".to_string(),
         Stage::Merge => format!("merging {}", p.current),
+        Stage::Ocr => format!("reading text from pictures (OCR) {}", p.current),
     };
     let mut param = ProgressNotificationParam::new(token, p.done as f64).with_message(what);
     if p.total > 0 {

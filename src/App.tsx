@@ -29,7 +29,7 @@ interface MergeResult {
 
 /** One progress report from a running job (tm_core::progress snapshot). */
 interface JobProgress {
-  stage: "scan" | "classify" | "merge";
+  stage: "scan" | "classify" | "merge" | "ocr";
   done: number;
   /** 0 while unknown. */
   total: number;
@@ -44,14 +44,22 @@ interface JobProgress {
   ask_long_run: boolean;
 }
 
-/** The open "proceed or cancel?" question: what was known when it was asked. */
+/** The open "proceed or cancel?" question. It shows the live estimate (one
+ * number on screen, not a stale one beside a fresh one); `elapsedMs` is when
+ * it was asked, for the "still counting files" case. */
 interface LongRunQuestion {
-  /** Time left then; null while files were still being counted. */
-  etaMs: number | null;
   elapsedMs: number;
-  /** Local clock time of the expected finish, e.g. "14:05". */
-  finish: string | null;
 }
+
+/** Local clock time `ms` from now: "14:05" today, "Thu 01:00" on another day. */
+const finishClock = (ms: number) => {
+  const now = new Date();
+  const at = new Date(now.getTime() + ms);
+  const time = at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return at.toDateString() === now.toDateString()
+    ? time
+    : `${at.toLocaleDateString([], { weekday: "short" })} ${time}`;
+};
 
 type Status = "ready" | "scanning" | "merging" | "cancelling" | "done" | "error" | "cancelled";
 
@@ -225,12 +233,7 @@ function App() {
     ch.onmessage = (p) => {
       setProgress(p);
       if (p.ask_long_run) {
-        setLongRun({
-          etaMs: p.eta_ms,
-          elapsedMs: p.elapsed_ms,
-          finish: p.eta_ms === null ? null
-            : new Date(Date.now() + p.eta_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        });
+        setLongRun({ elapsedMs: p.elapsed_ms });
       }
       if (merging && p.stage === "merge") {
         setStatus((s) => (s === "scanning" ? "merging" : s));
@@ -444,7 +447,10 @@ function App() {
     return s >= 60 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s` : `${s}s`;
   };
   const stageLabel = (p: JobProgress) =>
-    p.stage === "scan" ? "Scanning directory..." : p.stage === "classify" ? "Classifying files..." : p.current;
+    p.stage === "scan" ? "Scanning directory..."
+      : p.stage === "classify" ? "Classifying files..."
+      : p.stage === "ocr" ? `Reading text from pictures (OCR)${p.current ? ` — ${p.current}` : "…"}`
+      : p.current;
 
   return (
     <div className="app">
@@ -698,12 +704,12 @@ function App() {
             {progress && (
               <p className="progress-text">
                 {progress.total > 0
-                  ? `${progress.done.toLocaleString()} / ${progress.total.toLocaleString()} files (${((progress.done / progress.total) * 100).toFixed(1)}%)`
+                  ? `${progress.done.toLocaleString()} / ${progress.total.toLocaleString()} ${progress.stage === "ocr" ? "pages" : "files"} (${((progress.done / progress.total) * 100).toFixed(1)}%)`
                   : `${progress.done.toLocaleString()} entries`}
                 {` · ${formatClock(progress.elapsed_ms)}`}
-                {progress.eta_ms !== null && ` · ETA ${formatClock(progress.eta_ms)}`}
+                {progress.eta_ms !== null && ` · ETA ${formatClock(progress.eta_ms)} (≈ ${finishClock(progress.eta_ms)})`}
                 {progress.eta_ms !== null && progress.eta_band_ms !== null && progress.eta_band_ms >= 1000 &&
-                  ` ± ${formatClock(progress.eta_band_ms)}`}
+                  (progress.eta_band_ms * 2 >= progress.eta_ms ? " (rough)" : ` ± ${formatClock(progress.eta_band_ms)}`)}
               </p>
             )}
             {progress && progress.stalled_ms !== null && (
@@ -715,10 +721,10 @@ function App() {
               <div className="checkbox-group" role="alertdialog" aria-label="Long run">
                 <p className="progress-text" style={{ color: "var(--warning)" }}>
                   This is a long run:{" "}
-                  {longRun.etaMs !== null
-                    ? `about ${formatClock(longRun.etaMs)} left (finishes ≈ ${longRun.finish})`
+                  {progress && progress.eta_ms !== null
+                    ? `about ${formatClock(progress.eta_ms)} left (finishes ≈ ${finishClock(progress.eta_ms)})`
                     : `still counting files after ${formatClock(longRun.elapsedMs)}`}
-                  . Proceed? The ETA above keeps updating.
+                  . Proceed? The estimate keeps updating.
                 </p>
                 <button className="btn btn-primary" onClick={() => setLongRun(null)}>PROCEED</button>
                 <button className="btn btn-danger" onClick={() => { setLongRun(null); void handleCancel(); }}>

@@ -165,22 +165,34 @@ fn piece_text(word: &[u8], clx: &[u8]) -> Option<String> {
 
 /// Word's control characters to plain text: paragraph/cell/line/page marks
 /// become line breaks or tabs, field instructions (between 0x13 and 0x14) go
-/// and their results stay, object anchors and soft hyphens vanish.
+/// and their results stay, object anchors and soft hyphens vanish. In a
+/// table every cell ends with 0x07 and every row with one more, so a 0x07
+/// right after a cell's ends the row: a line break, not a second tab (the
+/// paragraph after a table was glued onto its last row).
 fn clean_word_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut in_field_code = 0usize;
+    let mut after_cell = false;
     for c in raw.chars() {
+        let cell = c == '\u{7}' && in_field_code == 0;
         match c {
             '\u{13}' => in_field_code += 1,
             '\u{14}' => in_field_code = in_field_code.saturating_sub(1),
             '\u{15}' => in_field_code = in_field_code.saturating_sub(1),
             _ if in_field_code > 0 => {}
             '\r' | '\u{b}' | '\u{c}' | '\u{e}' => out.push('\n'),
+            '\u{7}' if after_cell => {
+                out.pop();
+                out.push('\n');
+                after_cell = false;
+                continue;
+            }
             '\u{7}' => out.push('\t'),
             '\u{1e}' => out.push('-'),
             '\u{1}' | '\u{8}' | '\u{1f}' | '\u{5}' | '\u{2}' | '\u{3}' | '\u{4}' => {}
             c => out.push(c),
         }
+        after_cell = cell;
     }
     out
 }
@@ -233,6 +245,15 @@ fn u32_at(b: &[u8], i: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_table_row_ends_its_line() {
+        let raw = "Before\rA1\u{7}B1\u{7}\u{7}A2\u{7}B2\u{7}\u{7}After the table\r";
+        assert_eq!(
+            clean_word_text(raw),
+            "Before\nA1\tB1\nA2\tB2\nAfter the table\n"
+        );
+    }
 
     #[test]
     fn field_codes_drop_but_results_stay() {

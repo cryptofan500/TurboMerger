@@ -160,10 +160,16 @@ the source folder, never your absolute home path (`--show-source-path` opts in).
   identically on Windows, macOS and Linux with nothing extra to install.
   Photos and scanned PDF pages can be read with `--extract-images-text`
   (an external OCR command, `monaddoc` by default or `$TURBOMERGER_OCR_CMD`;
-  slow, off by default).
+  slow, off by default). OCR runs as a stage after the text: each distinct
+  picture is read once (copies, and scanned pages made from the same photos,
+  share one reading), in batches of up to 64 pages per engine start, and the
+  results are kept for the next run. Thumbnails, icons, figure crops beside
+  their Markdown and MonadDoc work folders are listed, not read
+  (`--ocr-all-pictures` reads them).
 - **No size limit** — every file is taken whatever its size: big text files and
-  archive members stream in bounded memory, and the text still flows into the
-  token-budget split. `--max-file-size MB` sets a cap if you want one.
+  archive members stream in bounded memory (their tokens are counted on several
+  threads), and the text still flows into the token-budget split.
+  `--max-file-size MB` sets a cap if you want one.
 - **Uses the machine without freezing it** — the worker pool is the logical
   cores minus one (minus two from 8 cores) at lowered CPU and I/O priority, so
   the desktop stays responsive (`--threads N`, `TURBOMERGER_THREADS`). PDFs over
@@ -206,7 +212,7 @@ turbomerger merge <folder|URL|gh:owner/repo> [out]
     [--max-tokens N] [--include GLOB] [--exclude GLOB] [--config FILE] [--max-file-size MB]
     [--compress] [--strip-comments] [--git-diff] [--git-log [N]] [--emit-skill]
     [--redact] [--gitignore] [--include-hidden] [--include-venv] [--hydrate]
-    [--extract-images-text] [--allow-system-paths] [--threads N]
+    [--extract-images-text [--ocr-all-pictures]] [--allow-system-paths] [--threads N]
     [--show-source-path] [--reproducible] [--fail-on-skip] [--quiet]
     [--progress auto|json|none] [--eta-after DUR] [--stall-after DUR] [--on-stall wait|fail]
     [--deadline DUR] [--on-deadline cancel|partial] [--keep-partial]
@@ -239,8 +245,12 @@ with `--progress json` (`{"event":"progress"|"stall"|"deadline", "stage", "done"
 `1h30m`. Token counts of unchanged files come from a per-device cache
 (`TURBOMERGER_CACHE_DIR` moves it, `TURBOMERGER_NO_CACHE=1` turns it off).
 `--threads N` (or `TURBOMERGER_THREADS`, also read by the desktop app; 0 =
-automatic) sets the worker count. `TURBOMERGER_PDF_WORKER_MB` sets the PDF
-worker's memory budget in MB (0 = none). The old `--no-redact` and
+automatic) sets the worker count. Workers take the next file as soon as they
+are free; `TURBOMERGER_INFLIGHT_MB` (default 256) caps the files in flight
+(documents count four times their size). `TURBOMERGER_PDF_WORKER_MB` sets the
+PDF worker's memory budget in MB (0 = none). OCR results are kept in
+`<user cache>/turbomerger/ocr-v1/` (`TURBOMERGER_OCR_CACHE` moves it, `off`
+turns it off); `TURBOMERGER_OCR_BATCH` sets the pages per OCR-engine start. The old `--no-redact` and
 `--no-gitignore` are still accepted; they are the defaults now.
 
 The one-line summary on stdout is

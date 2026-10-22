@@ -122,6 +122,10 @@ pub struct MergeOptions {
     /// command. Off by default (CLI `--extract-images-text`).
     #[serde(default)]
     pub extract_images_text: bool,
+    /// With OCR on, read thumbnails, icons, figure crops of a Markdown
+    /// export and MonadDoc work folders too (CLI `--ocr-all-pictures`).
+    #[serde(default)]
+    pub ocr_all_pictures: bool,
     /// Accept a protected operating-system folder as the source
     /// (`C:\Windows`, `/usr`, `/etc`, …) for whole-computer runs (CLI
     /// `--allow-system-paths`). Never set by the MCP server.
@@ -165,6 +169,7 @@ impl MergeOptions {
             reproducible: false,
             hydrate: false,
             extract_images_text: false,
+            ocr_all_pictures: false,
             allow_system_paths: false,
         }
     }
@@ -248,6 +253,7 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         protect_secrets: options.redact_secrets,
         whole_drive: options.allow_system_paths || security::is_filesystem_root(&root),
         ocr_images: options.extract_images_text,
+        ocr_all_pictures: options.ocr_all_pictures,
     };
 
     let merge_config = MergeConfig {
@@ -346,19 +352,22 @@ pub fn apply_selection(
 }
 
 /// Where a running job is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     /// Walking the folder (`done` = entries seen; the total is unknown).
+    #[default]
     Scan,
     /// Deciding what each candidate file is (`done` of `total`).
     Classify,
     /// Reading, redacting and counting files, then writing (`done` of `total`).
     Merge,
+    /// Reading text from pictures (`done` of `total` pages), after the text.
+    Ocr,
 }
 
 /// One progress report from a running job.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Progress {
     pub stage: Stage,
     pub done: usize,
@@ -366,6 +375,27 @@ pub struct Progress {
     pub total: usize,
     /// The file being worked on, when there is one.
     pub current: String,
+    /// Merge stage: input bytes finished, and in all (0 = not known). The
+    /// ETA weighs files by size: a thousand notes and one big PDF are not
+    /// a thousand and one equal steps.
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    /// Seconds of work queued for a later stage (pictures waiting for the
+    /// OCR stage), added to this stage's ETA.
+    pub later_secs: u64,
+}
+
+impl Progress {
+    /// A report with no byte counts and nothing queued for later.
+    pub fn new(stage: Stage, done: usize, total: usize, current: impl Into<String>) -> Progress {
+        Progress {
+            stage,
+            done,
+            total,
+            current: current.into(),
+            ..Progress::default()
+        }
+    }
 }
 
 /// Why a job produced no output.
@@ -425,26 +455,13 @@ pub fn run_merge(
     if let Some(o) = output {
         job.output_path = o.to_path_buf();
     }
-    progress(Progress {
-        stage: Stage::Scan,
-        done: 0,
-        total: 0,
-        current: String::new(),
-    });
+    progress(Progress::new(Stage::Scan, 0, 0, ""));
     let on_scan = |p: ScanProgress| {
         progress(match p {
-            ScanProgress::Walked(n) => Progress {
-                stage: Stage::Scan,
-                done: n,
-                total: 0,
-                current: String::new(),
-            },
-            ScanProgress::Classified { done, total } => Progress {
-                stage: Stage::Classify,
-                done,
-                total,
-                current: String::new(),
-            },
+            ScanProgress::Walked(n) => Progress::new(Stage::Scan, n, 0, ""),
+            ScanProgress::Classified { done, total } => {
+                Progress::new(Stage::Classify, done, total, "")
+            }
         })
     };
     let scan =
@@ -469,9 +486,15 @@ pub fn run_merge(
         return Err(JobError::Empty);
     }
 
+    let watch = crate::merger::MergeWatch::default();
+    let on_ocr = |done: usize, total: usize, current: &str| {
+        progress(Progress::new(Stage::Ocr, done, total, current))
+    };
     let ctl = crate::merger::MergeCtl {
         cancel: cancel.flag(),
         finish: Some(cancel.finish_flag()),
+        watch: Some(&watch),
+        on_ocr: Some(&on_ocr),
     };
     let outcome = crate::merger::merge_files_ctl(
         &job.root,
@@ -480,11 +503,12 @@ pub fn run_merge(
         &job.merge_config,
         ctl,
         |done, total, file| {
+            use std::sync::atomic::Ordering::Relaxed;
             progress(Progress {
-                stage: Stage::Merge,
-                done,
-                total,
-                current: file.to_string(),
+                bytes_done: watch.bytes_done.load(Relaxed),
+                bytes_total: watch.bytes_total.load(Relaxed),
+                later_secs: watch.ocr_secs.load(Relaxed),
+                ..Progress::new(Stage::Merge, done, total, file)
             })
         },
         &skipped,
