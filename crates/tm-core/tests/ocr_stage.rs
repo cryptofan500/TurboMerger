@@ -78,10 +78,20 @@ fn write(root: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
 }
 
 fn merge(root: &Path, files: &[PathBuf], out: &Path) -> (String, tm_core::merger::MergeOutcome) {
+    merge_cfg(root, files, out, false)
+}
+
+fn merge_cfg(
+    root: &Path,
+    files: &[PathBuf],
+    out: &Path,
+    keep_figures: bool,
+) -> (String, tm_core::merger::MergeOutcome) {
     let cfg = MergeConfig {
         include_tree: false,
         redact: false,
         extract_images_text: true,
+        keep_figures,
         ..MergeConfig::default()
     };
     let cancel = AtomicBool::new(false);
@@ -172,4 +182,108 @@ fn the_ocr_stage_reads_each_picture_once_and_remembers() {
     );
     std::env::remove_var("TURBOMERGER_OCR_CMD");
     std::env::remove_var("TURBOMERGER_OCR_CACHE");
+
+    // --- Figures kept (P7). A stand-in monaddoc on PATH answers --version and
+    // `run … --events`: one page per input, each with a figure crop. With
+    // keep_figures the crop lands beside the output under the picture's
+    // content name, the link names it, the report counts it, and the cache
+    // keeps both; without it, no link and no folder.
+    let fake = tmp.path().join("fakebin");
+    let mlog = tmp.path().join("monaddoc.log");
+    let script = FAKE_MONADDOC.replace("<LOG>", &mlog.display().to_string());
+    let bin = write(&fake, "monaddoc", script.as_bytes());
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{}:{old_path}", fake.display()));
+    std::env::set_var("TURBOMERGER_OCR_CACHE", tmp.path().join("cache-fig"));
+    let root = tmp.path().join("fig");
+    let files = vec![
+        write(&root, "a.png", b"ALPHA"),
+        write(&root, "b.png", b"BETA"),
+    ];
+    let out_dir = tmp.path().join("figs");
+    fs::create_dir_all(&out_dir).unwrap();
+    let (md, outcome) = merge_cfg(&root, &files, &out_dir.join("one.md"), true);
+    assert_eq!(
+        calls(&mlog),
+        1,
+        "{}",
+        fs::read_to_string(&mlog).unwrap_or_default()
+    );
+    assert_eq!(outcome.figures_kept, 2, "{md}");
+    assert!(
+        md.contains("TEXT OF ALPHA") && md.contains("TEXT OF BETA"),
+        "{md}"
+    );
+    assert!(md.contains("- Figures kept: 2 in `one_assets/`"), "{md}");
+    let links: Vec<String> = md
+        .split("](one_assets/")
+        .skip(1)
+        .filter_map(|r| r.split(')').next().map(str::to_string))
+        .collect();
+    assert_eq!(links.len(), 2, "{md}");
+    for l in &links {
+        let crop = out_dir.join("one_assets").join(l);
+        assert!(crop.is_file(), "missing crop {}", crop.display());
+        assert!(fs::read_to_string(&crop).unwrap().starts_with("WEBP-"));
+    }
+    // The second run reads nothing and still has the figures: the cache
+    // holds the crops, and they land in the new output's folder.
+    let (two, outcome) = merge_cfg(&root, &files, &out_dir.join("two.md"), true);
+    assert_eq!(calls(&mlog), 1, "the second run started the engine");
+    assert_eq!(outcome.figures_kept, 2, "{two}");
+    assert!(
+        two.contains("](two_assets/") && !two.contains("one_assets"),
+        "{two}"
+    );
+    for l in &links {
+        assert!(out_dir.join("two_assets").join(l).is_file(), "{l}");
+    }
+    // Without the option: the text, no links, no folder.
+    let (three, outcome) = merge_cfg(&root, &files, &out_dir.join("three.md"), false);
+    assert!(three.contains("TEXT OF ALPHA"), "{three}");
+    assert!(
+        !three.contains("![") && !out_dir.join("three_assets").exists(),
+        "{three}"
+    );
+    assert_eq!(outcome.figures_kept, 0);
+    std::env::set_var("PATH", old_path);
+    std::env::remove_var("TURBOMERGER_OCR_CACHE");
 }
+
+/// A stand-in monaddoc: `--version`, and `run --input DIR --out-dir OUT …
+/// --events` writing one page per input file, each with one figure crop.
+const FAKE_MONADDOC: &str = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "monaddoc 9.9.9"; exit 0; fi
+in=""; out=""
+while [ $# -gt 0 ]; do
+  case "$1" in --input) in="$2"; shift;; --out-dir) out="$2"; shift;; esac
+  shift
+done
+echo "$in" >> '<LOG>'
+mkdir -p "$out/ocr_assets"
+md="$out/ocr_3_structured.md"
+printf '# ocr
+
+' > "$md"
+n=0
+for f in "$in"/*; do
+  n=$((n+1)); b=$(basename "$f"); p=$(printf '%03d' $n)
+  printf '<a id="page-%06d"></a>
+<!-- page ? | PDF page %d | photo %s -->
+
+' $n $n "$b" >> "$md"
+  printf '![Figure 1 on page %d](ocr_assets/p%s-1.webp)
+
+TEXT OF %s
+
+' $n "$p" "$(LC_ALL=C tr -cd '[:alnum:] ' < "$f")" >> "$md"
+  printf 'WEBP-%s' "$b" > "$out/ocr_assets/p$p-1.webp"
+  printf '{"kind":"page","file":"%s"}
+' "$b"
+done
+echo '{"ok": true}'
+"#;

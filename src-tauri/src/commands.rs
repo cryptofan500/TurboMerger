@@ -821,6 +821,8 @@ mod tests {
             tokens_claude_est: 1,
             skill_path: None,
             not_captured: 0,
+            figures_kept: 0,
+            notes: Vec::new(),
         });
         assert!(outputs.allows(&out.to_string_lossy()));
         assert!(!outputs.allows("/etc/passwd"));

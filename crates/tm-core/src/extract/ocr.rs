@@ -51,6 +51,19 @@ const BATCH_PAGES: usize = 64;
 /// Seconds per page before this machine's own speed is known.
 const DEFAULT_SECS_PER_PAGE: f64 = 10.0;
 
+/// Stands for the figures folder in a page text until the output is known:
+/// the folder's name depends on the output file, a cache entry must not.
+const ASSETS: &str = "{TURBOMERGER_ASSETS}";
+
+/// Where a merge keeps the figure crops monaddoc cuts out of pages
+/// (`--keep-figures`): `<output stem>_assets/` beside the output.
+struct Figures {
+    dir: PathBuf,
+    /// How a link in the output names that folder: its file name.
+    href: String,
+    kept: AtomicUsize,
+}
+
 /// The text of `path` page by page (images: one page; PDFs: one entry per
 /// page when the engine marks pages, else one entry for the whole file).
 /// Reads at once, without the queue — for callers outside a merge.
@@ -169,6 +182,13 @@ pub(super) fn split_pages(md: &str) -> Vec<String> {
 /// [`split_pages`], with each page's photo file (`<!-- page ? | PDF page 3 |
 /// photo IMG_1.jpg -->`; empty when the page names none).
 pub(super) fn split_photos(md: &str) -> Vec<(String, String)> {
+    split_photos_opts(md, false)
+}
+
+/// [`split_photos`]; with `keep_links`, each page keeps monaddoc's figure
+/// links (`![Figure 1 on page 2](ocr_assets/p002-1.webp)`) for
+/// [`keep_figures`] to copy and rename.
+pub(super) fn split_photos_opts(md: &str, keep_links: bool) -> Vec<(String, String)> {
     let mut pages = Vec::new();
     let mut cur = String::new();
     let mut photo = String::new();
@@ -199,7 +219,7 @@ pub(super) fn split_photos(md: &str) -> Vec<(String, String)> {
             in_comment = !t.contains("-->");
             continue;
         }
-        if t.starts_with("![") || (!started && t.starts_with("# ")) {
+        if (t.starts_with("![") && !keep_links) || (!started && t.starts_with("# ")) {
             continue;
         }
         cur.push_str(line);
@@ -212,6 +232,44 @@ pub(super) fn split_photos(md: &str) -> Vec<(String, String)> {
         .into_iter()
         .map(|(photo, text)| (photo, collapse(&text)))
         .collect()
+}
+
+/// A page's figure links made permanent: each crop monaddoc wrote into
+/// `crops` (`ocr_assets/pPPP-K.webp`, numbered per batch) is copied to the
+/// figures folder as `<picture sha256, 12 hex>-<page of the picture>-K.webp`
+/// (the same name every run, so the cache can hold it), and the link names
+/// it through [`ASSETS`]. A link whose crop is missing is dropped: no
+/// dangling links.
+fn keep_figures(figures: &Figures, crops: &Path, hex: &str, page: usize, text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let t = line.trim();
+        let link = t
+            .starts_with("![")
+            .then(|| t.rsplit_once("](ocr_assets/"))
+            .flatten()
+            .and_then(|(alt, rest)| rest.strip_suffix(')').map(|name| (alt, name)));
+        let Some((alt, name)) = link else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        let k = name.rsplit_once('-').map_or(name, |(_, k)| k);
+        let dest = format!("{hex}-{page}-{k}");
+        let copied = std::fs::create_dir_all(&figures.dir).is_ok()
+            && std::fs::copy(crops.join(name), figures.dir.join(&dest)).is_ok();
+        if copied {
+            figures.kept.fetch_add(1, Ordering::Relaxed);
+            out.push_str(&format!("{alt}]({ASSETS}/{dest})\n"));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// The first 12 hex digits of a content hash: a picture's name in the
+/// figures folder.
+fn hex12(key: &Key) -> String {
+    key.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
 /// `<!-- page ? | PDF page 3 | photo IMG_1.jpg -->` → `IMG_1.jpg`.
@@ -361,6 +419,8 @@ pub struct OcrQueue {
     engine: Engine,
     tag: OnceLock<Result<String, String>>,
     cache: Option<PathBuf>,
+    /// Figure crops are kept beside the output (`--keep-figures`).
+    figures: Option<Figures>,
     staging: OnceLock<Result<tempfile::TempDir, String>>,
     folders: AtomicUsize,
     inner: Mutex<Inner>,
@@ -389,10 +449,26 @@ impl OcrQueue {
     /// `cmd`: the OCR command template; `None` uses `$TURBOMERGER_OCR_CMD`,
     /// else monaddoc.
     pub fn new(cmd: Option<&str>) -> OcrQueue {
+        Self::with_figures(cmd, None)
+    }
+
+    /// [`OcrQueue::new`]; with `figures_dir`, the figure crops monaddoc cuts
+    /// out of pages are kept there and linked from each page's text (only
+    /// monaddoc makes crops: a `$TURBOMERGER_OCR_CMD` engine keeps none).
+    pub fn with_figures(cmd: Option<&str>, figures_dir: Option<PathBuf>) -> OcrQueue {
+        let figures = figures_dir.map(|dir| Figures {
+            href: dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "figures".into()),
+            dir,
+            kept: AtomicUsize::new(0),
+        });
         OcrQueue {
             engine: Engine::pick(cmd),
             tag: OnceLock::new(),
             cache: cache_dir(),
+            figures,
             staging: OnceLock::new(),
             folders: AtomicUsize::new(0),
             inner: Mutex::new(Inner::default()),
@@ -406,6 +482,29 @@ impl OcrQueue {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Figure crops kept beside the output so far (fresh and from the cache).
+    pub fn figures_kept(&self) -> usize {
+        self.figures
+            .as_ref()
+            .map_or(0, |f| f.kept.load(Ordering::Relaxed))
+    }
+
+    /// The figures folder, when figures are kept.
+    pub fn figures_dir(&self) -> Option<&Path> {
+        self.figures.as_ref().map(|f| f.dir.as_path())
+    }
+
+    /// Page texts as the output wants them: figure links name the real folder.
+    fn finish(&self, pages: Vec<String>) -> Vec<String> {
+        match &self.figures {
+            Some(f) => pages
+                .into_iter()
+                .map(|p| p.replace(ASSETS, &f.href))
+                .collect(),
+            None => pages,
+        }
     }
 
     /// The engine's cache name, checked once per queue: a missing engine
@@ -478,7 +577,7 @@ impl OcrQueue {
         };
         if let Some(text) = self.cached(&key, pdf) {
             drop_file();
-            return Got::Ready(Ok(text));
+            return Got::Ready(Ok(self.finish(text)));
         }
         let staging = match self.staging() {
             Ok(s) => s.to_path_buf(),
@@ -549,6 +648,7 @@ impl OcrQueue {
             .items
             .get(t.0)
             .and_then(|i| i.result.clone())
+            .map(|r| r.map(|pages| self.finish(pages)))
             .unwrap_or_else(|| Err("OCR did not run".into()))
     }
 
@@ -776,14 +876,18 @@ impl OcrQueue {
             let _ = std::fs::remove_dir_all(&base);
             return Err(Stop::Failed(monaddoc_failure(&output)));
         }
-        let md = std::fs::read_to_string(base.join("out").join("ocr_3_structured.md"))
-            .map_err(|e| Stop::Failed(format!("monaddoc wrote no Markdown: {e}")));
-        let _ = std::fs::remove_dir_all(&base);
-        let md = md?;
+        let md = match std::fs::read_to_string(base.join("out").join("ocr_3_structured.md")) {
+            Ok(md) => md,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&base);
+                return Err(Stop::Failed(format!("monaddoc wrote no Markdown: {e}")));
+            }
+        };
         // Each page names its picture: `000012.jpg`, or `000013__p0004.png`
         // for page 4 of a whole PDF. A photo of a two-page spread is two pages.
+        let crops = base.join("out").join("ocr_assets");
         let mut texts: HashMap<usize, Vec<String>> = HashMap::new();
-        for (photo, text) in split_photos(&md) {
+        for (photo, text) in split_photos_opts(&md, self.figures.is_some()) {
             let Some((i, page)) = staged_index(&photo) else {
                 continue;
             };
@@ -791,6 +895,13 @@ impl OcrQueue {
                 continue;
             };
             let pages = texts.entry(item).or_default();
+            let text = match &self.figures {
+                Some(f) => {
+                    let key = self.lock().items[item].key;
+                    keep_figures(f, &crops, &hex12(&key), page.unwrap_or(pages.len()), &text)
+                }
+                None => text,
+            };
             match page {
                 Some(p) => {
                     if pages.len() <= p {
@@ -805,6 +916,7 @@ impl OcrQueue {
                 None => pages.push(text),
             }
         }
+        let _ = std::fs::remove_dir_all(&base);
         let mut out = Vec::with_capacity(ready.len());
         for (i, _) in ready {
             let pdf_pages = {
@@ -903,17 +1015,53 @@ impl OcrQueue {
         }
     }
 
+    /// With figures kept, an entry of its own (`-fig`): its texts carry the
+    /// links, and its crops sit in a folder beside it.
     fn cache_file(&self, key: &Key, pdf: bool) -> Option<PathBuf> {
         let tag = self.tag().ok()?;
         let dir = self.cache.as_ref()?;
         let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        let fig = if self.figures.is_some() { "-fig" } else { "" };
         let kind = if pdf { "pdf.json" } else { "json" };
-        Some(dir.join(format!("{hex}-{tag}.{kind}")))
+        Some(dir.join(format!("{hex}-{tag}{fig}.{kind}")))
     }
 
+    /// The crops of a cached picture: `<entry>.assets/`.
+    fn cache_assets(&self, key: &Key, pdf: bool) -> Option<PathBuf> {
+        self.figures.as_ref()?;
+        Some(self.cache_file(key, pdf)?.with_extension("assets"))
+    }
+
+    /// The names of the crops a page text links.
+    fn linked_crops(pages: &[String]) -> Vec<String> {
+        let mut names = Vec::new();
+        for p in pages {
+            for part in p.split(ASSETS).skip(1) {
+                if let Some(name) = part.strip_prefix('/').and_then(|r| r.split(')').next()) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names
+    }
+
+    /// A cached reading; with figures kept, its crops are copied back into
+    /// the figures folder first (a crop the cache lost makes the entry a miss).
     fn cached(&self, key: &Key, pdf: bool) -> Option<Vec<String>> {
         let text = std::fs::read_to_string(self.cache_file(key, pdf)?).ok()?;
-        serde_json::from_str(&text).ok()
+        let pages: Vec<String> = serde_json::from_str(&text).ok()?;
+        if let Some(f) = &self.figures {
+            let names = Self::linked_crops(&pages);
+            if !names.is_empty() {
+                let assets = self.cache_assets(key, pdf)?;
+                std::fs::create_dir_all(&f.dir).ok()?;
+                for name in &names {
+                    std::fs::copy(assets.join(name), f.dir.join(name)).ok()?;
+                }
+                f.kept.fetch_add(names.len(), Ordering::Relaxed);
+            }
+        }
+        Some(pages)
     }
 
     /// Best effort: a result that cannot be kept only costs time next run.
@@ -929,6 +1077,18 @@ impl OcrQueue {
         let Ok(body) = serde_json::to_string(pages) else {
             return;
         };
+        // Crops first: a reader of the entry must find every crop it links.
+        if let (Some(f), Some(assets)) = (&self.figures, self.cache_assets(key, pdf)) {
+            let names = Self::linked_crops(pages);
+            if !names.is_empty() && std::fs::create_dir_all(&assets).is_err() {
+                return;
+            }
+            for name in &names {
+                if std::fs::copy(f.dir.join(name), assets.join(name)).is_err() {
+                    return;
+                }
+            }
+        }
         let tmp = file.with_extension(format!("tmp{}", std::process::id()));
         if std::fs::write(&tmp, body).is_err() || std::fs::rename(&tmp, &file).is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -1020,6 +1180,46 @@ mod tests {
             "First page text\n\n| A | B |\n|---|---|\n| 1 | 2 |"
         );
         assert_eq!(pages[1], "Second page");
+    }
+
+    #[test]
+    fn figure_links_are_kept_renamed_and_copied_only_when_asked() {
+        let md = "# ocr\n\n<a id=\"page-000001\"></a>\n<!-- page ? | PDF page 1 | photo 000000.png -->\n\n\
+                  ![Figure 1 on page 1](ocr_assets/p001-1.webp)\n\nText\n\n\
+                  ![Figure 2 on page 1](ocr_assets/p001-2.webp)\n";
+        assert_eq!(split_photos(md)[0].1, "Text");
+        let kept = split_photos_opts(md, true);
+        assert!(
+            kept[0]
+                .1
+                .starts_with("![Figure 1 on page 1](ocr_assets/p001-1.webp)"),
+            "{kept:?}"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let crops = tmp.path().join("ocr_assets");
+        std::fs::create_dir_all(&crops).unwrap();
+        std::fs::write(crops.join("p001-1.webp"), b"RIFF").unwrap();
+        let figures = Figures {
+            dir: tmp.path().join("one_assets"),
+            href: "one_assets".into(),
+            kept: AtomicUsize::new(0),
+        };
+        let text = keep_figures(&figures, &crops, "0123456789ab", 0, &kept[0].1);
+        // The first crop is copied under the picture's name; the second has no
+        // crop file, so its link goes rather than dangle.
+        assert_eq!(
+            text,
+            format!("![Figure 1 on page 1]({ASSETS}/0123456789ab-0-1.webp)\n\nText")
+        );
+        assert_eq!(figures.kept.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            std::fs::read(tmp.path().join("one_assets/0123456789ab-0-1.webp")).unwrap(),
+            b"RIFF"
+        );
+        assert_eq!(
+            OcrQueue::linked_crops(&[text]),
+            vec!["0123456789ab-0-1.webp".to_string()]
+        );
     }
 
     #[test]

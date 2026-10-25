@@ -83,6 +83,7 @@ interface SavedSettings {
   excludeGlobs?: string; removeEmptyLines?: boolean; truncateBase64?: boolean;
   compress?: boolean; stripComments?: boolean; gitDiff?: boolean; gitLogCount?: string;
   emitSkill?: boolean; sourcePath?: string; extractImagesText?: boolean;
+  ocrAllPictures?: boolean; keepFigures?: boolean;
 }
 
 function loadSettings(): SavedSettings {
@@ -100,7 +101,7 @@ function loadSettings(): SavedSettings {
       excludeGlobs: "string", removeEmptyLines: "boolean", truncateBase64: "boolean",
       compress: "boolean", stripComments: "boolean", gitDiff: "boolean",
       gitLogCount: "string", emitSkill: "boolean", sourcePath: "string",
-      extractImagesText: "boolean",
+      extractImagesText: "boolean", ocrAllPictures: "boolean", keepFigures: "boolean",
     };
     for (const [key, kind] of Object.entries(kinds)) {
       if (fromV1 && RESET_FROM_V1.has(key)) continue;
@@ -128,6 +129,8 @@ function App() {
   const [includeHidden, setIncludeHidden] = useState(saved.includeHidden ?? false);
   const [redactSecrets, setRedactSecrets] = useState(saved.redactSecrets ?? false);
   const [extractImagesText, setExtractImagesText] = useState(saved.extractImagesText ?? false);
+  const [ocrAllPictures, setOcrAllPictures] = useState(saved.ocrAllPictures ?? false);
+  const [keepFigures, setKeepFigures] = useState(saved.keepFigures ?? false);
   const [format, setFormat] = useState<string>(saved.format ?? "markdown");
   const [ordering, setOrdering] = useState<string>(saved.ordering ?? "path");
   const [maxTokens, setMaxTokens] = useState<string>(saved.maxTokens ?? "");
@@ -180,13 +183,13 @@ function App() {
       includeVenv, includeTree, contentDetection, respectGitignore, includeHidden,
       redactSecrets, format, ordering, maxTokens, includeGlobs, excludeGlobs,
       removeEmptyLines, truncateBase64, compress, stripComments, gitDiff,
-      gitLogCount, emitSkill, sourcePath, extractImagesText,
+      gitLogCount, emitSkill, sourcePath, extractImagesText, ocrAllPictures, keepFigures,
     };
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch { /* quota */ }
   }, [includeVenv, includeTree, contentDetection, respectGitignore, includeHidden,
       redactSecrets, format, ordering, maxTokens, includeGlobs, excludeGlobs,
       removeEmptyLines, truncateBase64, compress, stripComments, gitDiff,
-      gitLogCount, emitSkill, sourcePath, extractImagesText]);
+      gitLogCount, emitSkill, sourcePath, extractImagesText, ocrAllPictures, keepFigures]);
 
   // Selection is per-project: a new source resets it (restored on scan).
   const changeSource = (path: string) => {
@@ -315,6 +318,8 @@ function App() {
       include_hidden: includeHidden,
       redact_secrets: redactSecrets,
       extract_images_text: extractImagesText,
+      ocr_all_pictures: extractImagesText && ocrAllPictures,
+      keep_figures: extractImagesText && keepFigures,
       format,
       ordering,
       max_tokens: maxTokens ? parseInt(maxTokens, 10) || 0 : 0,
@@ -560,6 +565,19 @@ function App() {
               </label>
             </div>
           ))}
+          {([
+            [ocrAllPictures, setOcrAllPictures, "Also read thumbnails, figure crops and OCR work folders (slow)"],
+            [keepFigures, setKeepFigures, "Keep figures (with OCR): crops saved beside the output"],
+          ] as [boolean, (b: boolean) => void, string][]).map(([val, setter, label], i) => (
+            <div className="checkbox-group" key={`ocr-${i}`} style={{ marginLeft: 24 }}>
+              <label className="checkbox-label">
+                <input type="checkbox" checked={extractImagesText && val} disabled={isWorking || !extractImagesText}
+                  onChange={(e) => { setter(e.target.checked); setPreset("custom"); }} />
+                <span>{label}</span>
+              </label>
+            </div>
+          ))}
+          <span className="field-label">Size cap: none — every file is taken whatever its size (big ones are streamed)</span>
         </section>
 
         <section className="section">

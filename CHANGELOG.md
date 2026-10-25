@@ -49,6 +49,20 @@ Changed:
 - Hidden files, `.env` included, stay out by default and are recorded
   (`--include-hidden`).
 
+### Figures kept, desktop OCR switches (2026-10-25, session 6)
+
+Added:
+- `--keep-figures` (desktop "Keep figures (with OCR)"; off by default): the figure
+  crops monaddoc cuts out of photographed pages are kept beside the output in
+  `<output stem>_assets/` under the picture's content name, linked from each
+  page's text, shared by `--max-tokens` parts, counted in the Merge Report, and
+  held in the OCR cache (a second run restores them without starting the engine).
+  Needs monaddoc 0.5, which writes the crops for `--only md-structured`.
+- Desktop: "Also read thumbnails, figure crops and OCR work folders" and "Keep
+  figures" switches under the OCR switch (both off, greyed while OCR is off), and
+  the "Size cap: none" line.
+- ADR 0019 records the OCR stage, the ordered pipeline and the figures.
+
 ### OCR as a stage, and speed (2026-10-22)
 
 Added:

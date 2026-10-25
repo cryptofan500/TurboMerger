@@ -165,7 +165,10 @@ the source folder, never your absolute home path (`--show-source-path` opts in).
   share one reading), in batches of up to 64 pages per engine start, and the
   results are kept for the next run. Thumbnails, icons, figure crops beside
   their Markdown and MonadDoc work folders are listed, not read
-  (`--ocr-all-pictures` reads them).
+  (`--ocr-all-pictures` reads them). `--keep-figures` (desktop: "Keep figures
+  (with OCR)", off by default) keeps the figure crops monaddoc cuts out of pages
+  beside the output, in `<output stem>_assets/`, linked from each page's text;
+  `--max-tokens` parts share the folder, and the Merge Report counts them.
 - **No size limit** — every file is taken whatever its size: big text files and
   archive members stream in bounded memory (their tokens are counted on several
   threads), and the text still flows into the token-budget split.
@@ -212,7 +215,7 @@ turbomerger merge <folder|URL|gh:owner/repo> [out]
     [--max-tokens N] [--include GLOB] [--exclude GLOB] [--config FILE] [--max-file-size MB]
     [--compress] [--strip-comments] [--git-diff] [--git-log [N]] [--emit-skill]
     [--redact] [--gitignore] [--include-hidden] [--include-venv] [--hydrate]
-    [--extract-images-text [--ocr-all-pictures]] [--allow-system-paths] [--threads N]
+    [--extract-images-text [--ocr-all-pictures] [--keep-figures]] [--allow-system-paths] [--threads N]
     [--show-source-path] [--reproducible] [--fail-on-skip] [--quiet]
     [--progress auto|json|none] [--eta-after DUR] [--stall-after DUR] [--on-stall wait|fail]
     [--deadline DUR] [--on-deadline cancel|partial] [--keep-partial]

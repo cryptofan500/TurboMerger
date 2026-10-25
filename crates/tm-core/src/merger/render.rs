@@ -320,6 +320,15 @@ fn write_markdown_report<W: Write>(w: &mut W, ctx: &RenderCtx) -> Result<()> {
         outcome.tokens_o200k,
         tokens::claude_estimate(outcome.tokens_o200k)
     )?;
+    if let (true, Some(dir)) = (outcome.figures_kept > 0, &outcome.figures_dir) {
+        writeln!(
+            w,
+            "- Figures kept: {} in `{}/`",
+            outcome.figures_kept,
+            dir.file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+        )?;
+    }
     if !view.not_captured.is_empty() {
         writeln!(
             w,

@@ -155,6 +155,10 @@ pub struct MergeConfig {
     /// Send image-only document pages (a scanned PDF with no text layer) to the
     /// external OCR command. Off by default (`--extract-images-text`).
     pub extract_images_text: bool,
+    /// With OCR, keep the figure crops monaddoc cuts out of pages beside the
+    /// output (`<output stem>_assets/`) and link them from each page's text.
+    /// Off by default (`--keep-figures`).
+    pub keep_figures: bool,
     /// Per-file cap in bytes for text that only shows its size once read —
     /// inflated gzip, archive members, streamed files. 0 = no cap.
     pub max_file_size: u64,
@@ -180,6 +184,7 @@ impl Default for MergeConfig {
             remote: false,
             reproducible: false,
             extract_images_text: false,
+            keep_figures: false,
             max_file_size: 0,
         }
     }
@@ -204,6 +209,18 @@ pub struct MergeOutcome {
     /// The merge finished early (`MergeCtl::finish`): files it did not get to
     /// are in `skipped` as not captured.
     pub partial: bool,
+    /// Figure crops kept beside the output (`keep_figures`), and where.
+    pub figures_kept: usize,
+    pub figures_dir: Option<PathBuf>,
+}
+
+/// Where kept figures go: `<output stem>_assets/` beside the output file.
+fn figures_dir_for(output: &Path) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".into());
+    output.with_file_name(format!("{stem}_assets"))
 }
 
 /// Runtime control of one merge.
@@ -339,9 +356,10 @@ where
     // Pictures, and the pages of PDFs that have no text layer, wait for one
     // OCR stage after the text (P7): each distinct picture is read once, in
     // batches, and remembered across runs.
-    let ocr = cfg
-        .extract_images_text
-        .then(|| crate::extract::OcrQueue::new(None));
+    let ocr = cfg.extract_images_text.then(|| {
+        let figures = cfg.keep_figures.then(|| figures_dir_for(output));
+        crate::extract::OcrQueue::with_figures(None, figures)
+    });
     let mut waiting: Vec<(usize, crate::extract::OcrWait)> = Vec::new();
 
     // Sizes up front: the scheduler's weights and the byte-weighted ETA.
@@ -600,9 +618,14 @@ where
     }
 
     // Aggregate stats.
+    let (figures_kept, figures_dir) = ocr.as_ref().map_or((0, None), |q| {
+        (q.figures_kept(), q.figures_dir().map(Path::to_path_buf))
+    });
     let mut outcome = MergeOutcome {
         files_skipped: merge_skips.len(),
         partial,
+        figures_kept,
+        figures_dir,
         ..Default::default()
     };
     for b in &blocks {
@@ -727,6 +750,13 @@ where
     drop(ctx);
     outcome.outputs = outputs;
     outcome.notes = notes;
+    if let (true, Some(dir)) = (outcome.figures_kept > 0, &outcome.figures_dir) {
+        outcome.notes.push(format!(
+            "{} figures kept in {}",
+            outcome.figures_kept,
+            dir.display()
+        ));
+    }
 
     // Claude-skill emission (T3-4): best-effort, into the scanned repo.
     if cfg.emit_skill && !cfg.remote {

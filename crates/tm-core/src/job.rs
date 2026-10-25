@@ -29,6 +29,10 @@ pub struct MergeResult {
     pub skill_path: Option<String>,
     /// Inputs whose content is NOT in the output (see `SkipKind::NotCaptured`).
     pub not_captured: usize,
+    /// Figure crops kept beside the output (`keep_figures`).
+    pub figures_kept: usize,
+    /// Remarks about the output (a part over its budget, figures kept, …).
+    pub notes: Vec<String>,
 }
 
 pub fn count_not_captured(scan: &[scanner::SkipEntry], merge: &[scanner::SkipEntry]) -> usize {
@@ -126,6 +130,11 @@ pub struct MergeOptions {
     /// export and MonadDoc work folders too (CLI `--ocr-all-pictures`).
     #[serde(default)]
     pub ocr_all_pictures: bool,
+    /// With OCR on, keep the figure crops monaddoc cuts out of pages beside
+    /// the output (`<output stem>_assets/`) and link them from the text (CLI
+    /// `--keep-figures`, desktop toggle). The MCP server never turns it on.
+    #[serde(default)]
+    pub keep_figures: bool,
     /// Accept a protected operating-system folder as the source
     /// (`C:\Windows`, `/usr`, `/etc`, …) for whole-computer runs (CLI
     /// `--allow-system-paths`). Never set by the MCP server.
@@ -170,6 +179,7 @@ impl MergeOptions {
             hydrate: false,
             extract_images_text: false,
             ocr_all_pictures: false,
+            keep_figures: false,
             allow_system_paths: false,
         }
     }
@@ -274,6 +284,7 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         remote: options.remote,
         reproducible: options.reproducible,
         extract_images_text: options.extract_images_text,
+        keep_figures: options.keep_figures && options.extract_images_text,
         max_file_size: config.scanning.max_file_size_mb * 1024 * 1024,
     };
 
@@ -548,6 +559,8 @@ pub fn run_merge(
             .as_ref()
             .map(|p| p.to_string_lossy().to_string()),
         not_captured: count_not_captured(&skipped, &outcome.skipped),
+        figures_kept: outcome.figures_kept,
+        notes: outcome.notes.clone(),
     };
     // Best effort: a cache that cannot be written only costs time next run.
     let _ = crate::cache::save();

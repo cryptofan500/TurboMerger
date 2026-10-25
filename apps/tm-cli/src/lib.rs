@@ -172,6 +172,11 @@ pub struct ScanArgs {
     /// MonadDoc work folders, which are left out by default
     #[arg(long, requires = "extract_images_text")]
     pub ocr_all_pictures: bool,
+    /// With --extract-images-text, keep the figure crops monaddoc cuts out of
+    /// pages beside the output (`<output stem>_assets/`) and link them from
+    /// each page's text; --max-tokens parts share the one folder
+    #[arg(long, requires = "extract_images_text")]
+    pub keep_figures: bool,
     /// Mask secrets (API keys, tokens, private keys, passwords) and leave
     /// credential files (.env, key material, credential dumps) out. Off by
     /// default: every text file is taken as it is
@@ -461,6 +466,7 @@ fn merge_options(src_root: String, scan: &ScanArgs) -> MergeOptions {
     o.hydrate = scan.hydrate;
     o.extract_images_text = scan.extract_images_text;
     o.ocr_all_pictures = scan.ocr_all_pictures;
+    o.keep_figures = scan.keep_figures;
     o.redact_secrets = scan.redact && !scan.no_redact;
     o.allow_system_paths = scan.allow_system_paths;
     o
