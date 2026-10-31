@@ -51,4 +51,7 @@
   files, decodes each file into a temporary file checked against the manifest, and moves
   them into place only when all pass. Never outside DIR, never through a symlink, never
   over a different file without `--overwrite`. `scripts/e2e/tm_verify.py restore` stays the
-  independent second reader.
+  independent second reader. Besides the bytes it restores the Unix permission bits
+  (`mode`); not timestamps, owners, empty folders or symlinks (a symlink in the source is
+  archived as the file it points to). Names that differ only in case, or that Windows
+  refuses, are reported as warnings.
