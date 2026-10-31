@@ -240,10 +240,88 @@ impl Entry {
             .map(|s| SkipEntry::new(s.path, s.reason, kind_from(&s.kind)));
         (blocks, skip)
     }
+}
+
+/// What `--resume` holds of a journaled file until the merge takes it (S12,
+/// HANDOFF_S8 §9.3): no path — the index key is the path's XXH3-128 and the
+/// caller brings the path back —, a block's name only when it is not the
+/// path, the language as an index into the few that occur. ≈ 150 B a file
+/// instead of ≈ 600 B with whole entries keyed by path strings.
+struct Kept {
+    size: u64,
+    mtime_ns: u64,
+    /// Its journal line (after the header): pass 2 copies exactly these.
+    line: u64,
+    blocks: Box<[KBlock]>,
+    skip: Option<Box<JSkip>>,
+}
+
+struct KBlock {
+    rel: Option<Box<str>>,
+    note: Option<Box<str>>,
+    off: u64,
+    len: u64,
+    tokens: u64,
+    xxh: u64,
+    lang: u16,
+    compressed: bool,
+    synthetic: bool,
+}
+
+impl Kept {
+    /// `None` only past 65,535 languages (the file is then read again).
+    fn of(
+        e: Entry,
+        line: u64,
+        langs: &mut Vec<String>,
+        ix: &mut HashMap<String, u16>,
+    ) -> Option<(u128, Kept)> {
+        let mut blocks = Vec::with_capacity(e.blocks.len());
+        for b in e.blocks {
+            let lang = match ix.get(&b.lang) {
+                Some(&i) => i,
+                None => {
+                    let i = u16::try_from(langs.len()).ok()?;
+                    langs.push(b.lang.clone());
+                    ix.insert(b.lang, i);
+                    i
+                }
+            };
+            blocks.push(KBlock {
+                rel: (b.rel != e.path).then(|| b.rel.into_boxed_str()),
+                note: b.note.map(String::into_boxed_str),
+                off: b.off,
+                len: b.len,
+                tokens: b.tokens as u64,
+                xxh: b.xxh,
+                lang,
+                compressed: b.compressed,
+                synthetic: b.synthetic,
+            });
+        }
+        let kept = Kept {
+            size: e.size,
+            mtime_ns: e.mtime_ns,
+            line,
+            blocks: blocks.into_boxed_slice(),
+            skip: e.skip.map(Box::new),
+        };
+        Some((path_key(&e.path), kept))
+    }
 
     fn end(&self) -> u64 {
         self.blocks.iter().map(|b| b.off + b.len).max().unwrap_or(0)
     }
+}
+
+fn path_key(path: &str) -> u128 {
+    twox_hash::XxHash3_128::oneshot(path.as_bytes())
+}
+
+/// Pass 2 needs only a line's path.
+#[derive(Deserialize)]
+struct PathOnly {
+    path: String,
 }
 
 /// An open checkpoint: the journal being written and what the last run left.
@@ -255,7 +333,10 @@ pub(super) struct Checkpoint {
     pending: Vec<u8>,
     last_flush: Instant,
     every: Duration,
-    kept: HashMap<String, Entry>,
+    /// The files the last run journaled, by the XXH3-128 of their path.
+    kept: HashMap<u128, Kept>,
+    /// Languages of the kept blocks (`KBlock::lang` indexes this).
+    langs: Vec<String>,
     /// Files this run took from the checkpoint instead of reading them.
     pub(super) resumed: usize,
     /// Files the checkpoint held when it was opened.
@@ -289,12 +370,22 @@ impl Checkpoint {
         let fingerprint = fingerprint(root, cfg);
         let jpath = dir.join(JOURNAL);
         let spath = dir.join(SPOOL);
-        let mut kept: HashMap<String, Entry> = HashMap::new();
+        let mut kept: HashMap<u128, Kept> = HashMap::new();
+        let mut langs: Vec<String> = Vec::new();
         let mut failed_check = 0;
+        // Entry lines that parsed; pass 2 reads no further.
+        let mut whole = 0u64;
         if cfg.resume && jpath.is_file() {
             let spool_len = std::fs::metadata(&spath).map(|m| m.len()).unwrap_or(0);
-            let (header, entries) = read_journal(&jpath)?;
-            match header {
+            // Pass 1: index every whole entry by its path's XXH3-128 (a later
+            // line for the same file wins); reading stops at the first line
+            // that is not one (a torn last write).
+            let mut lines = BufReader::new(File::open(&jpath)?).split(b'\n');
+            let header = match lines.next() {
+                Some(Ok(l)) => serde_json::from_slice::<Header>(&l).ok(),
+                _ => None,
+            };
+            match &header {
                 Some(h) if h.tm_checkpoint == FORMAT && h.fingerprint == fingerprint => {}
                 Some(_) => bail!(
                     "the checkpoint {} was made with other merge options or another TurboMerger build; \
@@ -304,16 +395,27 @@ impl Checkpoint {
                 // Torn while it was being created: nothing in it.
                 None => {}
             }
-            for e in entries {
-                // A later line for the same file wins.
-                kept.insert(e.path.clone(), e);
+            if header.is_some() {
+                let mut ix: HashMap<String, u16> = HashMap::new();
+                for (i, line) in lines.enumerate() {
+                    let Some(e) = line
+                        .ok()
+                        .and_then(|l| serde_json::from_slice::<Entry>(&l).ok())
+                    else {
+                        break;
+                    };
+                    if let Some((k, v)) = Kept::of(e, i as u64, &mut langs, &mut ix) {
+                        kept.insert(k, v);
+                    }
+                    whole = i as u64 + 1;
+                }
             }
             // Every kept block must still be in the spool, byte for byte
             // (a power loss can drop bytes a journal line names).
             let check = Spool::at(&spath, spool_len)?;
-            kept.retain(|_, e| {
-                let ok = e.end() <= spool_len
-                    && e.blocks.iter().all(|b| {
+            kept.retain(|_, k| {
+                let ok = k.end() <= spool_len
+                    && k.blocks.iter().all(|b| {
                         let span = Span {
                             offset: b.off,
                             len: b.len,
@@ -326,9 +428,10 @@ impl Checkpoint {
                 ok
             });
         }
-        let end = kept.values().map(Entry::end).max().unwrap_or(0);
-        // The journal is rewritten with what it keeps (header first), then
-        // the spool is cut to the last byte those entries name.
+        let end = kept.values().map(Kept::end).max().unwrap_or(0);
+        // Pass 2: the journal is rewritten with exactly the lines it keeps,
+        // byte for byte and in their order (header first); then the spool is
+        // cut to the last byte they name.
         let tmp = dir.join(COMPACTED);
         {
             let mut w = io::BufWriter::new(File::create(&tmp)?);
@@ -340,11 +443,22 @@ impl Checkpoint {
                 },
             )?;
             w.write_all(b"\n")?;
-            let mut order: Vec<&Entry> = kept.values().collect();
-            order.sort_by(|a, b| a.path.cmp(&b.path));
-            for e in order {
-                serde_json::to_writer(&mut w, e)?;
-                w.write_all(b"\n")?;
+            if !kept.is_empty() {
+                let mut lines = BufReader::new(File::open(&jpath)?).split(b'\n');
+                lines.next();
+                for (i, line) in lines.enumerate().take(whole as usize) {
+                    let line = line?;
+                    let Ok(p) = serde_json::from_slice::<PathOnly>(&line) else {
+                        break;
+                    };
+                    if kept
+                        .get(&path_key(&p.path))
+                        .is_some_and(|k| k.line == i as u64)
+                    {
+                        w.write_all(&line)?;
+                        w.write_all(b"\n")?;
+                    }
+                }
             }
             w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
         }
@@ -364,6 +478,7 @@ impl Checkpoint {
                 last_flush: Instant::now(),
                 every: flush_every(),
                 kept,
+                langs,
                 resumed: 0,
                 found,
                 failed_check,
@@ -374,9 +489,35 @@ impl Checkpoint {
 
     /// The journaled entry for `path`, if the file is unchanged since.
     pub(super) fn take(&mut self, path: &str, stamp: Option<Stamp>) -> Option<Entry> {
-        let e = self.kept.remove(path)?;
+        let k = self.kept.remove(&path_key(path))?;
         let s = stamp?;
-        (e.size == s.size && e.mtime_ns == s.mtime_ns).then_some(e)
+        if k.size != s.size || k.mtime_ns != s.mtime_ns {
+            return None;
+        }
+        let langs = &self.langs;
+        let blocks = k
+            .blocks
+            .into_vec()
+            .into_iter()
+            .map(|b| JBlock {
+                rel: b.rel.map_or_else(|| path.to_string(), String::from),
+                off: b.off,
+                len: b.len,
+                lang: langs[usize::from(b.lang)].clone(),
+                tokens: b.tokens as usize,
+                xxh: b.xxh,
+                note: b.note.map(String::from),
+                compressed: b.compressed,
+                synthetic: b.synthetic,
+            })
+            .collect();
+        Some(Entry {
+            path: path.to_string(),
+            size: k.size,
+            mtime_ns: k.mtime_ns,
+            blocks,
+            skip: k.skip.map(|s| *s),
+        })
     }
 
     /// Journal a finished file (written out with the next flush).
@@ -460,29 +601,6 @@ fn fingerprint(root: &Path, cfg: &MergeConfig) -> String {
         cfg.grid_chunk_rows,
     );
     format!("{:032x}", twox_hash::XxHash3_128::oneshot(text.as_bytes()))
-}
-
-/// The header and every whole entry; reading stops at the first line that
-/// is not one (a torn last write).
-fn read_journal(path: &Path) -> Result<(Option<Header>, Vec<Entry>)> {
-    let mut lines = BufReader::new(File::open(path)?).split(b'\n');
-    let header = match lines.next() {
-        Some(Ok(l)) => serde_json::from_slice::<Header>(&l).ok(),
-        _ => None,
-    };
-    let mut entries = Vec::new();
-    if header.is_some() {
-        for line in lines {
-            match line
-                .ok()
-                .and_then(|l| serde_json::from_slice::<Entry>(&l).ok())
-            {
-                Some(e) => entries.push(e),
-                None => break,
-            }
-        }
-    }
-    Ok((header, entries))
 }
 
 #[cfg(test)]
@@ -630,5 +748,123 @@ mod tests {
         assert_eq!(ck.found, 0);
         ck.remove(spool);
         assert!(!tmp.path().join("out.md.tm-checkpoint").exists());
+    }
+
+    fn record_n(ck: &mut Checkpoint, spool: &mut Spool, names: &[&str], stamp: Stamp) {
+        for name in names {
+            let span = spool.append(&format!("text of {name}\n")).unwrap();
+            let e = Entry::new(
+                (*name).into(),
+                stamp,
+                &[block(name, span.offset, span.len)],
+                None,
+                spool,
+            )
+            .unwrap()
+            .unwrap();
+            ck.record(&e, spool).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_resume_index_keeps_no_paths_and_stays_small() {
+        // S12 (§9.3): ≈ 150 B a file instead of ≈ 600 B.
+        assert!(
+            std::mem::size_of::<Kept>() <= 48,
+            "{}",
+            std::mem::size_of::<Kept>()
+        );
+        assert!(
+            std::mem::size_of::<KBlock>() <= 72,
+            "{}",
+            std::mem::size_of::<KBlock>()
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let (out, root) = (tmp.path().join("o.md"), tmp.path().join("src"));
+        let cfg = MergeConfig {
+            checkpoint: true,
+            ..MergeConfig::default()
+        };
+        let (mut ck, mut spool) = Checkpoint::open(&out, &root, &cfg).unwrap();
+        let names: Vec<String> = (0..1000).map(|i| format!("dir/f{i}.rs")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let stamp = Stamp {
+            size: 4,
+            mtime_ns: 5,
+        };
+        record_n(&mut ck, &mut spool, &refs, stamp);
+        ck.flush(&mut spool).unwrap();
+        drop((ck, spool));
+        let again = MergeConfig {
+            resume: true,
+            ..MergeConfig::default()
+        };
+        let (mut ck, spool) = Checkpoint::open(&out, &root, &again).unwrap();
+        assert_eq!(ck.found, 1000);
+        assert!(ck
+            .kept
+            .values()
+            .all(|k| k.blocks.iter().all(|b| b.rel.is_none())));
+        assert_eq!(ck.langs, vec!["rust".to_string()]);
+        let e = ck.take("dir/f7.rs", Some(stamp)).unwrap();
+        let (blocks, _) = e.restore();
+        assert_eq!(blocks[0].relative, "dir/f7.rs");
+        assert_eq!(blocks[0].lang, "rust");
+        assert_eq!(
+            blocks[0].utf8_note.as_deref(),
+            Some("decoded from windows-1252")
+        );
+        assert_eq!(spool.read(blocks[0].span).unwrap(), "text of dir/f7.rs\n");
+    }
+
+    #[test]
+    fn the_rewritten_journal_keeps_the_latest_lines_byte_for_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (out, root) = (tmp.path().join("o.md"), tmp.path().join("src"));
+        let cfg = MergeConfig {
+            checkpoint: true,
+            ..MergeConfig::default()
+        };
+        let (mut ck, mut spool) = Checkpoint::open(&out, &root, &cfg).unwrap();
+        let (s1, s2) = (
+            Stamp {
+                size: 1,
+                mtime_ns: 1,
+            },
+            Stamp {
+                size: 2,
+                mtime_ns: 2,
+            },
+        );
+        record_n(&mut ck, &mut spool, &["a", "b"], s1);
+        record_n(&mut ck, &mut spool, &["a"], s2); // a again, later: this line wins
+        record_n(&mut ck, &mut spool, &["c"], s1);
+        ck.flush(&mut spool).unwrap();
+        drop((ck, spool));
+        let j = tmp.path().join("o.md.tm-checkpoint").join(JOURNAL);
+        let before = std::fs::read_to_string(&j).unwrap();
+        let lines: Vec<&str> = before.lines().collect(); // header, a1, b, a2, c
+                                                         // c's bytes in the spool change: it fails its check and is dropped.
+        let sp = tmp.path().join("o.md.tm-checkpoint").join(SPOOL);
+        let mut bytes = std::fs::read(&sp).unwrap();
+        let n = bytes.len();
+        bytes[n - 3] ^= 1;
+        std::fs::write(&sp, bytes).unwrap();
+        let again = MergeConfig {
+            resume: true,
+            ..MergeConfig::default()
+        };
+        let (mut ck, _spool) = Checkpoint::open(&out, &root, &again).unwrap();
+        assert_eq!((ck.found, ck.failed_check), (2, 1));
+        let after = std::fs::read_to_string(&j).unwrap();
+        let kept: Vec<&str> = after.lines().collect();
+        assert_eq!(kept[0], lines[0], "header");
+        assert_eq!(
+            &kept[1..],
+            &[lines[2], lines[3]],
+            "b then the later a, byte for byte"
+        );
+        assert!(ck.take("a", Some(s1)).is_none(), "the earlier a is gone");
+        assert!(ck.take("b", Some(s1)).is_some());
     }
 }
