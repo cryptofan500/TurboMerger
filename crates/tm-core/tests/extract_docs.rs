@@ -119,3 +119,20 @@ fn real_arxiv_pdf_extracts_reading_order_text() {
         out.note
     );
 }
+
+#[test]
+fn every_pdf_is_parsed_on_a_thread_of_its_own() {
+    // S11 (HANDOFF_S8 §9): pdf_oxide keeps resolver state per thread, and a
+    // panicking PDF leaves it dirty for the next PDF on that thread (fonts
+    // lost, raw glyph codes). Debug builds refuse a parse on a reused thread,
+    // so two parses from this one test thread must both run elsewhere.
+    let tmp = tempfile::tempdir().unwrap();
+    for name in ["a.pdf", "b.pdf", "c.pdf"] {
+        let p = tmp.path().join(name);
+        std::fs::write(&p, "%PDF-1.7\nnot really a pdf\n").unwrap();
+        let err = tm_core::extract::pdf_parse(&p, None)
+            .err()
+            .unwrap_or_default();
+        assert!(!err.contains("already parsed"), "{name}: {err}");
+    }
+}

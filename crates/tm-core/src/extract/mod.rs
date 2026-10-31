@@ -295,6 +295,51 @@ pub fn pdf_pages(path: &Path) -> Result<Vec<String>, String> {
 /// page with several pictures, or one that does not decode, gets none (the
 /// whole PDF is read instead).
 pub fn pdf_parse(path: &Path, pictures: Option<&Path>) -> Result<PdfParse, String> {
+    // pdf_oxide keeps resolver state per THREAD, not per document
+    // (`RESOLVING_STACK`, `RECURSION_DEPTH`, pdf_oxide 0.3.78 document.rs:329).
+    // A malformed PDF that panics leaves entries behind; the next document on
+    // that pool thread then gets false "circular reference" errors and loses
+    // fonts — raw glyph codes on a page, depending on which PDF ran there next
+    // (S11, HANDOFF_S8 §9: 3 of 120 arxiv PDFs, every time, with one thread).
+    // Each PDF is parsed on its own short-lived thread, so that state starts
+    // empty and dies with the document. The thread inherits the worker's
+    // lowered CPU and I/O priority.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("tm-pdf".into())
+            .stack_size(PDF_THREAD_STACK)
+            .spawn_scoped(scope, || pdf_parse_on_this_thread(path, pictures))
+            .map_err(|e| format!("PDF parse failed: no parser thread: {e}"))?
+            .join()
+            .unwrap_or_else(|_| Err("PDF parser panicked on a malformed file".into()))
+    })
+}
+
+/// Stack of the per-PDF parser thread: generous, since only the pages it
+/// touches are ever resident.
+const PDF_THREAD_STACK: usize = 16 << 20;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// Debug builds: PDFs parsed on this thread — never more than one.
+    static PDFS_ON_THIS_THREAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn pdf_parse_on_this_thread(path: &Path, pictures: Option<&Path>) -> Result<PdfParse, String> {
+    #[cfg(debug_assertions)]
+    {
+        let n = PDFS_ON_THIS_THREAD.with(|c| {
+            c.set(c.get() + 1);
+            c.get()
+        });
+        // An assertion with a message instead of a panic: the merge names it.
+        if n != 1 {
+            return Err(format!(
+                "PDF parsed on a thread that already parsed {} PDF(s)",
+                n - 1
+            ));
+        }
+    }
     let owned = path.to_path_buf();
     // A malformed PDF must not panic the merge (debug/test: caught here;
     // release is panic=abort — see the module note).
