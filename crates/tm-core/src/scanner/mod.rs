@@ -1681,7 +1681,7 @@ pub fn scan_with(
     if (options.respect_gitignore && ignore_files_present) || overrides.is_some() {
         let ignored = find_ignored(
             root,
-            &seen,
+            seen,
             include_venv,
             include_hidden,
             protect_secrets,
@@ -1863,14 +1863,16 @@ fn resolve_symlink(link: &Path, root_canon: &Path) -> LinkTarget {
 /// ignored directory is reported once, not descended into).
 fn find_ignored(
     root: &Path,
-    seen: &HashSet<PathBuf>,
+    // Taken, not borrowed: walk 1 is done with it, and a copy for the walk's
+    // threads doubled its memory (S8, DeepSeek A2 — ~150–300 B per path).
+    seen: HashSet<PathBuf>,
     include_venv: bool,
     include_hidden: bool,
     protect_secrets: bool,
     system_areas: HashMap<PathBuf, &'static str>,
     cancel: &AtomicBool,
 ) -> Vec<(PathBuf, bool)> {
-    let seen = Arc::new(seen.clone());
+    let seen = Arc::new(seen);
     let found: Arc<Mutex<Vec<(PathBuf, bool)>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&found);
     let mut b = WalkBuilder::new(root);
