@@ -66,7 +66,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Merge a folder (or a remote repository) into one or more LLM-ready files.
-    Merge(MergeCmd),
+    Merge(Box<MergeCmd>),
     /// Aider-style repo map: ranked signatures within a token budget.
     Map(MapCmd),
     /// Apply the file changes in an LLM reply (a dry run unless --yes).
@@ -401,7 +401,7 @@ pub fn run(argv: &[OsString]) -> Option<i32> {
         pdf_worker::register();
     }
     Some(match cli.command {
-        Command::Merge(m) => run_merge(m),
+        Command::Merge(m) => run_merge(*m),
         Command::Map(m) => run_map(m),
         Command::Apply(a) => run_apply(a),
         Command::Explain(e) => run_explain(e),
@@ -551,17 +551,27 @@ fn run_merge(a: MergeCmd) -> i32 {
     options.reproducible = a.reproducible;
     options.remote = remote_label.is_some();
     options.source_label = remote_label;
-    options.grid_chunk_rows = a.grid_chunk_rows;
+    options.grid_chunk_rows = Some(a.grid_chunk_rows);
     options.budget_tokens = a.budget_tokens;
     options.complete = a.complete;
     options.embed_binary = a.embed_binary;
+    if a.embed_binary.is_some() && !a.complete {
+        eprintln!("error: --embed-binary needs --complete");
+        return EXIT_USAGE;
+    }
 
+    // Exact file selection (ADR 0020): a list or a plan merges exactly the
+    // named files and never walks the source folder.
+    if a.files_from.is_some() && a.selection.is_some() {
+        eprintln!("error: use either --files-from or --selection, not both");
+        return EXIT_USAGE;
+    }
     if let Some(files_from) = &a.files_from {
         use std::io::Read;
         let content = if files_from == "-" {
             let mut buf = String::new();
             if std::io::stdin().read_to_string(&mut buf).is_err() {
-                eprintln!("error: cannot read file list from stdin");
+                eprintln!("error: cannot read the file list from stdin");
                 return EXIT_USAGE;
             }
             buf
@@ -569,87 +579,148 @@ fn run_merge(a: MergeCmd) -> i32 {
             match std::fs::read_to_string(files_from) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("error: cannot read files-from '{}': {e}", files_from);
+                    eprintln!("error: cannot read --files-from '{files_from}': {e}");
                     return EXIT_USAGE;
                 }
             }
         };
+        let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
         let paths: Vec<String> = if a.null {
-            content.split('\0').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+            content
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
         } else {
-            content.lines()
-                .map(|l| l.trim())
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            content
+                .lines()
+                .map(|l| l.trim_end_matches('\r'))
+                .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
                 .map(|s| s.to_string())
                 .collect()
         };
-        options.selected_paths = Some(paths);
+        options.selection = Some(tm_core::selection::SelectionPlan::from_paths(&paths));
+    } else if a.null {
+        eprintln!("error: -0/--null needs --files-from");
+        return EXIT_USAGE;
     }
-
     if let Some(sel_path) = &a.selection {
-        match std::fs::read_to_string(sel_path) {
-            Ok(content) => {
-                match tm_core::selection::SelectionPlan::from_toml(&content) {
-                    Ok(plan) => {
-                        options.selection = Some(plan);
-                    }
-                    Err(e) => {
-                        eprintln!("error: invalid selection plan '{}': {e}", sel_path.display());
-                        return EXIT_USAGE;
-                    }
-                }
-            }
+        let content = match std::fs::read_to_string(sel_path) {
+            Ok(c) => c,
             Err(e) => {
-                eprintln!("error: cannot read selection file '{}': {e}", sel_path.display());
+                eprintln!(
+                    "error: cannot read selection file '{}': {e}",
+                    sel_path.display()
+                );
+                return EXIT_USAGE;
+            }
+        };
+        match tm_core::selection::SelectionPlan::from_toml(&content) {
+            Ok(plan) => options.selection = Some(plan),
+            Err(e) => {
+                eprintln!(
+                    "error: invalid selection plan '{}': {e}",
+                    sel_path.display()
+                );
                 return EXIT_USAGE;
             }
         }
     }
+    if let Some(plan) = &options.selection {
+        let explicit = plan.mode == tm_core::selection::SelectionMode::Explicit;
+        if explicit && (!a.scan.include.is_empty() || !a.scan.exclude.is_empty()) {
+            eprintln!("error: --include/--exclude cannot be combined with an explicit file list");
+            return EXIT_USAGE;
+        }
+        if plan.complete && !a.complete {
+            options.complete = true;
+        }
+    }
 
-    if a.list_only {
-        let job = match tm_core::job::resolve_job(&options) {
-            Ok(j) => j,
+    if a.list_only || a.emit_selection.is_some() {
+        let resolved = match resolve_plan_files(&options) {
+            Ok(r) => r,
             Err(e) => {
                 eprintln!("error: {e}");
                 return EXIT_ERROR;
             }
         };
-        let scan = if let Some(plan) = &options.selection {
-            if plan.mode == tm_core::selection::SelectionMode::Explicit {
-                let paths: Vec<String> = plan.files.iter().filter(|f| !f.exclude).map(|f| f.path.clone()).collect();
-                tm_core::scanner::scan_explicit(&job.root, &paths, &job.scan_options).unwrap_or_else(|_| tm_core::scanner::ScanResult { files: Vec::new(), stats: Default::default(), skipped: Vec::new() })
-            } else {
-                let flag = std::sync::atomic::AtomicBool::new(false);
-                tm_core::scanner::scan_with(&job.root, &job.scan_options, &flag, &|_| {}).unwrap_or_else(|_| tm_core::scanner::ScanResult { files: Vec::new(), stats: Default::default(), skipped: Vec::new() })
+        if let Some(out) = &a.emit_selection {
+            let base = options.selection.clone().unwrap_or_default();
+            let mut plan = tm_core::selection::SelectionPlan {
+                version: 1,
+                mode: tm_core::selection::SelectionMode::Explicit,
+                ordering: Some("plan".into()),
+                ..base.clone()
+            };
+            plan.files = resolved
+                .files
+                .iter()
+                .map(|(rel, _)| {
+                    base.find_file(rel)
+                        .cloned()
+                        .unwrap_or_else(|| tm_core::selection::FileSel {
+                            path: rel.clone(),
+                            ..Default::default()
+                        })
+                })
+                .collect();
+            let mut text = String::from("# Written by turbomerger --emit-selection; edit, then pass it back with --selection.\n");
+            for (rel, bytes) in &resolved.files {
+                text.push_str(&format!("# {bytes:>12} B  {rel}\n"));
             }
-        } else {
-            let flag = std::sync::atomic::AtomicBool::new(false);
-            tm_core::scanner::scan_with(&job.root, &job.scan_options, &flag, &|_| {}).unwrap_or_else(|_| tm_core::scanner::ScanResult { files: Vec::new(), stats: Default::default(), skipped: Vec::new() })
-        };
-        let mut files = scan.files;
-        let mut skipped = scan.skipped;
-        let keep_order = job.merge_config.ordering == tm_core::merger::Ordering::Plan;
-        tm_core::job::apply_selection(
-            &job.root,
-            &mut files,
-            &mut skipped,
-            &options.selected_paths,
-            &options.force_include,
-            &options.exclude_paths,
-            &options.exclude_dirs,
-            keep_order,
-        );
-        for f in &files {
-            let rel = tm_core::scanner::relative_display(&job.root, f);
-            let bytes = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
-            println!("{rel} ({bytes} bytes)");
+            match plan.to_toml() {
+                Ok(t) => text.push_str(&t),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return EXIT_ERROR;
+                }
+            }
+            if let Err(e) = std::fs::write(out, text) {
+                eprintln!("error: cannot write '{}': {e}", out.display());
+                return EXIT_ERROR;
+            }
+            eprintln!(
+                "selection plan written: {} ({} files)",
+                out.display(),
+                resolved.files.len()
+            );
         }
-        println!("\nTotal files: {}", files.len());
-        let not_captured = skipped.iter().any(|s| s.kind == tm_core::scanner::SkipKind::NotCaptured);
-        if not_captured {
-            return EXIT_SKIPS;
+        if a.list_only {
+            let plan = options.selection.as_ref();
+            for (rel, bytes) in &resolved.files {
+                let what = plan
+                    .and_then(|p| p.find_file(rel))
+                    .map(selection_summary)
+                    .unwrap_or_default();
+                println!(
+                    "{bytes:>12}  {rel}{}",
+                    if what.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  [{what}]")
+                    }
+                );
+            }
+            for s in &resolved.not_captured {
+                println!("NOT CAPTURED  {}  ({})", s.0, s.1);
+            }
+            println!(
+                "\n{} files, {} bytes{}",
+                resolved.files.len(),
+                resolved.files.iter().map(|f| f.1).sum::<u64>(),
+                if resolved.not_captured.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} not captured", resolved.not_captured.len())
+                }
+            );
+            return if resolved.not_captured.is_empty() {
+                EXIT_OK
+            } else {
+                EXIT_SKIPS
+            };
         }
-        return EXIT_OK;
     }
 
     // Ctrl-C cancels the job (temp files are cleaned up); a second one quits.
@@ -775,6 +846,82 @@ fn run_merge(a: MergeCmd) -> i32 {
         }
     }
     code
+}
+
+/// Files a plan (or a walk) resolves to, without merging.
+struct ResolvedFiles {
+    /// (relative path, bytes) in merge order.
+    files: Vec<(String, u64)>,
+    /// (path, reason) of named files that cannot be captured.
+    not_captured: Vec<(String, String)>,
+}
+
+fn resolve_plan_files(options: &tm_core::job::MergeOptions) -> Result<ResolvedFiles, String> {
+    use tm_core::scanner::{self, SkipKind};
+    let job = tm_core::job::resolve_job(options)?;
+    let scan = match &options.selection {
+        Some(plan) if plan.mode == tm_core::selection::SelectionMode::Explicit => {
+            let paths: Vec<String> = plan
+                .files
+                .iter()
+                .filter(|f| !f.exclude)
+                .map(|f| f.path.clone())
+                .collect();
+            scanner::scan_explicit(&job.root, &paths, &job.scan_options)
+                .map_err(|e| e.to_string())?
+        }
+        _ => {
+            let flag = std::sync::atomic::AtomicBool::new(false);
+            scanner::scan_with(&job.root, &job.scan_options, &flag, &|_| {})
+                .map_err(|e| e.to_string())?
+        }
+    };
+    let mut files = scan.files;
+    let mut skipped = scan.skipped;
+    let keep_order = job.merge_config.ordering == tm_core::merger::Ordering::Plan;
+    tm_core::job::apply_selection(
+        &job.root,
+        &mut files,
+        &mut skipped,
+        &tm_core::job::Curation::of(options, keep_order),
+    );
+    Ok(ResolvedFiles {
+        files: files
+            .iter()
+            .map(|f| {
+                let rel = scanner::relative_display(&job.root, f);
+                (rel, std::fs::metadata(f).map(|m| m.len()).unwrap_or(0))
+            })
+            .collect(),
+        not_captured: skipped
+            .iter()
+            .filter(|s| s.kind == SkipKind::NotCaptured)
+            .map(|s| (s.path.clone(), s.reason.clone()))
+            .collect(),
+    })
+}
+
+/// One-line summary of what a plan entry takes from its file.
+fn selection_summary(f: &tm_core::selection::FileSel) -> String {
+    let mut parts = Vec::new();
+    let mut n = |k: &str, v: usize| {
+        if v > 0 {
+            parts.push(format!("{k}={v}"));
+        }
+    };
+    n("lines", f.lines.len());
+    n("sections", f.sections.len());
+    n("exclude_sections", f.exclude_sections.len());
+    n("match", f.match_lines.len());
+    n("sheets", f.sheets.len());
+    n("exclude_sheets", f.exclude_sheets.len());
+    n("columns", f.columns.len());
+    n("rows", f.rows.len());
+    n("sheet_overrides", f.sheet_overrides.len());
+    if let Some(t) = f.max_tokens {
+        parts.push(format!("max_tokens={t}"));
+    }
+    parts.join(" ")
 }
 
 fn run_outline(file: PathBuf, json: bool) -> i32 {

@@ -10,6 +10,8 @@ export interface ScanEntry {
   path: string;
   size: number;
   tokens: number;
+  /** tokens scaled from the first 8 MiB of a bigger file */
+  estimated?: boolean;
 }
 export interface SkipEntry {
   path: string;

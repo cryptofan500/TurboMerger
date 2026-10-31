@@ -206,6 +206,36 @@ pub struct ScanEntry {
     pub path: String,
     pub size: u64,
     pub tokens: usize,
+    /// `tokens` scaled from the first [`SCAN_COUNT_BYTES`] of a bigger file.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
+}
+
+/// The scan preview reads at most this much of one file to count its tokens
+/// (bigger files are estimated by scaling), so a folder of huge files cannot
+/// pull gigabytes into memory just to show a number.
+const SCAN_COUNT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A bounded count before an automatic scan (no file is read).
+#[derive(Debug, Serialize)]
+pub struct FolderCount {
+    pub files: usize,
+    pub bytes: u64,
+    pub truncated: bool,
+}
+
+#[tauri::command]
+pub async fn count_folder(path: String) -> Result<FolderCount, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (files, bytes, truncated) = scanner::quick_count(std::path::Path::new(&path), 20_000);
+        FolderCount {
+            files,
+            bytes,
+            truncated,
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Serialize)]
@@ -264,9 +294,22 @@ pub async fn scan_folder(
                     return None;
                 }
                 let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                let tokens = std::fs::read(path)
-                    .map(|bytes| tm_core::cache::count(&String::from_utf8_lossy(&bytes)))
-                    .unwrap_or(0);
+                let estimated = size > SCAN_COUNT_BYTES;
+                let tokens = {
+                    use std::io::Read;
+                    let mut head = Vec::with_capacity(size.min(SCAN_COUNT_BYTES) as usize);
+                    std::fs::File::open(path)
+                        .and_then(|f| f.take(SCAN_COUNT_BYTES).read_to_end(&mut head))
+                        .map(|n| {
+                            let t = tm_core::cache::count(&String::from_utf8_lossy(&head));
+                            if estimated && n > 0 {
+                                (t as f64 * size as f64 / n as f64) as usize
+                            } else {
+                                t
+                            }
+                        })
+                        .unwrap_or(0)
+                };
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let rel = scanner::relative_display(&resolved.root, path);
                 if done.is_multiple_of(32) || done == total {
@@ -276,6 +319,7 @@ pub async fn scan_folder(
                     path: rel,
                     size,
                     tokens,
+                    estimated,
                 })
             })
             .collect();

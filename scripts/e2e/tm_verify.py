@@ -1,656 +1,1403 @@
 #!/usr/bin/env python3
-"""Line-by-line Oracle Verifier for TurboMerger TM-GRID/1 and Granular Selection.
-Validates Gates G1–G11 against openpyxl ground truth.
-Exit code 0: ALL PASS
-Exit code 5: VERIFICATION GATE FAILED
-"""
+"""tm_verify.py — independent verifier for TurboMerger output.
 
-import sys
-import os
-import re
-import json
-import hashlib
+Checks what TurboMerger wrote against the source files with code that shares
+nothing with the Rust encoder: openpyxl / the csv module read the sources, a
+strict stdlib decoder reads the merged Markdown, and the slicer is re-implemented
+from the written spec (ADR 0020 / 0021, `crates/tm-core/src/slice.rs` docs).
+
+Subcommands (exit 0 = pass, 5 = a gate failed, 2 = usage):
+  grid       --merged M.md --src-root DIR [--selection SEL.toml]
+             every workbook/CSV grid: sheet list, used range, header row, columns,
+             every cell (row, column, type, text) incl. header and preamble cells,
+             counts, per-sheet SHA-256, merged ranges, formula counts, table syntax.
+  slices     --merged M.md --src-root DIR --selection SEL.toml
+             every sliced text file re-cut from the source and compared byte for byte
+             (kept text and every [tm:…] marker).
+  accounting --json M.json --selection SEL.toml
+             every planned file present, nothing not captured.
+  cold       --merged M.md --src-root DIR --work DIR
+             only M.md and this script go to an empty folder; workbooks are rebuilt
+             there from the Markdown alone; the rebuilt cells must equal the originals.
+  restore    ARCHIVE.md --out DIR [--src-root DIR]
+             archive twin → files at their relative paths; size + SHA-256 per manifest.
+  decode     M.md --out DIR [--xlsx]      (used by `cold`; no source access)
+  audit      --merged M.md --src-root DIR --out AUDIT.md
+             side-by-side sample (source value vs decoded value) for human reading.
+  selftest   [--bin TURBOMERGER]
+             builds adversarial fixtures, runs the real binary, requires a clean pass,
+             then requires each of 14 deliberate corruptions to FAIL.
+  all        --merged M.md --json M.json --src-root DIR --selection SEL.toml --report R.md
+
+Run with `python3 -P` (openpyxl may be a user-site package; -P keeps the script
+folder off sys.path).
+"""
 import argparse
 import base64
-from typing import Dict, List, Tuple, Any, Optional
+import csv
+import datetime as dt
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from decimal import Decimal
 
-try:
+try:  # Python 3.11+
     import tomllib
-except ImportError:
-    try:
-        import tomli as tomllib
-    except ImportError:
-        tomllib = None
+except ImportError:  # pragma: no cover
+    tomllib = None
 
-import openpyxl
+EXIT_OK, EXIT_USAGE, EXIT_GATE = 0, 2, 5
+EMPTY_SHA = hashlib.sha256(b"").hexdigest()
 
-EXIT_OK = 0
-EXIT_ERR = 1
-EXIT_GATE_FAILED = 5
+RE_NUM = re.compile(r"^-?(0|[1-9][0-9]*)(\.[0-9]+)?$")
+RE_BOOL = re.compile(r"^(TRUE|FALSE)$")
+RE_ERR = re.compile(r"^(#NULL!|#DIV/0!|#VALUE!|#REF!|#NAME\?|#NUM!|#N/A|#GETTING_DATA|#DATA!)$")
+RE_DATE = re.compile(r"^(\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2}(\.\d{3})?)?|-?\d+:\d{2}:\d{2}(\.\d{3})?)$")
 
-def sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
 
-def unescape_cell(raw: str) -> str:
-    """Decodes a TM-GRID/1 table cell into raw string."""
-    text = raw.strip()
-    if text.startswith(' '):
-        text = text[1:]
-    if text.endswith(' '):
-        text = text[:-1]
-    
-    is_quoted = text.startswith("'")
-    if is_quoted:
-        text = text[1:]
-    
-    out = []
-    i = 0
-    n = len(text)
-    while i < n:
-        if text[i] == '\\' and i + 1 < n:
-            nxt = text[i+1]
-            if nxt == '\\':
-                out.append('\\')
-                i += 2
-            elif nxt == '|':
-                out.append('|')
-                i += 2
-            elif nxt == 'r':
-                out.append('\r')
-                i += 2
-            elif nxt == 't':
-                out.append('\t')
-                i += 2
-            elif text[i:].startswith('\\<br>'):
-                out.append('<br>')
-                i += 5
-            elif nxt == 'x' and i + 3 < n:
-                try:
-                    code = int(text[i+2:i+4], 16)
-                    out.append(chr(code))
-                    i += 4
-                except ValueError:
-                    out.append(text[i:i+2])
-                    i += 2
-            else:
-                out.append(nxt)
-                i += 2
-        elif text[i:].startswith('<br>'):
-            out.append('\n')
-            i += 4
+class Gate:
+    """Collects failures for one check; prints them and keeps counters."""
+
+    def __init__(self, name):
+        self.name, self.fails, self.notes, self.counts = name, [], [], {}
+
+    def fail(self, msg):
+        self.fails.append(msg)
+
+    def note(self, msg):
+        self.notes.append(msg)
+
+    def add(self, key, n=1):
+        self.counts[key] = self.counts.get(key, 0) + n
+
+    @property
+    def ok(self):
+        return not self.fails
+
+    def report(self, limit=25):
+        status = "PASS" if self.ok else "FAIL"
+        counts = ", ".join(f"{k}={v}" for k, v in sorted(self.counts.items()))
+        lines = [f"[{status}] {self.name}: {counts}"]
+        lines += [f"    FAIL {m}" for m in self.fails[:limit]]
+        if len(self.fails) > limit:
+            lines.append(f"    … {len(self.fails) - limit} more failures")
+        lines += [f"    note {m}" for m in self.notes[:limit]]
+        return "\n".join(lines)
+
+
+# ----------------------------------------------------------------- shared rules
+
+def json_lit(s):
+    out = ['"']
+    for c in s:
+        o = ord(c)
+        if c == '"':
+            out.append('\\"')
+        elif c == "\\":
+            out.append("\\\\")
+        elif c == "\n":
+            out.append("\\n")
+        elif c == "\r":
+            out.append("\\r")
+        elif c == "\t":
+            out.append("\\t")
+        elif c == "\b":
+            out.append("\\b")
+        elif c == "\f":
+            out.append("\\f")
+        elif o < 0x20:
+            out.append("\\u%04x" % o)
         else:
-            out.append(text[i])
-            i += 1
+            out.append(c)
+    out.append('"')
     return "".join(out)
 
-def escape_cell(canon: str, is_string: bool = True) -> str:
-    """Encodes cell text to TM-GRID/1."""
-    prefix = "'" if (is_string and (canon.startswith("'") or re.match(r'^-?\d+(\.\d+)?$', canon))) else ""
-    res = []
-    for c in canon:
-        if c == '\\':
-            res.append('\\\\')
-        elif c == '|':
-            res.append('\\|')
-        elif c == '\n':
-            res.append('<br>')
-        elif c == '\r':
-            res.append('\\r')
-        elif c == '\t':
-            res.append('\\t')
-        else:
-            res.append(c)
-    return prefix + "".join(res)
 
-def split_table_row(line: str) -> List[str]:
-    """Splits a markdown table row on unescaped pipes '|'."""
-    parts = []
-    current = []
+def canon_sha(cells):
+    """cells: {(row, col1): (kind, text)} → (count, sha256 of the canonical dump)."""
+    buf = "".join(f"{r}\t{c}\t{k}\t{json_lit(t)}\n" for (r, c), (k, t) in sorted(cells.items()))
+    return len(cells), hashlib.sha256(buf.encode("utf-8")).hexdigest()
+
+
+def looks_typed(t):
+    return bool(RE_NUM.match(t) or RE_BOOL.match(t) or RE_ERR.match(t) or RE_DATE.match(t))
+
+
+def escape_cell(text, marker):
+    out = ["'"] if marker and (text.startswith("'") or looks_typed(text)) else []
     i = 0
-    n = len(line)
-    while i < n:
-        if line[i] == '\\' and i + 1 < n:
-            current.append(line[i:i+2])
-            i += 2
-        elif line[i] == '|':
-            parts.append("".join(current))
-            current = []
-            i += 1
+    while i < len(text):
+        if text.startswith("<br>", i):
+            out.append("\\<br>")
+            i += 4
+            continue
+        c = text[i]
+        o = ord(c)
+        if c == "\\":
+            out.append("\\\\")
+        elif c == "|":
+            out.append("\\|")
+        elif c == "\n":
+            out.append("<br>")
+        elif c == "\r":
+            out.append("\\r")
+        elif c == "\t":
+            out.append("\\t")
+        elif o < 0x20 or o == 0x7F:
+            out.append("\\x%02x" % o)
         else:
-            current.append(line[i])
-            i += 1
-    parts.append("".join(current))
-    return parts
-
-class GridSheet:
-    def __init__(self, name: str, sheet_num: int, total_sheets: int):
-        self.name = name
-        self.sheet_num = sheet_num
-        self.total_sheets = total_sheets
-        self.headers: List[str] = []
-        self.rows: Dict[int, List[str]] = {} # 1-based row -> cells
-        self.preamble: List[Tuple[str, str]] = [] # (coord, text)
-        self.sha256 = ""
-        self.emitted_cells = 0
-        self.body_rows = 0
-        self.has_duplicates = False
-        self.has_pad_error = False
-
-class MergedGridDoc:
-    def __init__(self):
-        self.files: Dict[str, List[GridSheet]] = {} # file_path -> list of GridSheet
-
-def parse_merged_markdown(md_text: str) -> MergedGridDoc:
-    doc = MergedGridDoc()
-    lines = md_text.splitlines()
-    i = 0
-    n = len(lines)
-    
-    current_file = ""
-    current_sheet: Optional[GridSheet] = None
-    
-    while i < n:
-        line = lines[i]
-        
-        # Detect document header ## path/to/file
-        m_file = re.match(r'^##\s+(.+)$', line)
-        if m_file:
-            path_part = m_file.group(1).strip()
-            if " (" in path_part:
-                current_file = path_part.split(" (")[0].strip()
-            else:
-                current_file = path_part
-            if current_file not in doc.files:
-                doc.files[current_file] = []
-            i += 1
-            continue
-            
-        # Detect TM-GRID/1 markers
-        if line.startswith("@sheet "):
-            # @sheet 1/3 name="SheetName" ... sha256=...
-            m_s = re.search(r'@sheet\s+(\d+)/(\d+)\s+name="([^"]+)"', line)
-            if m_s:
-                s_num = int(m_s.group(1))
-                s_tot = int(m_s.group(2))
-                s_name = m_s.group(3)
-                current_sheet = GridSheet(s_name, s_num, s_tot)
-                
-                m_sha = re.search(r'sha256=([0-9a-fA-F]{64})', line)
-                if m_sha:
-                    current_sheet.sha256 = m_sha.group(1)
-                
-                if current_file:
-                    doc.files[current_file].append(current_sheet)
-                else:
-                    if "anonymous" not in doc.files:
-                        doc.files["anonymous"] = []
-                    doc.files["anonymous"].append(current_sheet)
-            i += 1
-            continue
-            
-        if line.startswith("> ") and current_sheet:
-            # Preamble > A1: Title
-            m_p = re.match(r'^>\s+([A-Z]+[0-9]+):\s+(.*)$', line)
-            if m_p:
-                current_sheet.preamble.append((m_p.group(1), unescape_cell(m_p.group(2))))
-            i += 1
-            continue
-            
-        if line.startswith("| row |") or line.startswith("| # |"):
-            # Table header
-            parts = split_table_row(line)
-            headers = [unescape_cell(c) for c in parts[2:-1]]
-            if current_sheet:
-                current_sheet.headers = headers
-            i += 1
-            # Skip delimiter line
-            if i < n and lines[i].startswith("| ---"):
-                i += 1
-            continue
-            
-        if line.startswith("|") and current_sheet:
-            if line.startswith("| ---") or line.startswith("@cont"):
-                i += 1
-                continue
-            parts = split_table_row(line)
-            if len(parts) >= 3:
-                row_label = parts[1].strip()
-                if row_label.startswith('R'):
-                    row_label = row_label[1:]
-                try:
-                    row_idx = int(row_label)
-                    cells = []
-                    for c in parts[2:-1]:
-                        if not (c.startswith(' ') and c.endswith(' ')):
-                            current_sheet.has_pad_error = True
-                        cells.append(unescape_cell(c))
-                    if row_idx in current_sheet.rows:
-                        current_sheet.has_duplicates = True
-                    current_sheet.rows[row_idx] = cells
-                    current_sheet.body_rows += 1
-                except ValueError:
-                    pass
-            i += 1
-            continue
-            
-        if line.startswith("@end sheet="):
-            if current_sheet:
-                m_sha = re.search(r'sha256=([0-9a-fA-F]{64})', line)
-                if m_sha and not current_sheet.sha256:
-                    current_sheet.sha256 = m_sha.group(1)
-            current_sheet = None
-            i += 1
-            continue
-            
+            out.append(c)
         i += 1
-        
-    return doc
+    return "".join(out)
 
-def read_oracle_workbook(path: str) -> Dict[str, Dict[str, Any]]:
-    wb = openpyxl.load_workbook(path, data_only=True)
-    sheets_data = {}
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        # find non-empty cells
-        cells_dict = {}
-        min_r = 9999999
-        max_r = 0
-        min_c = 9999999
-        max_c = 0
-        
-        for r_idx, row in enumerate(ws.iter_rows(values_only=False), start=1):
-            for c_idx, cell in enumerate(row, start=1):
-                val = cell.value
-                if val is not None and str(val) != "":
-                    sval = str(val)
-                    if isinstance(val, float) and val.is_integer():
-                        sval = str(int(val))
-                    cells_dict[(r_idx, c_idx)] = sval
-                    min_r = min(min_r, r_idx)
-                    max_r = max(max_r, r_idx)
-                    min_c = min(min_c, c_idx)
-                    max_c = max(max_c, c_idx)
-                    
-        sheets_data[sheet_name] = {
-            "cells": cells_dict,
-            "min_r": min_r if min_r <= max_r else 0,
-            "max_r": max_r,
-            "min_c": min_c if min_c <= max_c else 0,
-            "max_c": max_c,
-            "total_cells": len(cells_dict),
-        }
-    return sheets_data
 
-def verify_grid(merged_path: str, src_root: str, selection_path: Optional[str] = None) -> bool:
-    print(f"[*] Verifying TM-GRID/1: {merged_path}")
-    with open(merged_path, 'r', encoding='utf-8') as f:
-        md_text = f.read()
-        
-    doc = parse_merged_markdown(md_text)
-    if not doc.files:
-        print("[!] Gate Failed: No files or TM-GRID sheets found in merged markdown", file=sys.stderr)
-        return False
-        
-    all_ok = True
-    checked_sheets = 0
-    checked_cells = 0
-    
-    for rel_path, sheets in doc.files.items():
-        if not sheets:
+def decode_field(field, typed):
+    """Escaped cell text (no pad) → (kind, text) or None for an empty cell."""
+    if field == "":
+        return None
+    quoted = typed and field.startswith("'")
+    body = field[1:] if quoted else field
+    out, i = [], 0
+    while i < len(body):
+        if body.startswith("<br>", i):
+            out.append("\n")
+            i += 4
             continue
-            
-        full_src = rel_path if os.path.isabs(rel_path) else os.path.join(src_root, rel_path)
-        if not os.path.exists(full_src):
-            print(f"[-] Note: Source file {full_src} not found on disk, skipping oracle check for this file.")
+        c = body[i]
+        if c == "\\":
+            nxt = body[i + 1:i + 2]
+            if nxt in ("\\", "|", "<"):
+                out.append(nxt)
+                i += 2
+            elif nxt == "r":
+                out.append("\r")
+                i += 2
+            elif nxt == "t":
+                out.append("\t")
+                i += 2
+            elif nxt == "x" and re.match(r"[0-9a-f]{2}", body[i + 2:i + 4]):
+                out.append(chr(int(body[i + 2:i + 4], 16)))
+                i += 4
+            else:
+                raise ValueError(f"bad escape in {field!r}")
             continue
-            
-        oracle = read_oracle_workbook(full_src)
-        
-        for gsheet in sheets:
-            if gsheet.name not in oracle:
-                print(f"[!] Gate Failed: Sheet '{gsheet.name}' not in oracle workbook {full_src}", file=sys.stderr)
-                all_ok = False
+        if c == "|":
+            raise ValueError(f"unescaped pipe in {field!r}")
+        out.append(c)
+        i += 1
+    text = "".join(out)
+    if not typed or quoted:
+        return ("s", text)
+    if RE_NUM.match(text):
+        return ("n", text)
+    if RE_BOOL.match(text):
+        return ("b", text)
+    if RE_ERR.match(text):
+        return ("e", text)
+    if RE_DATE.match(text):
+        return ("d", text)
+    return ("s", text)
+
+
+def split_row(line):
+    """'| a | b\\|c |' → [' a ', ' b\\|c '] (split on unescaped pipes only)."""
+    if not (line.startswith("|") and line.endswith("|")) or len(line) < 2:
+        raise ValueError(f"table line must start and end with '|': {line[:80]!r}")
+    fields, cur, i, body = [], [], 0, line[1:]
+    while i < len(body):
+        c = body[i]
+        if c == "\\" and i + 1 < len(body):
+            cur.append(body[i:i + 2])
+            i += 2
+            continue
+        if c == "|":
+            fields.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if cur:
+        raise ValueError(f"text after the last pipe: {line[-40:]!r}")
+    return fields
+
+
+def unpad(field):
+    if len(field) < 2 or field[0] != " " or field[-1] != " ":
+        raise ValueError(f"cell must be padded with exactly one space each side: {field!r}")
+    return field[1:-1]
+
+
+def col_letter(i):  # 0-based
+    s = ""
+    i += 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def col_index(s):  # 0-based, None if not letters
+    if not s or len(s) > 3 or not all("A" <= ch <= "Z" for ch in s):
+        return None
+    n = 0
+    for ch in s:
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
+
+def expand_cols(spec):
+    if spec in ("-", ""):
+        return []
+    out = []
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        lo, hi = col_index(a), col_index(b or a)
+        out += list(range(lo, hi + 1))
+    return out
+
+
+def parse_meta(line, prefix):
+    """'@sheet 1/2 name="x" a=b' → ({'name': 'x', 'a': 'b'}, '1/2')."""
+    rest = line[len(prefix):].lstrip(" ")
+    head, _, rest = rest.partition(" ") if not rest.startswith(("name=", "body_rows=", "sheet=")) else ("", "", rest)
+    meta, i = {}, 0
+    dec = json.JSONDecoder()
+    while i < len(rest):
+        j = rest.index("=", i)
+        key = rest[i:j]
+        if rest[j + 1:j + 2] == '"':
+            val, end = dec.raw_decode(rest, j + 1)
+        else:
+            end = rest.find(" ", j + 1)
+            end = len(rest) if end < 0 else end
+            val = rest[j + 1:end]
+        meta[key] = val
+        i = end + 1 if end < len(rest) and rest[end:end + 1] == " " else end
+    return meta, head
+
+
+# ------------------------------------------------------------- merged Markdown
+
+def md_blocks(text):
+    """Every '## path' + fenced block → list of dict(path, lang, content, line)."""
+    lines = text.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        ln = lines[i]
+        if ln.startswith("## ") and i + 2 < len(lines) and lines[i + 1] == "":
+            m = re.match(r"^(`{3,})(.*)$", lines[i + 2])
+            if m:
+                fence, lang = m.group(1), m.group(2).strip()
+                j = i + 3
+                while j < len(lines) and lines[j] != fence:
+                    j += 1
+                out.append({"path": ln[3:], "lang": lang, "content": "\n".join(lines[i + 3:j]), "line": i + 1})
+                i = j + 1
                 continue
-                
-            osheet = oracle[gsheet.name]
-            checked_sheets += 1
-            
-            # Build column index mapping from gsheet.headers to oracle columns
-            col_map = {}
-            if gsheet.headers:
-                # Find which row in oracle contains these headers
-                best_hr = None
-                best_match_count = 0
-                for candidate_r in range(1, min(15, osheet["max_r"] + 1)):
-                    match_count = 0
-                    for c_candidate in range(1, osheet["max_c"] + 1):
-                        val = str(osheet["cells"].get((candidate_r, c_candidate), "")).strip().lower()
-                        if any(val == h.strip().lower() for h in gsheet.headers):
-                            match_count += 1
-                    if match_count > best_match_count:
-                        best_match_count = match_count
-                        best_hr = candidate_r
-                
-                if best_hr is not None and best_match_count >= len(gsheet.headers) // 2:
-                    for c_idx, h in enumerate(gsheet.headers, start=1):
-                        h_norm = h.strip().lower()
-                        for c_candidate in range(1, osheet["max_c"] + 1):
-                            val = str(osheet["cells"].get((best_hr, c_candidate), "")).strip().lower()
-                            if val == h_norm:
-                                col_map[c_idx] = c_candidate
-                                break
+        i += 1
+    return out
 
-            # Compare cells
-            for r_idx, cells in gsheet.rows.items():
-                for c_idx, decoded_val in enumerate(cells, start=1):
-                    target_c = col_map.get(c_idx, c_idx)
-                    oracle_val = osheet["cells"].get((r_idx, target_c), "")
-                    # Normalise line breaks
-                    oracle_val_norm = str(oracle_val).replace("\r\n", "\n").replace("\r", "\n")
-                    decoded_val_norm = str(decoded_val).replace("\r\n", "\n").replace("\r", "\n")
-                    
-                    if oracle_val_norm != decoded_val_norm:
-                        # Allow trimming whitespace differences from calamine
-                        if oracle_val_norm.strip() == decoded_val_norm.strip():
-                            continue
-                        # Allow float formatting minor match (e.g. 95.5 vs 95.5)
-                        try:
-                            if abs(float(oracle_val_norm) - float(decoded_val_norm)) < 1e-6:
-                                continue
-                        except ValueError:
-                            pass
-                        print(f"[!] Gate Failed: Cell mismatch in {rel_path} sheet '{gsheet.name}' at R{r_idx}C{c_idx} (oracle C{target_c}):", file=sys.stderr)
-                        print(f"    Oracle:  {repr(oracle_val_norm)}", file=sys.stderr)
-                        print(f"    Decoded: {repr(decoded_val_norm)}", file=sys.stderr)
-                        all_ok = False
-                    checked_cells += 1
-                    
-    print(f"[+] Grid verification passed: {checked_sheets} sheets, {checked_cells} cells verified.")
-    return all_ok
 
-def run_selftest() -> int:
-    print("[*] Running tm_verify self-test with 12 deliberate mutations...")
-    # Reference synthetic workbook & text
-    ref_rows = [
-        ["ID", "Name", "Desc"],
-        ["1", "Alpha", "Line 1\nLine 2"],
-        ["2", "Beta", "Value | with | pipes"],
-        ["3", "Gamma", "'01234"],
-    ]
-    
-    def render_ref(rows: List[List[str]], mutation_id: Optional[int] = None) -> str:
-        r = [list(row) for row in rows]
-        if mutation_id == 1:
-            r[1][1] = "Alpba" # (1) change one character
-        elif mutation_id == 2:
-            del r[2] # (2) delete a body row
-        elif mutation_id == 3:
-            r[1][0], r[1][1] = r[1][1], r[1][0] # (3) swap two adjacent cells
-        elif mutation_id == 4:
-            r[1][0] = "99" # (4) change a number
-        elif mutation_id == 5:
-            r[2][2] = "Raw | unescaped | pipe" # (5) insert unescaped pipe
-        
-        lines = [
-            "## test.xlsx",
-            "TM-GRID/1",
-            '@file name="test.xlsx" path="test.xlsx" sheets=1 bytes=100 source_sha256=1111111111111111111111111111111111111111111111111111111111111111',
-            '',
-            '@sheet 1/1 name="Sheet1" state=visible used=A1:C4 header_row=1 cols=A-C body_rows=3 cells=9 merged=- formulas=0 types=typed sha256=2222222222222222222222222222222222222222222222222222222222222222'
-        ]
-        if mutation_id == 8:
-            lines[-1] = '@sheet 1/1 name="WrongSheet" state=visible' # (8) swap two sheets
-            
-        # Header
-        lines.append("| row | ID | Name | Desc |")
-        lines.append("| ---: | :--- | :--- | :--- |")
-        
-        for idx in range(1, len(r)):
-            row = r[idx]
-            c0 = escape_cell(row[0], False)
-            c1 = escape_cell(row[1], True)
-            c2 = escape_cell(row[2], True)
-            if mutation_id == 11 and c2.startswith("'"):
-                c2 = c2[1:] # (11) delete ' marker
-            if mutation_id == 12:
-                c2 = c2.replace("<br>", " ") # (12) replace <br> by space
-            if mutation_id == 10:
-                line_str = f"| {idx} | {c0} |{c1} | {c2} |" # (10) strip leading space
-            else:
-                line_str = f"| {idx} | {c0} | {c1} | {c2} |"
-            lines.append(line_str)
-            if mutation_id == 9 and idx == 1:
-                lines.append(f"| {idx} | {c0} | {c1} | {c2} |") # (9) duplicate row
-                
-        if mutation_id != 6: # (6) remove @end
-            sha = "3333333333333333333333333333333333333333333333333333333333333333"
-            if mutation_id == 7:
-                sha = "4444444444444444444444444444444444444444444444444444444444444444" # (7) edit sha256
-            lines.append(f"@end sheet=1 body_rows=3 cells=9 sha256={sha}")
-            
-        return "\n".join(lines) + "\n"
-
-    # Baseline clean parse
-    clean_text = render_ref(ref_rows)
-    clean_doc = parse_merged_markdown(clean_text)
-    assert len(clean_doc.files) == 1
-    assert len(clean_doc.files["test.xlsx"]) == 1
-    sh = clean_doc.files["test.xlsx"][0]
-    assert len(sh.rows) == 3
-    assert sh.rows[1][1] == "Alpha"
-    assert sh.rows[1][2] == "Line 1\nLine 2"
-    assert sh.rows[2][2] == "Value | with | pipes"
-    assert sh.rows[3][2] == "'01234"
-    print("[+] Selftest baseline reference parse PASSED.")
-    
-    # Assert each mutation fails detection
-    for mut_id in range(1, 13):
-        mut_text = render_ref(ref_rows, mut_id)
-        mut_doc = parse_merged_markdown(mut_text)
-        
-        # Check against clean
-        failed = False
-        if mut_id == 6: # missing @end
-            # sh either not closed or properties missing
-            failed = True
-        elif mut_id == 7: # edited sha256
-            if mut_doc.files["test.xlsx"][0].sha256 != "3333333333333333333333333333333333333333333333333333333333333333":
-                failed = True
-        elif mut_id == 8: # sheet name
-            if "Sheet1" not in [s.name for s in mut_doc.files.get("test.xlsx", [])]:
-                failed = True
-        elif mut_id == 9: # duplicate row
-            if mut_doc.files["test.xlsx"][0].has_duplicates or mut_doc.files["test.xlsx"][0].body_rows != 3:
-                failed = True
-        elif mut_id == 10: # strip leading space from padded cell
-            if mut_doc.files["test.xlsx"][0].has_pad_error:
-                failed = True
-        else:
-            m_sh = mut_doc.files.get("test.xlsx", [None])[0]
-            if not m_sh or len(m_sh.rows) != 3:
-                failed = True
-            else:
-                for r_idx in [1, 2, 3]:
-                    if m_sh.rows.get(r_idx) != sh.rows.get(r_idx):
-                        failed = True
-                        break
-        assert failed, f"Mutation {mut_id} was NOT detected!"
-        print(f"  [x] Mutation {mut_id:02d} detected successfully (expected failure).")
-        
-    print("[+] Selftest: Clean pass + 12/12 deliberate mutations detected (Gate G1 & G8 PASS).")
-    return EXIT_OK
-
-def restore_archive(archive_path: str, out_dir: str) -> bool:
-    print(f"[*] Restoring archive twin: {archive_path} -> {out_dir}")
-    os.makedirs(out_dir, exist_ok=True)
-    with open(archive_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-        
-    # Check for __manifest__
-    m_manifest = re.search(r'##\s+__manifest__\s+```(?:json|jsonlines)?\n(.*?)\n```', content, re.DOTALL)
-    if not m_manifest:
-        print("[!] Gate Failed: Archive has no valid ## __manifest__ block", file=sys.stderr)
-        return False
-        
-    manifest_raw = m_manifest.group(1).strip()
-    manifest_files = []
-    if manifest_raw.startswith('{') and not "\n{" in manifest_raw:
-        try:
-            m_obj = json.loads(manifest_raw)
-            manifest_files = m_obj.get("files", [m_obj])
-        except json.JSONDecodeError:
-            pass
-    if not manifest_files:
-        for line in manifest_raw.splitlines():
-            line = line.strip()
-            if line.startswith('{'):
-                try:
-                    manifest_files.append(json.loads(line))
-                except json.JSONDecodeError:
+def decode_grid(content, gate, where):
+    """Strict TM-GRID/1 decoder → {'file': meta, 'sheets': [sheet...]}."""
+    lines = content.split("\n")
+    if not lines or lines[0] != "TM-GRID/1":
+        gate.fail(f"{where}: first line is not TM-GRID/1")
+        return None
+    fmeta, _ = parse_meta(lines[1], "@file")
+    sheets, i = [], 2
+    while i < len(lines):
+        ln = lines[i]
+        if ln == "":
+            i += 1
+            continue
+        if not ln.startswith("@sheet "):
+            gate.fail(f"{where}: unexpected line {i + 1}: {ln[:80]!r}")
+            return None
+        meta, pos = parse_meta(ln, "@sheet")
+        sh = {"meta": meta, "pos": pos, "cells": {}, "header_fields": None, "body_rows": [], "errors": []}
+        sheets.append(sh)
+        i += 1
+        if "skipped" in meta:
+            if i >= len(lines) or not lines[i].startswith("@end ") or not lines[i].endswith(" skipped"):
+                gate.fail(f"{where}: skipped sheet {meta.get('name')!r} lacks its '@end … skipped'")
+            i += 1
+            continue
+        typed = meta.get("types") == "typed"
+        cols = expand_cols(meta.get("cols", "-"))
+        hr = meta.get("header_row", "none")
+        header_line = None
+        ended = False
+        while i < len(lines):
+            ln = lines[i]
+            try:
+                if ln.startswith("@end "):
+                    emeta, _ = parse_meta(ln, "@end")
+                    sh["end"] = emeta
+                    ended = True
+                    i += 1
+                    break
+                if ln.startswith("> "):
+                    m = re.match(r"^> ([A-Z]{1,3})(\d+): (.*)$", ln)
+                    if not m:
+                        raise ValueError(f"bad preamble line {ln[:80]!r}")
+                    v = decode_field(m.group(3), typed)
+                    if v is None:
+                        raise ValueError("empty preamble cell")
+                    sh["cells"][(int(m.group(2)), col_index(m.group(1)) + 1)] = v
+                elif ln.startswith("@cont "):
                     pass
+                elif ln == "":
+                    pass
+                elif ln.startswith("| row |"):
+                    if header_line is None:
+                        header_line = ln
+                        fields = split_row(ln)
+                        if len(fields) != len(cols) + 1:
+                            raise ValueError(f"header has {len(fields) - 1} cells, cols= says {len(cols)}")
+                        sh["header_fields"] = [unpad(f) for f in fields[1:]]
+                        if hr != "none":
+                            for k, f in enumerate(sh["header_fields"]):
+                                v = decode_field(f, typed)
+                                if v is not None:
+                                    sh["cells"][(int(hr), cols[k] + 1)] = v
+                    elif ln != header_line:
+                        raise ValueError("a repeated header differs from the first one")
+                elif ln.startswith("| ---: |"):
+                    if len(split_row(ln)) != len(cols) + 1:
+                        raise ValueError("delimiter row has the wrong cell count")
+                elif ln.startswith("| "):
+                    fields = split_row(ln)
+                    if len(fields) != len(cols) + 1:
+                        raise ValueError(f"row has {len(fields) - 1} cells, cols= says {len(cols)}: {ln[:80]!r}")
+                    rown = int(unpad(fields[0]))
+                    if sh["body_rows"] and rown <= sh["body_rows"][-1]:
+                        raise ValueError(f"row {rown} out of order")
+                    sh["body_rows"].append(rown)
+                    for k, f in enumerate(fields[1:]):
+                        v = decode_field(unpad(f), typed)
+                        if v is not None:
+                            sh["cells"][(rown, cols[k] + 1)] = v
+                else:
+                    raise ValueError(f"unexpected line {ln[:80]!r}")
+            except (ValueError, IndexError) as e:
+                sh["errors"].append(f"line {i + 1}: {e}")
+            i += 1
+        if not ended:
+            gate.fail(f"{where}: sheet {meta.get('name')!r} has no @end (cut off)")
+    return {"file": fmeta, "sheets": sheets}
 
-    # Check for __binary__
-    binaries = {}
-    bin_blocks = re.findall(r'##\s+__binary__:\s+([^\n]+)\n\n```base64\n(.*?)\n```', content, re.DOTALL)
-    for b_path, b_b64 in bin_blocks:
-        binaries[b_path.strip()] = b_b64.strip()
-        
-    # Process files
-    restored_count = 0
-    for entry in manifest_files:
-        rel_path = entry["path"]
-        expected_sha = entry["sha256"]
-        expected_bytes = entry["bytes"]
-        is_binary = entry.get("kind") == "binary" or entry.get("binary", False)
-        
-        target_path = os.path.join(out_dir, rel_path)
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        
-        if is_binary and rel_path in binaries:
-            data = base64.b64decode(binaries[rel_path])
-            with open(target_path, 'wb') as f:
-                f.write(data)
+
+def check_grid_self(g, gate, where):
+    """Counts and hashes inside the Markdown agree with themselves."""
+    for sh in g["sheets"]:
+        m, name = sh["meta"], sh["meta"].get("name")
+        if "skipped" in m:
+            continue
+        for e in sh["errors"]:
+            gate.fail(f"{where} [{name}] {e}")
+        n, sha = canon_sha(sh["cells"])
+        end = sh.get("end", {})
+        if str(n) != m.get("cells") or str(n) != end.get("cells"):
+            gate.fail(f"{where} [{name}] decoded {n} cells, meta says {m.get('cells')} / end {end.get('cells')}")
+        if sha != m.get("sha256") or sha != end.get("sha256"):
+            gate.fail(f"{where} [{name}] decoded sha256 {sha[:12]} ≠ meta {m.get('sha256', '')[:12]} / end {end.get('sha256', '')[:12]}")
+        if str(len(sh["body_rows"])) != m.get("body_rows") or m.get("body_rows") != end.get("body_rows"):
+            gate.fail(f"{where} [{name}] {len(sh['body_rows'])} body rows, meta says {m.get('body_rows')}")
+
+
+# ------------------------------------------------------------------- oracles
+
+def canon_py(v, data_type=None):
+    """openpyxl value → (kind, text) or None (the written TM-GRID/1 rules)."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return ("b", "TRUE" if v else "FALSE")
+    if isinstance(v, int):
+        return ("n", str(v))
+    if isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")):
+            return ("e", "#NUM!")
+        if v == 0:
+            return ("n", "0")  # -0.0 reads as 0 (Excel shows 0)
+        t = format(Decimal(repr(v)), "f")
+        return ("n", t[:-2] if t.endswith(".0") else t)
+    if isinstance(v, dt.datetime):
+        ms = v.microsecond // 1000
+        frac = f".{ms:03d}" if ms else ""
+        if (v.hour, v.minute, v.second, ms) == (0, 0, 0, 0):
+            return ("d", v.strftime("%Y-%m-%d"))
+        return ("d", v.strftime("%Y-%m-%d %H:%M:%S") + frac)
+    if isinstance(v, dt.date):
+        return ("d", v.strftime("%Y-%m-%d"))
+    if isinstance(v, dt.time):
+        ms = v.microsecond // 1000
+        return ("d", v.strftime("%H:%M:%S") + (f".{ms:03d}" if ms else ""))
+    if isinstance(v, dt.timedelta):
+        total_ms = round(abs(v.total_seconds()) * 1000)
+        h, rem = divmod(total_ms, 3_600_000)
+        m, rem = divmod(rem, 60_000)
+        s, ms = divmod(rem, 1000)
+        return ("d", f"{'-' if v.total_seconds() < 0 else ''}{h}:{m:02d}:{s:02d}" + (f".{ms:03d}" if ms else ""))
+    s = str(v)
+    if s == "":
+        return None
+    if data_type == "e":
+        return ("e", s)
+    return ("s", s)
+
+
+def oracle_workbook(path):
+    """{name: {'state', 'kind', 'cells', 'merged', 'formulas'}} in sheet order."""
+    import openpyxl  # noqa: PLC0415
+    wb = openpyxl.load_workbook(path, data_only=True)
+    try:
+        wbf = openpyxl.load_workbook(path, data_only=False)
+    except Exception:  # noqa: BLE001
+        wbf = None
+    out = {}
+    for name in wb.sheetnames:
+        ws = wb[name]
+        state = {"veryHidden": "veryhidden"}.get(ws.sheet_state, ws.sheet_state)
+        if ws.__class__.__name__ != "Worksheet":
+            out[name] = {"state": state, "kind": "chartsheet", "cells": {}, "merged": set(), "formulas": 0}
+            continue
+        cells = {}
+        for row in ws.iter_rows():
+            for c in row:
+                v = canon_py(c.value, c.data_type)
+                if v is not None:
+                    cells[(c.row, c.column)] = v
+        formulas = 0
+        if wbf is not None:
+            for row in wbf[name].iter_rows():
+                for c in row:
+                    if c.data_type == "f":
+                        formulas += 1
+        merged = {str(r) for r in ws.merged_cells.ranges}
+        out[name] = {"state": state, "kind": "worksheet", "cells": cells, "merged": merged, "formulas": formulas}
+    return out
+
+
+def oracle_delimited(path, delim):
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        recs = list(csv.reader(f, delimiter=delim))
+    cells = {}
+    for r, rec in enumerate(recs, 1):
+        for c, v in enumerate(rec, 1):
+            if v != "":
+                cells[(r, c)] = ("s", v)
+    name = os.path.basename(path)
+    return {name: {"state": "visible", "kind": "worksheet", "cells": cells, "merged": set(), "formulas": 0, "text": True}}
+
+
+def glob_match(p, t):
+    return re.fullmatch("".join(".*" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in p), t, re.S) is not None
+
+
+def guess_header(cells):
+    """Independent copy of the header heuristic (typed sheets)."""
+    if not cells:
+        return None
+    cols = [c for _, c in cells]
+    width = max(cols) - min(cols) + 1
+    need = max(2, -(-width // 2))
+    rows = {}
+    for (r, _), (k, _) in cells.items():
+        n, all_s = rows.get(r, (0, True))
+        rows[r] = (n + 1, all_s and k == "s")
+    for r in sorted(rows):
+        if rows[r][0] >= need and rows[r][1]:
+            return r
+    return None
+
+
+def resolve_cols(specs, header, lo, hi):
+    """Same documented rules as the encoder: exact header name, letters/ranges, then case-insensitive."""
+    out, missing = [], []
+    for spec in specs:
+        exact = [c for c, t in header.items() if t == spec]
+        if len(exact) == 1:
+            c = exact[0]
+        elif len(exact) > 1:
+            missing.append(spec)
+            continue
         else:
-            # Extract fenced block for ## rel_path
-            pattern = re.compile(
-                rf'##\s+{re.escape(rel_path)}[^\n]*\n+(?P<fence>`{{3,}})[^\n]*\n(?P<content>.*?)\n(?P=fence)',
-                re.DOTALL
-            )
-            m_fenced = pattern.search(content)
-            if not m_fenced:
-                print(f"[!] Gate Failed: Content for {rel_path} not found in archive", file=sys.stderr)
-                return False
-            data = m_fenced.group("content").encode('utf-8')
-            if len(data) == expected_bytes and sha256_bytes(data) == expected_sha:
-                pass
-            elif len(data) + 1 == expected_bytes:
-                data += b'\n'
-            elif len(data) - 1 == expected_bytes and data.endswith(b'\n'):
-                data = data[:-1]
-            elif sha256_bytes(data.replace(b'\n', b'\r\n')) == expected_sha:
-                data = data.replace(b'\n', b'\r\n')
-            elif sha256_bytes(data.replace(b'\n', b'\r\n') + b'\r\n') == expected_sha:
-                data = data.replace(b'\n', b'\r\n') + b'\r\n'
-            elif not data.endswith(b'\n') and sha256_bytes(data + b'\n') == expected_sha:
-                data += b'\n'
-                    
-            with open(target_path, 'wb') as f:
-                f.write(data)
-                
-        actual_sha = sha256_bytes(open(target_path, 'rb').read())
-        actual_bytes = os.path.getsize(target_path)
-        
-        if actual_sha != expected_sha and not (is_binary and rel_path not in binaries):
-            print(f"[!] Gate Failed: SHA-256 mismatch for restored {rel_path}: {actual_sha} != {expected_sha}", file=sys.stderr)
-            return False
-        restored_count += 1
-        
-    print(f"[+] Archive restore verified: {restored_count} files restored with matching SHA-256 (Gate G11 PASS).")
-    return True
+            a, _, b = spec.partition("-")
+            ia, ib = col_index(a), col_index(b or a)
+            if ia is not None and ib is not None and ia <= ib and ia >= lo and ib <= hi:
+                for c in range(ia, ib + 1):
+                    if c not in out:
+                        out.append(c)
+                continue
+            loose = [c for c, t in header.items() if t.strip().lower() == spec.strip().lower()]
+            if len(loose) != 1:
+                missing.append(spec)
+                continue
+            c = loose[0]
+        if c not in out:
+            out.append(c)
+    return out, missing
 
-def run_slices_check(merged_path: str, src_root: str, selection_path: str) -> bool:
-    print(f"[*] Verifying sub-file slices: {merged_path}")
-    with open(merged_path, 'r', encoding='utf-8') as f:
-        md_text = f.read()
-        
-    # Check that [tm:omitted markers exist where appropriate
-    omitted_count = len(re.findall(r'<!--\s*\[tm:omitted\s+\d+\s+lines[^\]]*\]\s*-->', md_text))
-    print(f"[+] Verified slices: {omitted_count} transparent omission notices detected (Gate G7 & G10 PASS).")
-    return True
+
+def sheet_pick(entry, name):
+    over = next((o for o in entry.get("sheet", []) if o.get("name") == name or glob_match(o.get("name", ""), name)), None)
+    pick = {"header_row": entry.get("header_row"), "columns": entry.get("columns", []), "rows": entry.get("rows", [])}
+    if over:
+        if over.get("header_row") is not None:
+            pick["header_row"] = over["header_row"]
+        if over.get("columns"):
+            pick["columns"] = over["columns"]
+        if over.get("rows"):
+            pick["rows"] = over["rows"]
+    return pick
+
+
+def rows_ok(specs):
+    rng = []
+    for s in specs:
+        a, _, b = str(s).partition("-")
+        rng.append((int(a), int(b or a)))
+    return lambda r: not rng or any(a <= r <= b for a, b in rng)
+
+
+def verify_grid_against_oracle(block, g, entry, src_root, gate):
+    rel = block["path"]
+    where = rel
+    src = os.path.join(src_root, rel)
+    if not os.path.isfile(src):
+        gate.fail(f"{where}: source not found at {src}")
+        return
+    ext = os.path.splitext(rel)[1].lower()
+    if ext in (".csv", ".tsv", ".tab"):
+        oracle = oracle_delimited(src, "\t" if ext != ".csv" else ",")
+    else:
+        oracle = oracle_workbook(src)
+    with open(src, "rb") as f:
+        data = f.read()
+    fm = g["file"]
+    if fm.get("path") != rel:
+        gate.fail(f"{where}: @file path={fm.get('path')!r} ≠ block path")
+    if fm.get("source_sha256") != hashlib.sha256(data).hexdigest() or fm.get("bytes") != str(len(data)):
+        gate.fail(f"{where}: @file bytes/source_sha256 do not match the source on disk")
+    names = list(oracle)
+    got = [sh["meta"].get("name") for sh in g["sheets"]]
+    if got != names:
+        gate.fail(f"{where}: sheets {got} ≠ source sheets {names}")
+        return
+    if fm.get("sheets") != str(len(names)):
+        gate.fail(f"{where}: @file sheets={fm.get('sheets')} ≠ {len(names)}")
+    entry = entry or {}
+    sel_sheets, excl = entry.get("sheets", []), entry.get("exclude_sheets", [])
+    for sh in g["sheets"]:
+        m, name = sh["meta"], sh["meta"].get("name")
+        o = oracle[name]
+        gate.add("sheets")
+        if m.get("state") != o["state"]:
+            gate.fail(f"{where} [{name}] state={m.get('state')} ≠ source {o['state']}")
+        selected = (not sel_sheets or any(p == name or glob_match(p, name) for p in sel_sheets)) and not any(
+            p == name or glob_match(p, name) for p in excl)
+        if "skipped" in m:
+            gate.add("sheets_skipped")
+            why = m["skipped"]
+            if selected and o["kind"] == "worksheet" and not why.startswith("unreadable"):
+                gate.fail(f"{where} [{name}] selected sheet was skipped ({why})")
+            if not selected and why != "not selected":
+                gate.fail(f"{where} [{name}] skip reason {why!r}")
+            continue
+        if not selected:
+            gate.fail(f"{where} [{name}] was emitted but the selection leaves it out")
+        cells_all = o["cells"]
+        if not cells_all:
+            if m.get("cells") != "0":
+                gate.fail(f"{where} [{name}] source is empty, meta cells={m.get('cells')}")
+            continue
+        rows = [r for r, _ in cells_all]
+        cols = [c - 1 for _, c in cells_all]
+        used = f"{col_letter(min(cols))}{min(rows)}:{col_letter(max(cols))}{max(rows)}"
+        if m.get("used") != used:
+            gate.fail(f"{where} [{name}] used={m.get('used')} ≠ source {used}")
+        pick = sheet_pick(entry, name)
+        text_sheet = o.get("text", False)
+        if pick["header_row"] is not None:
+            hr = int(pick["header_row"])
+        elif text_sheet:
+            hr = 1 if any(r == 1 for r, _ in cells_all) else None
+        else:
+            hr = guess_header(cells_all)
+        if m.get("header_row") != (str(hr) if hr is not None else "none"):
+            gate.fail(f"{where} [{name}] header_row={m.get('header_row')} ≠ expected {hr}")
+            continue
+        header = {c - 1: t for (r, c), (_, t) in cells_all.items() if r == hr} if hr is not None else {}
+        if pick["columns"]:
+            want, missing = resolve_cols(pick["columns"], header, min(cols), max(cols))
+            if missing:
+                gate.fail(f"{where} [{name}] columns not resolvable: {missing}")
+        else:
+            want = list(range(min(cols), max(cols) + 1))
+        if expand_cols(m.get("cols", "-")) != want:
+            gate.fail(f"{where} [{name}] cols={m.get('cols')} ≠ expected {','.join(col_letter(c) for c in want)}")
+            continue
+        keep_row = rows_ok(pick["rows"])
+        wantset = {c + 1 for c in want}
+        expected = {}
+        for (r, c), v in cells_all.items():
+            if c not in wantset:
+                continue
+            if hr is not None and r <= hr:
+                expected[(r, c)] = v
+            elif keep_row(r):
+                expected[(r, c)] = v
+        if text_sheet:
+            expected = {k: ("s", t) for k, (_, t) in expected.items()}
+        decoded = sh["cells"]
+        gate.add("cells_source", len(expected))
+        gate.add("cells_decoded", len(decoded))
+        diff = 0
+        for key in sorted(set(expected) | set(decoded)):
+            a, b = expected.get(key), decoded.get(key)
+            if a == b:
+                continue
+            diff += 1
+            r, c = key
+            ref = f"{col_letter(c - 1)}{r}"
+            if a is None:
+                gate.fail(f"{where} [{name}] {ref}: extra cell {b!r}")
+            elif b is None:
+                gate.fail(f"{where} [{name}] {ref}: MISSING cell {a!r}")
+            elif a[1] == b[1]:
+                gate.fail(f"{where} [{name}] {ref}: type {b[0]} ≠ source {a[0]} for {a[1][:60]!r}")
+            elif a[1].strip() == b[1] and a[1] != b[1]:
+                gate.add("edge_whitespace_lost")
+                gate.fail(f"{where} [{name}] {ref}: edge whitespace lost: source {a[1][:60]!r}")
+            else:
+                gate.fail(f"{where} [{name}] {ref}: text {b[1][:60]!r} ≠ source {a[1][:60]!r}")
+        if diff == 0:
+            gate.add("sheets_exact")
+        n, sha = canon_sha(expected)
+        if sha != m.get("sha256"):
+            gate.fail(f"{where} [{name}] source-side sha256 {sha[:12]} ≠ meta {m.get('sha256', '')[:12]}")
+        if not text_sheet:
+            mg = set(filter(None, m.get("merged", "-").replace("-", "").split(";"))) if m.get("merged") != "-" else set()
+            if mg != o["merged"]:
+                gate.fail(f"{where} [{name}] merged={sorted(mg)} ≠ source {sorted(o['merged'])}")
+            if m.get("formulas") != str(o["formulas"]):
+                gate.fail(f"{where} [{name}] formulas={m.get('formulas')} ≠ source {o['formulas']}")
+
+
+def load_plan(path):
+    if not path:
+        return {}
+    with open(path, "rb") as f:
+        plan = tomllib.load(f)
+    return {norm_rel(e["path"]): e for e in plan.get("file", [])}, plan
+
+
+def norm_rel(p):
+    return "/".join(x for x in p.replace("\\", "/").split("/") if x not in ("", "."))
+
+
+def cmd_grid(merged, src_root, selection, gate=None):
+    gate = gate or Gate("grid")
+    entries = load_plan(selection)[0] if selection else {}
+    with open(merged, encoding="utf-8", newline="") as f:
+        text = f.read()
+    n = 0
+    for b in md_blocks(text):
+        if b["lang"] != "tm-grid":
+            continue
+        n += 1
+        g = decode_grid(b["content"], gate, b["path"])
+        if g is None:
+            continue
+        check_grid_self(g, gate, b["path"])
+        verify_grid_against_oracle(b, g, entries.get(norm_rel(b["path"])), src_root, gate)
+    gate.add("grid_blocks", n)
+    if selection:
+        for rel, e in entries.items():
+            ext = os.path.splitext(rel)[1].lower()
+            is_table = ext in (".xlsx", ".xlsm", ".xls", ".xlsb", ".ods") or (
+                ext in (".csv", ".tsv") and any(e.get(k) for k in ("columns", "rows", "header_row")))
+            if is_table and not e.get("exclude") and not any(norm_rel(b["path"]) == rel and b["lang"] == "tm-grid" for b in md_blocks(text)):
+                gate.fail(f"{rel}: planned table has no tm-grid block")
+    return gate
+
+
+# ------------------------------------------------------------------- slices
+
+def scan_headings(lines):
+    heads, fence = [], None
+    for i, raw in enumerate(lines):
+        line = raw.rstrip("\n").rstrip("\r")
+        indent = len(line) - len(line.lstrip(" "))
+        rest = line[indent:]
+        if indent <= 3 and rest[:1] in ("`", "~"):
+            ch = rest[0]
+            n = len(rest) - len(rest.lstrip(ch))
+            if n >= 3:
+                if fence is None:
+                    fence = (ch, n)
+                    continue
+                if fence[0] == ch and n >= fence[1] and rest[n:].strip() == "":
+                    fence = None
+                    continue
+        if fence is not None or indent > 3 or not rest.startswith("#"):
+            continue
+        h = len(rest) - len(rest.lstrip("#"))
+        if h > 6:
+            continue
+        after = rest[h:]
+        if not (after == "" or after[0] in " \t"):
+            continue
+        t = after.strip()
+        stripped = t.rstrip("#")
+        if len(stripped) < len(t) and (stripped == "" or stripped[-1] in " \t"):
+            t = stripped.rstrip()
+        heads.append({"level": h, "text": t, "line": i})
+    for k, hd in enumerate(heads):
+        hd["own_end"] = heads[k + 1]["line"] if k + 1 < len(heads) else len(lines)
+        nxt = next((x for x in heads[k + 1:] if x["level"] <= hd["level"]), None)
+        hd["sub_end"] = nxt["line"] if nxt else len(lines)
+    return heads
+
+
+def parse_pattern(p):
+    own = p.startswith("own:")
+    if own:
+        p = p[4:]
+    m = re.match(r"^[Hh]([1-6]):(.*)$", p, re.S)
+    if m:
+        return own, int(m.group(1)), m.group(2)
+    return own, None, p
+
+
+def expected_slice(text, e):
+    """Re-implementation of slice_text from the written rules → expected output string."""
+    lines = text.splitlines(keepends=True)
+    total = len(lines)
+    heads = scan_headings(lines)
+    keep = [False] * total
+    if e.get("lines"):
+        for spec in e["lines"]:
+            a, _, b = str(spec).partition("-")
+            a, b = int(a), int(b or a)
+            for i in range(a - 1, min(b, total)):
+                keep[i] = True
+    else:
+        first = heads[0]["line"] if heads else total
+        secs, matches = e.get("sections", []), e.get("match", [])
+        if not secs and not matches:
+            keep = [True] * total
+            if e.get("preamble") is False:
+                for i in range(first):
+                    keep[i] = False
+        elif e.get("preamble", bool(secs)):
+            for i in range(first):
+                keep[i] = True
+
+        def mark(p, on):
+            own, lvl, glob = parse_pattern(p)
+            for hd in heads:
+                if (lvl is None or lvl == hd["level"]) and glob_match(glob, hd["text"]):
+                    for i in range(hd["line"], hd["own_end"] if own else hd["sub_end"]):
+                        keep[i] = on
+
+        for p in secs:
+            mark(p, True)
+        for rx in matches:
+            r = re.compile(rx)
+            for i, ln in enumerate(lines):
+                if r.search(ln.rstrip("\n").rstrip("\r")):
+                    keep[i] = True
+                    if e.get("heading_context"):
+                        hd = next((x for x in reversed(heads) if x["line"] <= i), None)
+                        if hd:
+                            keep[hd["line"]] = True
+        for p in e.get("exclude_sections", []):
+            mark(p, False)
+    kept_lines = sum(keep)
+    kept_bytes = sum(len(lines[i].encode("utf-8")) for i in range(total) if keep[i])
+    kept_secs = sum(1 for hd in heads if keep[hd["line"]])
+    label = e.get("label") or e["path"]
+    out = [f"[tm:slice label={json.dumps(label, ensure_ascii=False)} kept=\"{kept_lines} of {total} lines\" "
+           f"sections=\"{kept_secs} of {len(heads)}\" bytes=\"{kept_bytes} of {len(text.encode('utf-8'))}\"]\n"]
+    i = 0
+    while i < total:
+        start, k = i, keep[i]
+        while i < total and keep[i] == k:
+            i += 1
+        if k:
+            for j in range(start, i):
+                ln = lines[j]
+                out.append(ln if (ln.endswith("\n") or j + 1 == total) else ln + "\n")
+        else:
+            b = sum(len(lines[j].encode("utf-8")) for j in range(start, i))
+            inside = [hd for hd in heads if start <= hd["line"] < i]
+            what = ""
+            if inside:
+                what = f" (section {json.dumps(inside[0]['text'], ensure_ascii=False)}" + (
+                    f" + {len(inside) - 1} more)" if len(inside) > 1 else ")")
+            out.append(f"[tm:omitted lines {start + 1}-{i}{what} — {i - start} lines, {b} bytes]\n")
+    return "".join(out)
+
+
+def cmd_slices(merged, src_root, selection, gate=None):
+    gate = gate or Gate("slices")
+    entries, _ = load_plan(selection)
+    with open(merged, encoding="utf-8", newline="") as f:
+        blocks = {norm_rel(b["path"]): b for b in md_blocks(f.read())}
+    for rel, e in entries.items():
+        if not any(e.get(k) for k in ("lines", "sections", "exclude_sections", "match")) and e.get("preamble") is not False:
+            continue
+        if e.get("max_tokens"):
+            gate.note(f"{rel}: max_tokens slice not re-derived (needs the o200k tokenizer)")
+            continue
+        b = blocks.get(rel)
+        if b is None:
+            gate.fail(f"{rel}: sliced file missing from the merge")
+            continue
+        with open(os.path.join(src_root, rel), "rb") as f:
+            raw = f.read()
+        src = raw.decode("utf-8")
+        if src.startswith("﻿"):
+            src = src[1:]
+        if "\r\n" in src and "\r" not in b["content"]:
+            src = src.replace("\r\n", "\n")  # --reproducible
+        want = expected_slice(src, e)
+        got = b["content"] + "\n"
+        gate.add("sliced_files")
+        if got == want or (not want.endswith("\n") and got == want + "\n"):
+            gate.add("byte_identical")
+            continue
+        wl, gl = want.splitlines(), got.splitlines()
+        k = next((n for n, (x, y) in enumerate(zip(wl, gl)) if x != y), min(len(wl), len(gl)))
+        gate.fail(f"{rel}: slice differs at output line {k + 1}: expected {wl[k][:90] if k < len(wl) else '<end>'!r} got {gl[k][:90] if k < len(gl) else '<end>'!r}")
+    return gate
+
+
+# --------------------------------------------------------------- accounting
+
+def cmd_accounting(json_path, selection, gate=None):
+    gate = gate or Gate("accounting")
+    entries, plan = load_plan(selection)
+    with open(json_path, encoding="utf-8") as f:
+        doc = json.load(f)
+    files = doc.get("files", [])
+    got = {norm_rel(x.get("path", "")): x for x in files}
+    for rel, e in entries.items():
+        if e.get("exclude"):
+            continue
+        gate.add("planned")
+        if rel not in got:
+            gate.fail(f"{rel}: planned but not in the merge")
+            continue
+        gate.add("merged")
+        ext = os.path.splitext(rel)[1].lower()
+        want_grid = ext in (".xlsx", ".xlsm", ".xls", ".xlsb", ".ods") or (ext in (".csv", ".tsv") and any(e.get(k) for k in ("columns", "rows", "header_row")))
+        lang = got[rel].get("language", got[rel].get("lang", ""))
+        if want_grid and lang != "tm-grid":
+            gate.fail(f"{rel}: language {lang!r}, expected tm-grid")
+    extra = [p for p in got if p not in entries]
+    if extra and plan.get("mode") == "explicit":
+        gate.fail(f"files not in the plan: {extra[:5]}")
+    skipped = doc.get("skipped") or doc.get("not_captured_files") or []
+    nc = [s for s in skipped if isinstance(s, dict) and s.get("kind", "").lower().replace("_", "") in ("notcaptured",)]
+    summary = doc.get("summary", {})
+    ncount = summary.get("not_captured", len(nc)) if isinstance(summary, dict) else len(nc)
+    if ncount:
+        gate.fail(f"not captured: {ncount} {nc[:3]}")
+    gate.add("not_captured", ncount)
+    return gate
+
+
+# ------------------------------------------------------------ decode & cold
+
+def py_value(kind, text):
+    if kind == "n":
+        return int(text) if RE_NUM.match(text) and "." not in text else float(text)
+    if kind == "b":
+        return text == "TRUE"
+    if kind == "d":
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", text):
+            return dt.datetime.strptime(text, "%Y-%m-%d")
+        if re.match(r"^\d{4}-", text):
+            fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in text else "%Y-%m-%d %H:%M:%S"
+            return dt.datetime.strptime(text, fmt)
+        neg = text.startswith("-")
+        h, m, s = text.lstrip("-").split(":")
+        sec = float(s)
+        td = dt.timedelta(hours=int(h), minutes=int(m), seconds=sec)
+        if not neg and int(h) < 24 and len(h) == 2:
+            return (dt.datetime.min + td).time()
+        return -td if neg else td
+    return text
+
+
+def cmd_decode(merged, out_dir, xlsx=False):
+    gate = Gate("decode")
+    with open(merged, encoding="utf-8", newline="") as f:
+        text = f.read()
+    os.makedirs(out_dir, exist_ok=True)
+    built = []
+    for b in md_blocks(text):
+        if b["lang"] != "tm-grid":
+            continue
+        g = decode_grid(b["content"], gate, b["path"])
+        if g is None:
+            continue
+        check_grid_self(g, gate, b["path"])
+        base = os.path.join(out_dir, norm_rel(b["path"]))
+        os.makedirs(base, exist_ok=True)
+        for sh in g["sheets"]:
+            if "skipped" in sh["meta"]:
+                continue
+            nm = re.sub(r"[^\w.-]+", "_", sh["meta"]["name"])[:80]
+            with open(os.path.join(base, nm + ".jsonl"), "w", encoding="utf-8") as f:
+                for (r, c), (k, t) in sorted(sh["cells"].items()):
+                    f.write(json.dumps({"row": r, "col": c, "type": k, "text": t}, ensure_ascii=False) + "\n")
+        if xlsx and not b["path"].lower().endswith((".csv", ".tsv")):
+            import openpyxl  # noqa: PLC0415
+            wb = openpyxl.Workbook()
+            wb.remove(wb.active)
+            for sh in g["sheets"]:
+                ws = wb.create_sheet(sh["meta"]["name"][:31])
+                state = sh["meta"].get("state", "visible")
+                ws.sheet_state = {"veryhidden": "veryHidden"}.get(state, state)
+                for (r, c), (k, t) in sh["cells"].items():
+                    cell = ws.cell(row=r, column=c)
+                    if k == "s":
+                        cell.value = t
+                        cell.data_type = "s"  # never let '=…' become a formula
+                    elif k == "e":
+                        cell.value = t
+                        cell.data_type = "e"
+                    else:
+                        cell.value = py_value(k, t)
+                        if k == "d" and isinstance(cell.value, dt.timedelta):
+                            cell.number_format = "[h]:mm:ss"
+                for rng in filter(None, sh["meta"].get("merged", "-").split(";")):
+                    if rng != "-":
+                        ws.merged_cells.add(rng)
+            path = base + ".rebuilt.xlsx"
+            wb.save(path)
+            built.append(path)
+    gate.add("workbooks_rebuilt", len(built))
+    return gate
+
+
+def cmd_cold(merged, src_root, work, selection=None):
+    gate = Gate("cold")
+    if os.path.exists(work):
+        shutil.rmtree(work)
+    os.makedirs(work)
+    shutil.copy(merged, os.path.join(work, "merged.md"))
+    shutil.copy(os.path.abspath(__file__), os.path.join(work, "tm_verify.py"))
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": work}
+    for k in ("PYTHONUSERBASE",):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    user_site = subprocess.run([sys.executable, "-c", "import site;print(site.getusersitepackages())"],
+                               capture_output=True, text=True).stdout.strip()
+    if user_site:
+        env["PYTHONPATH"] = user_site  # openpyxl may live there; the source tree is never on the path
+    r = subprocess.run([sys.executable, "-P", "tm_verify.py", "decode", "merged.md", "--out", "rebuilt", "--xlsx"],
+                       cwd=work, env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        gate.fail(f"decode in the empty folder failed: {r.stderr.strip()[-400:]}")
+        return gate
+    with open(merged, encoding="utf-8", newline="") as f:
+        text = f.read()
+    for b in md_blocks(text):
+        if b["lang"] != "tm-grid" or b["path"].lower().endswith((".csv", ".tsv")):
+            continue
+        rebuilt = os.path.join(work, "rebuilt", norm_rel(b["path"]) + ".rebuilt.xlsx")
+        if not os.path.isfile(rebuilt):
+            gate.fail(f"{b['path']}: no rebuilt workbook")
+            continue
+        g = decode_grid(b["content"], Gate("tmp"), b["path"])
+        rb = oracle_workbook(rebuilt)
+        orig = oracle_workbook(os.path.join(src_root, b["path"]))
+        for sh in g["sheets"]:
+            if "skipped" in sh["meta"]:
+                continue
+            name = sh["meta"]["name"]
+            got = rb.get(name[:31], {}).get("cells", {})
+            if got != sh["cells"]:
+                k = next(k for k in sorted(set(got) | set(sh["cells"])) if got.get(k) != sh["cells"].get(k))
+                gate.fail(f"{b['path']} [{name}] rebuilt workbook ≠ Markdown cells at {k}: rebuilt {got.get(k)!r} vs md {sh['cells'].get(k)!r}")
+                continue
+            o = orig[name]["cells"]
+            bad = [k for k, v in got.items() if o.get(k) != v]
+            if bad:
+                gate.fail(f"{b['path']} [{name}] {len(bad)} rebuilt cells ≠ original, first {bad[0]}")
+            else:
+                gate.add("sheets_cell_identical")
+                gate.add("cells", len(got))
+    return gate
+
+
+# ------------------------------------------------------------------ restore
+
+def cmd_restore(archive, out_dir, src_root=None):
+    gate = Gate("restore")
+    with open(archive, encoding="utf-8", newline="") as f:
+        text = f.read()
+    blocks = md_blocks(text)
+    man = next((b for b in blocks if b["path"] == "__manifest__"), None)
+    if man is None:
+        gate.fail("no ## __manifest__ block")
+        return gate
+    entries = [json.loads(x) for x in man["content"].splitlines() if x.strip()]
+    bins = {b["path"][len("__binary__: "):]: b["content"] for b in blocks if b["path"].startswith("__binary__: ")}
+    content = {b["path"]: b for b in blocks}
+    os.makedirs(out_dir, exist_ok=True)
+    for e in entries:
+        rel = e["path"]
+        target = os.path.join(out_dir, rel)
+        os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+        if rel in bins:
+            data = base64.b64decode("".join(bins[rel].split()))
+        elif e.get("kind") == "text" and rel in content:
+            body = content[rel]["content"]
+            if e.get("eol") == "crlf":
+                body = body.replace("\r\n", "\n")
+                if body.endswith("\r"):  # the CR of the last CRLF sits before the closing fence
+                    body = body[:-1]
+            if e.get("final_newline") and e["bytes"] > 0:
+                body += "\n"
+            if e.get("eol") == "crlf":
+                body = body.replace("\n", "\r\n")
+            data = body.encode("utf-8") if e["bytes"] > 0 else b""
+        else:
+            gate.fail(f"{rel}: {e.get('kind')} file has no embedded bytes (use --embed-binary)")
+            continue
+        with open(target, "wb") as f:
+            f.write(data)
+        if e.get("mode"):
+            os.chmod(target, e["mode"] & 0o777)
+        sha = hashlib.sha256(data).hexdigest()
+        if len(data) != e["bytes"] or sha != e["sha256"]:
+            gate.fail(f"{rel}: restored {len(data)} B sha {sha[:12]} ≠ manifest {e['bytes']} B {e['sha256'][:12]}")
+            continue
+        if src_root:
+            with open(os.path.join(src_root, rel), "rb") as f:
+                if hashlib.sha256(f.read()).hexdigest() != sha:
+                    gate.fail(f"{rel}: restored file ≠ the original on disk")
+                    continue
+        gate.add("byte_identical")
+        gate.add("bytes", len(data))
+    gate.add("manifest_files", len(entries))
+    return gate
+
+
+# -------------------------------------------------------------------- audit
+
+def cmd_audit(merged, src_root, out, selection=None):
+    entries = load_plan(selection)[0] if selection else {}
+    with open(merged, encoding="utf-8", newline="") as f:
+        text = f.read()
+    rows = ["# TurboMerger audit sample (source value vs decoded value)", "",
+            f"Merged file: `{merged}`  ", f"Written: {dt.datetime.now().astimezone().isoformat(timespec='seconds')}", "",
+            "Exhaustive checking is done by `grid`; this sample is for eyes: first/last 3 body rows of every sheet,",
+            "every 25th row, and every cell with a line break, pipe, backslash, leading quote, edge space, or > 1,000 chars.", ""]
+    for b in md_blocks(text):
+        if b["lang"] != "tm-grid":
+            continue
+        g = decode_grid(b["content"], Gate("tmp"), b["path"])
+        src = os.path.join(src_root, b["path"])
+        ext = os.path.splitext(src)[1].lower()
+        oracle = oracle_delimited(src, "\t" if ext == ".tsv" else ",") if ext in (".csv", ".tsv") else oracle_workbook(src)
+        rows.append(f"## {b['path']}")
+        for sh in g["sheets"]:
+            if "skipped" in sh["meta"]:
+                rows.append(f"- sheet `{sh['meta']['name']}`: skipped ({sh['meta']['skipped']})")
+                continue
+            o = oracle[sh["meta"]["name"]]["cells"]
+            br = sh["body_rows"]
+            pick = set(br[:3] + br[-3:] + br[::25])
+            rows.append(f"### `{sh['meta']['name']}` — {sh['meta'].get('body_rows')} rows, {sh['meta'].get('cells')} cells")
+            rows.append("| cell | source (oracle) | decoded from the bundle | equal |")
+            rows.append("| --- | --- | --- | --- |")
+            for (r, c), v in sorted(sh["cells"].items()):
+                t = v[1]
+                special = any(x in t for x in ("\n", "|", "\\")) or t.startswith("'") or t != t.strip() or len(t) > 1000
+                if r in pick or special:
+                    ov = o.get((r, c))
+                    show = lambda x: escape_cell(x[1][:120], False) + ("…" if len(x[1]) > 120 else "") if x else "∅"  # noqa: E731
+                    rows.append(f"| {col_letter(c - 1)}{r} | {show(ov)} | {show(v)} | {'yes' if ov == v else '**NO**'} |")
+            rows.append("")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join(rows) + "\n")
+    g = Gate("audit")
+    g.add("lines", len(rows))
+    return g
+
+
+# ----------------------------------------------------------------- selftest
+
+def find_bin(arg):
+    for c in (arg, os.environ.get("TURBOMERGER_BIN"), os.path.expanduser("~/.local/opt/TurboMerger-dev/turbomerger"),
+              os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "target", "debug", "turbomerger")):
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return os.path.abspath(c)
+    return None
+
+
+def build_fixtures(root):
+    import openpyxl  # noqa: PLC0415
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Cases"
+    ws["A1"] = "Second-chance cases (synthetic)"
+    ws["A2"] = "built for tm_verify selftest"
+    ws.merge_cells("A1:F1")
+    for i, h in enumerate(["id", "name", "note", "score", "flag", "when"], 1):
+        ws.cell(row=4, column=i, value=h)
+    data = [
+        ["1403811331", "Mercy | Lorain", "line one\nline two", 54, True, dt.datetime(2024, 1, 31)],
+        ["0123", "<br> literal", "back\\slash \\| mix", 45.5, False, dt.datetime(2024, 2, 1, 13, 45, 7)],
+        ["'quoted", " lead space", "tab\there", 1e-7, None, dt.time(9, 30)],
+        ["TRUE", "trail space ", "cr\rinside", 0.1 + 0.2, None, None],
+        ["x7", "Ünïcödé 😀 ‏RTL", "=SUM(1,2) as text", -0.0, None, None],
+    ]
+    for r, row in enumerate(data, 5):
+        for c, v in enumerate(row, 1):
+            if v is not None:
+                cell = ws.cell(row=r, column=c, value=v)
+                if isinstance(v, str):
+                    cell.data_type = "s"
+    ws.cell(row=10, column=4, value="#DIV/0!").data_type = "e"
+    ws["G12"] = "=D5*2"
+    hid = wb.create_sheet("Hidden")
+    hid["C5"] = "sparse start"
+    hid["D7"] = 3
+    hid.sheet_state = "hidden"
+    wb.create_sheet("Empty")
+    wb.save(os.path.join(root, "cases.xlsx"))
+    with open(os.path.join(root, "roster.csv"), "w", encoding="utf-8", newline="") as f:
+        f.write('Rank,Program,City,Why,Website\r\n1,"Mercy, Lorain",Lorain,"two\r\nlines","https://a.example"\r\n'
+                '2,"Say ""hi""",X,,https://b.example\r\n\r\n3,Third,Y,"pipe | and \\ back",\r\n')
+    with open(os.path.join(root, "dossier.md"), "w", encoding="utf-8", newline="") as f:
+        f.write("pre\n# DOSSIER TITLE\nintro\n## 0. Files\nf\n## 1. Summary\ns1\n### 1.1 Detail\n"
+                "d https://c.example/x\n```\n## fenced, not a heading\n```\n## 2. Rankings\nr\n## 3. Programs\n"
+                "### FM #1 Mercy\nlong text\nproof https://d.example\n### FM #2 Other\nno url here\n")
+    with open(os.path.join(root, "code.py"), "w", encoding="utf-8", newline="") as f:
+        f.write("".join(f"line {i}\n" for i in range(1, 21)))
+    sel = '''version = 1
+mode = "explicit"
+ordering = "plan"
+[[file]]
+path = "cases.xlsx"
+sheets = ["Cases", "Hidden"]
+[[file.sheet]]
+name = "Cases"
+header_row = 4
+columns = ["id", "name", "note", "score", "flag", "when"]
+[[file]]
+path = "roster.csv"
+columns = ["Rank", "Program", "Why", "Website"]
+[[file]]
+path = "dossier.md"
+sections = ["own:H1:DOSSIER*", "H2:1. Summary", "H2:2. *"]
+exclude_sections = ["H3:1.1 *"]
+match = ["https?://"]
+heading_context = true
+[[file]]
+path = "code.py"
+lines = ["2-4", "10"]
+'''
+    with open(os.path.join(root, "sel.toml"), "w", encoding="utf-8") as f:
+        f.write(sel)
+    return os.path.join(root, "sel.toml")
+
+
+def run_checks(md, js, root, sel):
+    gates = [cmd_grid(md, root, sel), cmd_slices(md, root, sel)]
+    if js:
+        gates.append(cmd_accounting(js, sel))
+    return gates
+
+
+def cmd_selftest(bin_arg):
+    tm = find_bin(bin_arg)
+    if not tm:
+        print("selftest: no turbomerger binary (--bin, $TURBOMERGER_BIN, ~/.local/opt/TurboMerger-dev)", file=sys.stderr)
+        return EXIT_USAGE
+    ok = True
+    with tempfile.TemporaryDirectory(prefix="tm_verify_selftest_") as tmp:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        sel = build_fixtures(src)
+        md, js = os.path.join(tmp, "out.md"), os.path.join(tmp, "out.json")
+        env = dict(os.environ, TURBOMERGER_NO_CACHE="1")
+        for out, fmt in ((md, "markdown"), (js, "json")):
+            r = subprocess.run([tm, "merge", src, out, "--selection", sel, "--format", fmt, "--reproducible", "--yes", "-q"],
+                               capture_output=True, text=True, env=env)
+            if r.returncode != 0:
+                print(f"selftest: turbomerger exit {r.returncode}: {r.stderr[-600:]}", file=sys.stderr)
+                return EXIT_GATE
+        clean = run_checks(md, js, src, sel)
+        for g in clean:
+            print(g.report())
+            ok &= g.ok
+        cg = cmd_cold(md, src, os.path.join(tmp, "cold"))
+        print(cg.report())
+        ok &= cg.ok
+        with open(md, encoding="utf-8", newline="") as f:
+            base = f.read()
+
+        def mut(n, a, b, count=1):
+            if a not in base:
+                return None, f"mutation {n}: anchor {a!r} not found"
+            return base.replace(a, b, count), None
+
+        def first_row(prefix):
+            return next(ln for ln in base.split("\n") if ln.startswith(prefix))
+
+        row5 = first_row("| 5 |")
+        row6 = first_row("| 6 |")
+        f5 = split_row(row5)
+        swapped = "|" + "|".join([f5[0], f5[2], f5[1]] + f5[3:]) + "|"
+        sheet_line = next(ln for ln in base.split("\n") if ln.startswith('@sheet 1/3 name="Cases"'))
+        sha = re.search(r"sha256=([0-9a-f]{64})", sheet_line).group(1)
+        mutations = [
+            ("change one character in a cell", *mut(1, "Mercy \\| Lorain", "Mercy \\| Lorsin")),
+            ("delete a body row", *mut(2, row6 + "\n", "")),
+            ("swap two adjacent cells", *mut(3, row5, swapped)),
+            ("change a number", *mut(4, " 45.5 |", " 45.6 |")),
+            ("insert an unescaped pipe", *mut(5, "Mercy \\| Lorain", "Mercy | Lorain")),
+            ("remove an @end", re.sub(r"\n@end sheet=1 [^\n]*", "", base, count=1), None),
+            ("edit the sha256", *mut(7, sha, sha[:-1] + ("0" if sha[-1] != "0" else "1"))),
+            ("swap two sheets", *mut(8, 'name="Hidden"', 'name="Hiddem"')),
+            ("duplicate a row", *mut(9, row6 + "\n", row6 + "\n" + row6 + "\n")),
+            ("strip a pad space", *mut(10, "| 54 |", "|54 |")),
+            ("delete a ' marker", *mut(11, "| '1403811331 |", "| 1403811331 |")),
+            ("replace <br> by a space", *mut(12, "line one<br>line two", "line one line two")),
+            ("alter a kept slice line", *mut(13, "\ns1\n", "\ns2\n")),
+            ("change an omitted-lines marker", re.sub(r"\[tm:omitted lines (\d+)-", lambda m: f"[tm:omitted lines {int(m.group(1)) + 1}-", base, count=1), None),
+        ]
+        detected = 0
+        for k, (name, text, err) in enumerate(mutations, 1):
+            if err or text is None or text == base:
+                print(f"  [!!] mutation {k:02d} ({name}) could not be applied: {err}")
+                ok = False
+                continue
+            mp = os.path.join(tmp, f"mut{k}.md")
+            with open(mp, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            gates = [cmd_grid(mp, src, sel), cmd_slices(mp, src, sel)]
+            if all(g.ok for g in gates):
+                print(f"  [!!] mutation {k:02d} ({name}) was NOT detected")
+                ok = False
+            else:
+                detected += 1
+                first = next(m for g in gates for m in g.fails)
+                print(f"  [ok] mutation {k:02d} ({name}) detected: {first[:110]}")
+        print(f"selftest: clean run {'PASS' if all(g.ok for g in clean) and cg.ok else 'FAIL'}, "
+              f"{detected}/{len(mutations)} mutations detected")
+        ar = os.path.join(tmp, "archive.md")
+        plan = os.path.join(tmp, "complete.toml")
+        with open(plan, "w", encoding="utf-8") as f:
+            f.write('version = 1\nmode = "explicit"\nordering = "plan"\ncomplete = true\n' +
+                    "".join(f'[[file]]\npath = "{p}"\n' for p in ("cases.xlsx", "roster.csv", "dossier.md", "code.py")))
+        r = subprocess.run([tm, "merge", src, ar, "--selection", plan, "--complete", "--embed-binary", "5", "--format",
+                            "markdown", "--yes", "-q"], capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            print(f"selftest: archive merge exit {r.returncode}: {r.stderr[-400:]}")
+            return EXIT_GATE
+        rg = cmd_restore(ar, os.path.join(tmp, "restored"), src)
+        print(rg.report())
+        ok &= rg.ok
+        with open(ar, encoding="utf-8", newline="") as f:
+            atext = f.read()
+        bad = os.path.join(tmp, "archive_bad.md")
+        with open(bad, "w", encoding="utf-8", newline="") as f:
+            f.write(atext.replace("line 7\n", "line 7 \n", 1))
+        bg = cmd_restore(bad, os.path.join(tmp, "restored_bad"), src)
+        if bg.ok:
+            print("  [!!] a one-byte change in the archive was NOT detected by restore")
+            ok = False
+        else:
+            print("  [ok] a one-byte change in the archive is detected by restore")
+        ok &= detected == len(mutations)
+    print("SELFTEST", "PASS" if ok else "FAIL")
+    return EXIT_OK if ok else EXIT_GATE
+
+
+# --------------------------------------------------------------------- main
 
 def main():
-    parser = argparse.ArgumentParser(description="TurboMerger TM-GRID/1 & Granular Selection Verifier")
-    subparsers = parser.add_subparsers(dest="cmd")
-    
-    # selftest
-    subparsers.add_parser("selftest")
-    
-    # grid
-    p_grid = subparsers.add_parser("grid")
-    p_grid.add_argument("--merged", required=True)
-    p_grid.add_argument("--src-root", default=".")
-    p_grid.add_argument("--selection", default=None)
-    
-    # slices
-    p_slices = subparsers.add_parser("slices")
-    p_slices.add_argument("--merged", required=True)
-    p_slices.add_argument("--src-root", default=".")
-    p_slices.add_argument("--selection", default=None)
-    
-    # restore
-    p_res = subparsers.add_parser("restore")
-    p_res.add_argument("archive")
-    p_res.add_argument("--out", required=True)
-    
-    # audit
-    p_aud = subparsers.add_parser("audit")
-    p_aud.add_argument("--merged", required=True)
-    p_aud.add_argument("--src-root", default=".")
-    p_aud.add_argument("--out", required=True)
-    
-    # all
-    p_all = subparsers.add_parser("all")
-    p_all.add_argument("--merged", required=True)
-    p_all.add_argument("--src-root", default=".")
-    p_all.add_argument("--selection", default=None)
-    p_all.add_argument("--out", default=None)
-    
-    args = parser.parse_args()
-    
-    if args.cmd == "selftest":
-        sys.exit(run_selftest())
-        
-    elif args.cmd == "grid":
-        ok = verify_grid(args.merged, args.src_root, args.selection)
-        sys.exit(EXIT_OK if ok else EXIT_GATE_FAILED)
-        
-    elif args.cmd == "slices":
-        ok = run_slices_check(args.merged, args.src_root, args.selection or "")
-        sys.exit(EXIT_OK if ok else EXIT_GATE_FAILED)
-        
-    elif args.cmd == "restore":
-        ok = restore_archive(args.archive, args.out)
-        sys.exit(EXIT_OK if ok else EXIT_GATE_FAILED)
-        
-    elif args.cmd == "audit":
-        print(f"[*] Writing audit report to {args.out}")
-        with open(args.out, 'w', encoding='utf-8') as f:
-            f.write(f"# TurboMerger Audit Report\n\nGenerated for: `{args.merged}`\n\nStatus: VERIFIED PASS\n")
-        sys.exit(EXIT_OK)
-        
-    elif args.cmd == "all":
-        g_ok = verify_grid(args.merged, args.src_root, args.selection)
-        s_ok = run_slices_check(args.merged, args.src_root, args.selection or "")
-        if args.out:
-            with open(args.out, 'w', encoding='utf-8') as f:
-                f.write(f"# TurboMerger Comprehensive Audit Report\n\nMerged: `{args.merged}`\nGrid: {'PASS' if g_ok else 'FAIL'}\nSlices: {'PASS' if s_ok else 'FAIL'}\n")
-        if not (g_ok and s_ok):
-            sys.exit(EXIT_GATE_FAILED)
-        sys.exit(EXIT_OK)
-        
-    else:
-        parser.print_help()
-        sys.exit(EXIT_ERR)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("selftest")
+    s.add_argument("--bin")
+    for name in ("grid", "slices", "audit", "all"):
+        p = sub.add_parser(name)
+        p.add_argument("--merged", required=True)
+        p.add_argument("--src-root", required=True)
+        p.add_argument("--selection", required=name == "slices")
+        if name == "audit":
+            p.add_argument("--out", required=True)
+        if name == "all":
+            p.add_argument("--json")
+            p.add_argument("--report")
+            p.add_argument("--work")
+    p = sub.add_parser("accounting")
+    p.add_argument("--json", required=True)
+    p.add_argument("--selection", required=True)
+    p = sub.add_parser("cold")
+    p.add_argument("--merged", required=True)
+    p.add_argument("--src-root", required=True)
+    p.add_argument("--work", required=True)
+    p = sub.add_parser("restore")
+    p.add_argument("archive")
+    p.add_argument("--out", required=True)
+    p.add_argument("--src-root")
+    p = sub.add_parser("decode")
+    p.add_argument("merged")
+    p.add_argument("--out", required=True)
+    p.add_argument("--xlsx", action="store_true")
+    a = ap.parse_args()
+    if a.cmd == "selftest":
+        return cmd_selftest(a.bin)
+    if a.cmd == "grid":
+        gates = [cmd_grid(a.merged, a.src_root, a.selection)]
+    elif a.cmd == "slices":
+        gates = [cmd_slices(a.merged, a.src_root, a.selection)]
+    elif a.cmd == "accounting":
+        gates = [cmd_accounting(a.json, a.selection)]
+    elif a.cmd == "cold":
+        gates = [cmd_cold(a.merged, a.src_root, a.work)]
+    elif a.cmd == "restore":
+        gates = [cmd_restore(a.archive, a.out, a.src_root)]
+    elif a.cmd == "decode":
+        gates = [cmd_decode(a.merged, a.out, a.xlsx)]
+    elif a.cmd == "audit":
+        gates = [cmd_audit(a.merged, a.src_root, a.out, a.selection)]
+    else:  # all
+        gates = [cmd_grid(a.merged, a.src_root, a.selection)]
+        if a.selection:
+            gates.append(cmd_slices(a.merged, a.src_root, a.selection))
+        if a.json and a.selection:
+            gates.append(cmd_accounting(a.json, a.selection))
+        if a.work:
+            gates.append(cmd_cold(a.merged, a.src_root, a.work))
+    text = "\n".join(g.report(limit=200 if a.cmd == "all" else 25) for g in gates)
+    print(text)
+    if getattr(a, "report", None):
+        with open(a.report, "w", encoding="utf-8") as f:
+            f.write(f"# tm_verify report\n\nMerged: `{a.merged}`  \nSource root: `{a.src_root}`  \n"
+                    f"Selection: `{a.selection}`  \nWritten: {dt.datetime.now().astimezone().isoformat(timespec='seconds')}\n\n"
+                    f"```\n{text}\n```\n")
+    return EXIT_OK if all(g.ok for g in gates) else EXIT_GATE
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

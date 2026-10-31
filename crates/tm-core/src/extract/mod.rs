@@ -11,7 +11,7 @@
 //!   text layer, so it yields nothing here; with `ocr` on, the file is handed
 //!   to an external OCR command (`monaddoc` by default). PDFium rendering of
 //!   figure/table crops into an image bundle is the next step (tm-worker).
-//! - **xls/xlsx/xlsb/ods** → `calamine`, every sheet as tab-separated rows.
+//! - **xls/xlsx/xlsb/ods** → `calamine`, every sheet as TM-GRID/1 text (`grid`).
 //! - **docx/pptx/odt/odp/epub** → a zip of XML parts; the text nodes are pulled
 //!   with `quick-xml`.
 //! - **doc/ppt** (Office 97-2003) → the OLE compound file (`cfb`): Word's
@@ -184,10 +184,14 @@ pub struct ExtractOptions<'a> {
     /// The job's cancel flag: an OCR engine still running is stopped (with
     /// everything it started) as soon as it is set.
     pub cancel: Option<&'a AtomicBool>,
-    /// TM-GRID/1 granular sheet and column projection
+    /// TM-GRID/1 sheet, column and row selection for this file.
     pub grid_select: Option<&'a crate::selection::GridSelect>,
-    /// TM-GRID/1 chunk row interval (default 150)
+    /// TM-GRID/1 body rows per table chunk (0 = one table per sheet).
     pub grid_chunk_rows: usize,
+    /// The file's relative display path, written into the `@file` line.
+    pub grid_path: Option<&'a str>,
+    /// `on_no_match = "error"`: a sheet or column that matches nothing fails the file.
+    pub grid_strict: bool,
 }
 
 /// Extracted text plus a one-line provenance note for the Merge Report.
@@ -666,11 +670,28 @@ pub fn finish_queued(wait: OcrWait, queue: &OcrQueue) -> Result<Extracted, Strin
 
 // ------------------------------------------------------------------- spreadsheets
 
+/// Workbooks become TM-GRID/1 text (ADR 0021): every non-empty cell at its
+/// row and column, typed, escaped, with per-sheet counts and SHA-256.
 fn extract_spreadsheet(path: &Path, opts: &ExtractOptions<'_>) -> Result<Extracted, String> {
-    let empty_sel = crate::selection::GridSelect::default();
-    let sel = opts.grid_select.unwrap_or(&empty_sel);
-    let chunk_rows = if opts.grid_chunk_rows == 0 { 150 } else { opts.grid_chunk_rows };
-    grid::encode_workbook(path, sel, chunk_rows)
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).map_err(|e| format!("spreadsheet read failed: {e}"))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workbook");
+    let src = grid::GridSource {
+        rel_path: opts.grid_path.unwrap_or(name),
+        bytes: bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+    };
+    drop(bytes);
+    let empty = crate::selection::GridSelect::default();
+    let gopts = grid::GridOptions {
+        select: opts.grid_select.unwrap_or(&empty),
+        chunk_rows: opts.grid_chunk_rows,
+        strict: opts.grid_strict,
+    };
+    grid::encode_workbook(path, &src, &gopts)
 }
 
 // ------------------------------------------------------------- zip-of-XML formats
@@ -834,6 +855,67 @@ fn collapse_blank_lines(text: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// Outline a file's structure for writing a selection plan: Markdown
+/// headings (ATX, outside fences — the same scanner the slicer uses), sheets
+/// of a workbook, or the header of a CSV/TSV file.
+pub fn outline_file(path: &Path) -> Result<serde_json::Value, String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let file = path.display().to_string();
+    match ext.as_str() {
+        "md" | "markdown" | "txt" => {
+            let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            let headings: Vec<serde_json::Value> = crate::slice::outline_headings(&content)
+                .into_iter()
+                .map(|(line, level, text)| serde_json::json!({"line": line, "level": level, "text": text}))
+                .collect();
+            Ok(
+                serde_json::json!({"file": file, "kind": "markdown", "lines": content.lines().count(), "headings": headings}),
+            )
+        }
+        "csv" | "tsv" => {
+            let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            let delim = if ext == "tsv" { '\t' } else { ',' };
+            let records = grid::parse_delimited(content.trim_start_matches('\u{feff}'), delim);
+            let header = records.first().cloned().unwrap_or_default();
+            Ok(
+                serde_json::json!({"file": file, "kind": "table", "records": records.len(), "header": header}),
+            )
+        }
+        "xlsx" | "xlsm" | "xlsb" | "xls" | "ods" => {
+            use calamine::{open_workbook_auto, Reader};
+            let mut wb =
+                open_workbook_auto(path).map_err(|e| format!("cannot open spreadsheet: {e}"))?;
+            let names: Vec<String> = wb.sheet_names().to_vec();
+            let mut sheets = Vec::new();
+            for name in &names {
+                let (rows, cols, cells) = match wb.worksheet_range(name) {
+                    Ok(range) => {
+                        let (r, c) = range.get_size();
+                        (
+                            r,
+                            c,
+                            range
+                                .used_cells()
+                                .filter(|(_, _, v)| grid::canon(v).is_some())
+                                .count(),
+                        )
+                    }
+                    Err(_) => (0, 0, 0),
+                };
+                sheets.push(
+                    serde_json::json!({"name": name, "rows": rows, "cols": cols, "cells": cells}),
+                );
+            }
+            Ok(serde_json::json!({"file": file, "kind": "spreadsheet", "sheets": sheets}))
+        }
+        _ => Ok(serde_json::json!({"file": file, "kind": "unknown"})),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,58 +1008,5 @@ mod tests {
     #[test]
     fn slide_order_is_numeric() {
         assert!(slide_index("ppt/slides/slide2.xml") < slide_index("ppt/slides/slide10.xml"));
-    }
-}
-
-/// Outline a file's structure (headings in Markdown, sheets in spreadsheets).
-pub fn outline_file(path: &Path) -> Result<serde_json::Value, String> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    if ext == "md" || ext == "markdown" {
-        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let mut headings = Vec::new();
-        for (idx, line) in content.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('#') {
-                let count = trimmed.chars().take_while(|&c| c == '#').count();
-                if count >= 1 && count <= 6 {
-                    let text = trimmed[count..].trim().trim_end_matches('#').trim();
-                    headings.push(serde_json::json!({
-                        "line": idx + 1,
-                        "level": count,
-                        "text": text,
-                    }));
-                }
-            }
-        }
-        Ok(serde_json::json!({
-            "file": path.display().to_string(),
-            "kind": "markdown",
-            "headings": headings,
-        }))
-    } else if matches!(ext.as_str(), "xlsx" | "xls" | "ods") {
-        use calamine::{open_workbook_auto, Reader};
-        let mut wb = open_workbook_auto(path).map_err(|e| format!("cannot open spreadsheet: {e}"))?;
-        let names = wb.sheet_names().to_vec();
-        let mut sheets = Vec::new();
-        for name in &names {
-            if let Ok(range) = wb.worksheet_range(name) {
-                let (rows, cols) = range.get_size();
-                sheets.push(serde_json::json!({
-                    "name": name,
-                    "rows": rows,
-                    "cols": cols,
-                }));
-            }
-        }
-        Ok(serde_json::json!({
-            "file": path.display().to_string(),
-            "kind": "spreadsheet",
-            "sheets": sheets,
-        }))
-    } else {
-        Ok(serde_json::json!({
-            "file": path.display().to_string(),
-            "kind": "unknown",
-        }))
     }
 }

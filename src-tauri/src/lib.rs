@@ -22,6 +22,7 @@ pub fn run() {
             commands::merge_folder,
             commands::pack_remote,
             commands::scan_folder,
+            commands::count_folder,
             commands::repo_map,
             commands::start_watch,
             commands::stop_watch,

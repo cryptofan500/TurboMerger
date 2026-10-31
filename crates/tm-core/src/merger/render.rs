@@ -316,36 +316,56 @@ fn write_markdown<W: Write>(w: &mut W, ctx: &RenderCtx, blocks: &[&Block]) -> Re
     }
 
     if ctx.cfg.complete {
+        // Archive twin (ADR 0020): one JSON line per file so a rebuild can be
+        // byte-identical. A text file rebuilds from its block (`eol` and
+        // `final_newline` undo what the Markdown fence changes); a file its
+        // block cannot reproduce byte for byte (workbooks, PDFs, a BOM,
+        // non-UTF-8, mixed line ends) is `binary` and is embedded as base64
+        // when `--embed-binary` allows its size.
+        let facts: Vec<(&Block, Vec<u8>, ArchiveFacts)> = blocks
+            .iter()
+            .map(|b| {
+                let data = std::fs::read(ctx.root.join(&b.relative)).unwrap_or_default();
+                let f = ArchiveFacts::of(b, &data);
+                (*b, data, f)
+            })
+            .collect();
         writeln!(w, "## __manifest__\n\n```jsonlines")?;
-        for b in blocks {
-            let p = ctx.root.join(&b.relative);
-            let bytes = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            let sha = std::fs::read(&p).map(|data| format!("{:x}", sha2::Sha256::digest(&data))).unwrap_or_default();
-            let is_bin = b.lang == "tm-grid" || b.relative.ends_with(".xlsx") || b.relative.ends_with(".xls") || b.relative.ends_with(".pdf");
-            let kind = if is_bin { "binary" } else { "text" };
+        for (b, data, f) in &facts {
             let line = serde_json::json!({
                 "path": b.relative,
-                "bytes": bytes,
-                "sha256": sha,
-                "kind": kind,
+                "bytes": data.len(),
+                "sha256": format!("{:x}", sha2::Sha256::digest(data)),
+                "kind": if f.text_ok { "text" } else { "binary" },
+                "lang": b.lang,
+                "eol": f.eol,
+                "final_newline": data.last() == Some(&b'\n'),
+                "bom": f.bom,
+                "utf8": f.utf8,
+                "mode": file_mode(&ctx.root.join(&b.relative)),
             });
             writeln!(w, "{}", line)?;
         }
         writeln!(w, "```\n")?;
-
         if let Some(mb_cap) = ctx.cfg.embed_binary {
             let max_bytes = mb_cap * 1024 * 1024;
-            for b in blocks {
-                let p = ctx.root.join(&b.relative);
-                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                if matches!(ext.as_str(), "xlsx" | "xls" | "pdf" | "png" | "jpg" | "jpeg") {
-                    if let Ok(data) = std::fs::read(&p) {
-                        if (data.len() as u64) <= max_bytes {
-                            let b64 = crate::remote::base64(&data);
-                            writeln!(w, "## __binary__: {}\n\n```base64\n{}\n```\n", b.relative, b64)?;
-                        }
-                    }
+            for (b, data, f) in &facts {
+                if f.text_ok || data.len() as u64 > max_bytes {
+                    continue;
                 }
+                // 76-character lines (RFC 2045) keep the twin easy to diff.
+                let b64 = crate::remote::base64(data);
+                let wrapped: Vec<&str> = b64
+                    .as_bytes()
+                    .chunks(76)
+                    .map(|c| std::str::from_utf8(c).unwrap_or(""))
+                    .collect();
+                writeln!(
+                    w,
+                    "## __binary__: {}\n\n```base64\n{}\n```\n",
+                    b.relative,
+                    wrapped.join("\n")
+                )?;
             }
         }
     }
@@ -808,6 +828,62 @@ pub(super) fn generate_tree(folder: &str, blocks: &[&Block]) -> String {
     let mut out = format!("{}/\n", folder);
     render(&top, "", &mut out);
     out
+}
+
+/// What an archive rebuild needs to know about one source file.
+struct ArchiveFacts {
+    eol: &'static str,
+    bom: bool,
+    utf8: bool,
+    /// The block's text reproduces the file byte for byte.
+    text_ok: bool,
+}
+
+impl ArchiveFacts {
+    fn of(b: &Block, data: &[u8]) -> Self {
+        let crlf = data.windows(2).filter(|w| w == b"\r\n").count();
+        let lf = data.iter().filter(|&&c| c == b'\n').count();
+        let lone_cr = data.iter().filter(|&&c| c == b'\r').count() - crlf;
+        let eol = match (crlf, lf - crlf, lone_cr) {
+            (0, 0, 0) => "none",
+            (0, _, 0) => "lf",
+            (_, 0, 0) => "crlf",
+            _ => "mixed",
+        };
+        let bom = data.starts_with(&[0xEF, 0xBB, 0xBF])
+            || data.starts_with(&[0xFF, 0xFE])
+            || data.starts_with(&[0xFE, 0xFF]);
+        let utf8 = std::str::from_utf8(data).is_ok();
+        let text_ok = b.lang != "tm-grid"
+            && utf8
+            && !bom
+            && eol != "mixed"
+            && !b.compressed
+            && b.redactions.is_empty()
+            && b.utf8_note.is_none();
+        ArchiveFacts {
+            eol,
+            bom,
+            utf8,
+            text_ok,
+        }
+    }
+}
+
+/// Unix permission bits of a file (0 elsewhere), for the archive manifest.
+fn file_mode(p: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        0
+    }
 }
 
 #[cfg(test)]

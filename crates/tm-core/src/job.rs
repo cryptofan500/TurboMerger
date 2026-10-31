@@ -149,9 +149,10 @@ pub struct MergeOptions {
     /// Exact relative directory prefixes to exclude from merge
     #[serde(default)]
     pub exclude_dirs: Vec<String>,
-    /// TM-GRID/1 table chunk row interval (default 150)
+    /// TM-GRID/1 body rows per table chunk: `None` = 150, `Some(0)` = one
+    /// table per sheet.
     #[serde(default)]
-    pub grid_chunk_rows: usize,
+    pub grid_chunk_rows: Option<usize>,
     /// Token budget ceiling
     #[serde(default)]
     pub budget_tokens: Option<u64>,
@@ -205,7 +206,7 @@ impl MergeOptions {
             selection: None,
             exclude_paths: Vec::new(),
             exclude_dirs: Vec::new(),
-            grid_chunk_rows: 150,
+            grid_chunk_rows: None,
             budget_tokens: None,
             complete: false,
             embed_binary: None,
@@ -294,7 +295,12 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         ocr_all_pictures: options.ocr_all_pictures,
     };
 
-    let ordering_str = options.selection.as_ref().and_then(|s| s.ordering.as_deref()).or(options.ordering.as_deref()).unwrap_or("path");
+    let ordering_str = options
+        .selection
+        .as_ref()
+        .and_then(|s| s.ordering.as_deref())
+        .or(options.ordering.as_deref())
+        .unwrap_or("path");
     let ordering = MergeOrdering::from_str_lenient(ordering_str);
 
     let merge_config = MergeConfig {
@@ -318,7 +324,7 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         keep_figures: options.keep_figures && options.extract_images_text,
         max_file_size: config.scanning.max_file_size_mb * 1024 * 1024,
         selection: options.selection.clone(),
-        grid_chunk_rows: if options.grid_chunk_rows == 0 { 150 } else { options.grid_chunk_rows },
+        grid_chunk_rows: options.grid_chunk_rows.unwrap_or(150),
         complete: options.complete,
         embed_binary: options.embed_binary,
         budget_tokens: options.budget_tokens,
@@ -363,6 +369,33 @@ fn unique_output(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     dir.join(format!("{}_merged.{}", candidate, ext))
 }
 
+/// What a merge keeps after the scan: GUI curation, CLI lists, rescues.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Curation<'a> {
+    /// Exact relative paths to keep (GUI tri-state tree, MCP).
+    pub selected_paths: Option<&'a [String]>,
+    /// Skipped files to rescue (validated to stay inside the root).
+    pub force_include: &'a [String],
+    /// Exact relative paths to drop.
+    pub exclude_paths: &'a [String],
+    /// Relative folders to drop with everything under them.
+    pub exclude_dirs: &'a [String],
+    /// Keep the scan order (a selection plan's order) instead of sorting.
+    pub keep_order: bool,
+}
+
+impl<'a> Curation<'a> {
+    pub fn of(options: &'a MergeOptions, keep_order: bool) -> Self {
+        Curation {
+            selected_paths: options.selected_paths.as_deref(),
+            force_include: &options.force_include,
+            exclude_paths: &options.exclude_paths,
+            exclude_dirs: &options.exclude_dirs,
+            keep_order,
+        }
+    }
+}
+
 /// Apply force-include rescues and the curated selection to a scan result.
 /// Force-included paths are validated to stay inside the root; selection is
 /// an exact relative-path filter.
@@ -370,12 +403,15 @@ pub fn apply_selection(
     root: &Path,
     files: &mut Vec<PathBuf>,
     skipped: &mut Vec<scanner::SkipEntry>,
-    selected_paths: &Option<Vec<String>>,
-    force_include: &[String],
-    exclude_paths: &[String],
-    exclude_dirs: &[String],
-    keep_order: bool,
+    cur: &Curation<'_>,
 ) {
+    let Curation {
+        selected_paths,
+        force_include,
+        exclude_paths,
+        exclude_dirs,
+        keep_order,
+    } = *cur;
     for rel in force_include {
         let candidate = root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
         let Ok(canon) = dunce::canonicalize(&candidate) else {
@@ -399,7 +435,8 @@ pub fn apply_selection(
         files.retain(|f| want.contains(scanner::relative_display(root, f).as_str()));
     }
     if !exclude_paths.is_empty() {
-        let unpick: std::collections::HashSet<&str> = exclude_paths.iter().map(|s| s.as_str()).collect();
+        let unpick: std::collections::HashSet<&str> =
+            exclude_paths.iter().map(|s| s.as_str()).collect();
         files.retain(|f| !unpick.contains(scanner::relative_display(root, f).as_str()));
     }
     if !exclude_dirs.is_empty() {
@@ -531,16 +568,24 @@ pub fn run_merge(
     };
     let scan = if let Some(plan) = &options.selection {
         if plan.mode == crate::selection::SelectionMode::Explicit {
-            let paths: Vec<String> = plan.files.iter().filter(|f| !f.exclude).map(|f| f.path.clone()).collect();
-            scanner::scan_explicit(&job.root, &paths, &job.scan_options).map_err(|e| JobError::Scan(e.to_string()))?
+            let paths: Vec<String> = plan
+                .files
+                .iter()
+                .filter(|f| !f.exclude)
+                .map(|f| f.path.clone())
+                .collect();
+            scanner::scan_explicit(&job.root, &paths, &job.scan_options)
+                .map_err(|e| JobError::Scan(e.to_string()))?
         } else {
-            scanner::scan_with(&job.root, &job.scan_options, cancel.flag(), &on_scan).map_err(|e| {
-                if e.is::<Cancelled>() {
-                    JobError::Cancelled
-                } else {
-                    JobError::Scan(e.to_string())
-                }
-            })?
+            scanner::scan_with(&job.root, &job.scan_options, cancel.flag(), &on_scan).map_err(
+                |e| {
+                    if e.is::<Cancelled>() {
+                        JobError::Cancelled
+                    } else {
+                        JobError::Scan(e.to_string())
+                    }
+                },
+            )?
         }
     } else {
         scanner::scan_with(&job.root, &job.scan_options, cancel.flag(), &on_scan).map_err(|e| {
@@ -559,11 +604,7 @@ pub fn run_merge(
         &job.root,
         &mut files,
         &mut skipped,
-        &options.selected_paths,
-        &options.force_include,
-        &options.exclude_paths,
-        &options.exclude_dirs,
-        keep_order,
+        &Curation::of(options, keep_order),
     );
     if files.is_empty() && skipped.is_empty() {
         return Err(JobError::Empty);
@@ -777,30 +818,30 @@ mod tests {
         )];
 
         // Force-include rescues the skipped file and clears its skip entry.
+        let rescue = ["notes.txt".to_string(), "../escape.txt".to_string()];
         apply_selection(
             &root,
             &mut files,
             &mut skipped,
-            &None,
-            &["notes.txt".to_string(), "../escape.txt".to_string()],
-            &[],
-            &[],
-            false,
+            &Curation {
+                force_include: &rescue,
+                ..Default::default()
+            },
         );
         assert!(files.iter().any(|f| f.ends_with("notes.txt")));
         assert!(skipped.is_empty());
         assert_eq!(files.len(), 3, "path traversal must not add files");
 
         // Selection keeps exactly the named subset.
+        let keep = ["a.rs".to_string(), "notes.txt".to_string()];
         apply_selection(
             &root,
             &mut files,
             &mut skipped,
-            &Some(vec!["a.rs".to_string(), "notes.txt".to_string()]),
-            &[],
-            &[],
-            &[],
-            false,
+            &Curation {
+                selected_paths: Some(&keep),
+                ..Default::default()
+            },
         );
         let rels: Vec<String> = files
             .iter()

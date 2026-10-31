@@ -11,6 +11,7 @@ use regex::Regex;
 use super::{relative_display, Block, MergeConfig, MergeSkip};
 use crate::extract::{OcrQueue, OcrWait};
 use crate::scanner::SkipKind;
+use sha2::Digest as _;
 
 static BASE64_RUN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z0-9+/]{200,}={0,2}").expect("base64 run regex"));
@@ -237,22 +238,97 @@ fn process_bytes(
         return Err((relative, "binary content".into(), SkipKind::Binary));
     }
 
+    let source = if cfg.selection.is_some() {
+        Some((
+            buffer.len() as u64,
+            format!("{:x}", sha2::Sha256::digest(&buffer)),
+        ))
+    } else {
+        None
+    };
     let (mut content, utf8_note) = decode_text(buffer, bom);
-    let utf8_note = match (note, utf8_note) {
+    let mut utf8_note = match (note, utf8_note) {
         (Some(n), Some(u)) => Some(format!("{n}; {u}")),
         (Some(n), None) => Some(n.to_string()),
         (None, u) => u,
     };
-    if cfg.reproducible && content.contains('\r') {
-        content = content.replace("\r\n", "\n");
-    }
 
-    if let Some(plan) = &cfg.selection {
-        if let Some(file_sel) = plan.find_file(&relative) {
-            if let Ok((sliced, _report)) = crate::slice::slice_text(&content, file_sel) {
+    // Selection plan (ADR 0020/0021). A selector that cannot be applied makes
+    // the file "not captured" with the reason — never a silent whole-file merge.
+    let ext = Path::new(lang_from)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut grid = false;
+    if let Some((plan, sel)) = cfg
+        .selection
+        .as_ref()
+        .and_then(|p| p.find_file(&relative).map(|f| (p, f)))
+    {
+        let strict = plan.on_no_match == crate::selection::Strictness::Error;
+        let fail = |e: String| {
+            (
+                relative.clone(),
+                format!("selection: {e}"),
+                SkipKind::NotCaptured,
+            )
+        };
+        let delim = match ext.as_str() {
+            "csv" => Some(','),
+            "tsv" | "tab" => Some('\t'),
+            _ => None,
+        };
+        if crate::slice::has_table_slice(sel) {
+            let Some(d) = delim else {
+                return Err(fail(
+                    "columns/rows/sheets apply only to spreadsheets and CSV/TSV".into(),
+                ));
+            };
+            if crate::slice::has_text_slice(sel) {
+                return Err(fail("a table cannot also take lines/sections/match".into()));
+            }
+            let (bytes, sha256) = source.clone().unwrap_or_default();
+            let src = crate::extract::grid::GridSource {
+                rel_path: &relative,
+                bytes,
+                sha256,
+            };
+            let select = sel.to_grid_select();
+            let gopts = crate::extract::grid::GridOptions {
+                select: &select,
+                chunk_rows: cfg.grid_chunk_rows,
+                strict,
+            };
+            let text = content.strip_prefix('\u{feff}').unwrap_or(&content);
+            let (grid_text, grid_note) =
+                crate::extract::grid::encode_delimited(text, d, &src, &gopts).map_err(fail)?;
+            content = grid_text;
+            utf8_note = Some(match utf8_note {
+                Some(n) => format!("{n}; {grid_note}"),
+                None => grid_note,
+            });
+            grid = true;
+        } else {
+            if cfg.reproducible && content.contains('\r') {
+                content = content.replace("\r\n", "\n");
+            }
+            if crate::slice::has_text_slice(sel) {
+                let (sliced, report) =
+                    crate::slice::slice_text(&content, sel, strict).map_err(fail)?;
                 content = sliced;
+                if !report.warnings.is_empty() {
+                    let w = format!("selection warnings: {}", report.warnings.join("; "));
+                    utf8_note = Some(match utf8_note {
+                        Some(n) => format!("{n}; {w}"),
+                        None => w,
+                    });
+                }
             }
         }
+    }
+    if !grid && cfg.reproducible && content.contains('\r') {
+        content = content.replace("\r\n", "\n");
     }
 
     if cfg.redact {
@@ -303,11 +379,7 @@ fn process_bytes(
         ));
     }
 
-    let lang = Path::new(lang_from)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let lang = if grid { "tm-grid".to_string() } else { ext };
 
     // Tree-sitter reductions (a failed parse keeps the original; redaction
     // still runs on whatever survives). Comment strip must run BEFORE
@@ -326,10 +398,12 @@ fn process_bytes(
         }
     }
 
-    if cfg.truncate_base64 {
+    // A grid's blank lines separate its chunked tables and its cells are data:
+    // neither text reduction applies to it.
+    if cfg.truncate_base64 && !grid {
         content = truncate_base64(&content);
     }
-    if cfg.remove_empty_lines {
+    if cfg.remove_empty_lines && !grid {
         content = drop_empty_lines(&content);
     }
 
@@ -393,20 +467,26 @@ fn process_document(
             crate::extract::extract_queued(path, kind, queue, &relative)
         }
         _ => {
-            let grid_sel = ctx.cfg.selection.as_ref().and_then(|plan| plan.find_file(&relative)).map(|f| f.to_grid_select());
+            let plan = ctx.cfg.selection.as_ref();
+            let grid_sel = plan
+                .and_then(|p| p.find_file(&relative))
+                .map(|f| f.to_grid_select());
             let opts = crate::extract::ExtractOptions {
                 ocr: ctx.cfg.extract_images_text,
                 ocr_cmd: None,
                 cancel: Some(ctx.cancel),
                 grid_select: grid_sel.as_ref(),
                 grid_chunk_rows: ctx.cfg.grid_chunk_rows,
+                grid_path: Some(&relative),
+                grid_strict: plan
+                    .is_none_or(|p| p.on_no_match == crate::selection::Strictness::Error),
             };
             crate::extract::extract(path, kind, &opts).map(Queued::Done)
         }
     }
     .map_err(|e| (relative.clone(), e, SkipKind::NotCaptured))?;
     match queued {
-        Queued::Done(extracted) => Ok(document_block(relative, extracted, ctx.cfg, ctx.harvested)),
+        Queued::Done(extracted) => document_block(relative, extracted, ctx.cfg, ctx.harvested),
         Queued::Waiting(wait) => {
             *ctx.wait = Some(wait);
             // Keeps the file's place in the order until the OCR stage.
@@ -437,7 +517,7 @@ pub(super) fn finish_waiting(
 ) -> (std::result::Result<(Block, String), MergeSkip>, Vec<String>) {
     let mut harvested = Vec::new();
     let result = match crate::extract::finish_queued(wait, queue) {
-        Ok(extracted) => Ok(document_block(relative, extracted, cfg, &mut harvested)),
+        Ok(extracted) => document_block(relative, extracted, cfg, &mut harvested),
         Err(e) => Err((relative, e, SkipKind::NotCaptured)),
     };
     (result, harvested)
@@ -449,16 +529,47 @@ fn document_block(
     extracted: crate::extract::Extracted,
     cfg: &MergeConfig,
     harvested: &mut Vec<String>,
-) -> (Block, String) {
+) -> std::result::Result<(Block, String), MergeSkip> {
     let mut content = extracted.text;
-    if cfg.reproducible && content.contains('\r') {
+    let mut note = extracted.note;
+    let grid = extracted.lang == "tm-grid";
+    if cfg.reproducible && !grid && content.contains('\r') {
         content = content.replace("\r\n", "\n");
     }
 
-    if let Some(plan) = &cfg.selection {
-        if let Some(file_sel) = plan.find_file(&relative) {
-            if let Ok((sliced, _report)) = crate::slice::slice_text(&content, file_sel) {
-                content = sliced;
+    // Workbooks took their table selection in the encoder; extracted prose
+    // (PDF, Word, slides) can take a text slice.
+    if let Some((plan, sel)) = cfg
+        .selection
+        .as_ref()
+        .and_then(|p| p.find_file(&relative).map(|f| (p, f)))
+    {
+        let strict = plan.on_no_match == crate::selection::Strictness::Error;
+        let fail = |e: String| {
+            (
+                relative.clone(),
+                format!("selection: {e}"),
+                SkipKind::NotCaptured,
+            )
+        };
+        if !grid && crate::slice::has_table_slice(sel) {
+            return Err(fail(
+                "columns/rows/sheets apply only to spreadsheets and CSV/TSV".into(),
+            ));
+        }
+        if crate::slice::has_text_slice(sel) {
+            if grid {
+                return Err(fail(
+                    "a workbook cannot take lines/sections/match; use sheets/columns/rows".into(),
+                ));
+            }
+            let (sliced, report) = crate::slice::slice_text(&content, sel, strict).map_err(fail)?;
+            content = sliced;
+            if !report.warnings.is_empty() {
+                note.push_str(&format!(
+                    "; selection warnings: {}",
+                    report.warnings.join("; ")
+                ));
             }
         }
     }
@@ -474,19 +585,19 @@ fn document_block(
 
     let tokens = crate::cache::count(&content);
 
-    (
+    Ok((
         Block {
             relative,
             span: Default::default(),
             lang: extracted.lang,
             tokens,
-            utf8_note: Some(extracted.note),
+            utf8_note: Some(note),
             redactions,
             compressed: false,
             synthetic: false,
         },
         content,
-    )
+    ))
 }
 
 /// Decode raw file bytes to a String: BOM → strict UTF-8 → chardetng-guessed

@@ -1,9 +1,10 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { homeDir } from "@tauri-apps/api/path";
 import CuratePanel, { ScanReport } from "./components/CuratePanel";
 import ApplyPanel from "./components/ApplyPanel";
 import "./styles/global.css";
@@ -152,6 +153,9 @@ function App() {
 
   // Curate state (T2-1/T2-2/T2-7): exclusions + rescues for the CURRENT source.
   const [scanReport, setScanReport] = useState<ScanReport | null>(null);
+  const [autoScanNote, setAutoScanNote] = useState<string | null>(null);
+  // The drop listener is registered once; it reaches the current autoScan through this ref.
+  const autoScanRef = useRef<(path: string) => void>(() => {});
   const [curateOpen, setCurateOpen] = useState(false);
   const [excluded, setExcluded] = useState<Set<string>>(new Set());
   const [forceInclude, setForceInclude] = useState<Set<string>>(new Set());
@@ -255,7 +259,7 @@ function App() {
       ) {
         const dropPath = event.payload.paths[0];
         changeSource(dropPath);
-        handleScan(dropPath, false);
+        autoScanRef.current(dropPath);
       }
     });
     return () => { p.then((f) => f()); };
@@ -285,7 +289,7 @@ function App() {
     const selected = await open({ directory: true, multiple: false, title: "Select Codebase to Merge" });
     if (selected && typeof selected === "string") {
       changeSource(selected);
-      handleScan(selected, false);
+      autoScan(selected);
     }
   };
 
@@ -374,6 +378,38 @@ function App() {
       setProgress(null);
     }
   };
+
+  // A folder is scanned automatically only when a cheap count (no file is
+  // read) shows it is small; drives, the home folder and big trees wait for
+  // "Scan & curate", so choosing a folder can never freeze the window.
+  const AUTO_SCAN_MAX_FILES = 5000;
+  const AUTO_SCAN_MAX_BYTES = 500 * 1024 * 1024;
+  const autoScan = async (path: string) => {
+    setAutoScanNote(null);
+    setScanReport(null);
+    const trim = (p: string) => p.replace(/[\\/]+$/, "");
+    const home = await homeDir().catch(() => "");
+    if (/^([A-Za-z]:)?$/.test(trim(path)) || (home && trim(path) === trim(home))) {
+      setAutoScanNote("A drive or your home folder: use Scan & curate to choose the files.");
+      return;
+    }
+    try {
+      const c = await invoke<{ files: number; bytes: number; truncated: boolean }>("count_folder", { path });
+      if (c.truncated || c.files > AUTO_SCAN_MAX_FILES || c.bytes > AUTO_SCAN_MAX_BYTES) {
+        setAutoScanNote(
+          `Large folder (${c.truncated ? "more than " : ""}${c.files.toLocaleString()} files, ${(c.bytes / 1048576).toFixed(0)} MB): use Scan & curate to choose the files.`
+        );
+        return;
+      }
+    } catch {
+      return;
+    }
+    handleScan(path, false);
+  };
+
+  useEffect(() => {
+    autoScanRef.current = (path: string) => void autoScan(path);
+  });
 
   const handleScan = async (overridePath?: string, openModal = true) => {
     const target = overridePath ?? sourcePath;
@@ -545,6 +581,9 @@ function App() {
             />
             <button className="btn btn-secondary" onClick={selectSource} disabled={isWorking || watching}>Browse</button>
           </div>
+          {autoScanNote && !scanReport && (
+            <div style={{ marginTop: 8, fontSize: 13, color: "var(--text-secondary)" }}>{autoScanNote}</div>
+          )}
           {scanReport && (
             <>
               <div

@@ -395,7 +395,11 @@ pub struct ScanResult {
     pub skipped: Vec<SkipEntry>,
 }
 
-/// Explicit file scanner: checks named paths directly without walking directories.
+/// Explicit mode (ADR 0020): classify exactly the named files, never walk.
+/// Paths are relative to `root` ('/' separators; an absolute path must lie
+/// inside the root). `..`, paths resolving outside the root (symlinks
+/// included) and missing files are recorded as not captured; a path listed
+/// twice is merged once.
 pub fn scan_explicit(
     root: &Path,
     paths: &[String],
@@ -404,25 +408,75 @@ pub fn scan_explicit(
     let mut files = Vec::new();
     let mut skipped = Vec::new();
     let mut stats = ScanStats::default();
+    let root_canon = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut seen = std::collections::HashSet::new();
 
     for rel_str in paths {
-        let p_rel = rel_str.replace('\\', std::path::MAIN_SEPARATOR_STR);
-        let candidate = if Path::new(&p_rel).is_absolute() {
-            PathBuf::from(&p_rel)
+        let rel = if Path::new(rel_str).is_absolute() {
+            match dunce::canonicalize(rel_str) {
+                Ok(abs) => match abs.strip_prefix(&root_canon) {
+                    Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                    Err(_) => {
+                        skipped.push(SkipEntry::new(
+                            rel_str.clone(),
+                            "outside the source folder".to_string(),
+                            SkipKind::NotCaptured,
+                        ));
+                        continue;
+                    }
+                },
+                Err(_) => {
+                    skipped.push(SkipEntry::new(
+                        rel_str.clone(),
+                        "file not found".to_string(),
+                        SkipKind::NotCaptured,
+                    ));
+                    continue;
+                }
+            }
         } else {
-            root.join(&p_rel)
+            match crate::selection::normalize_rel(rel_str) {
+                Ok(r) => r,
+                Err(e) => {
+                    skipped.push(SkipEntry::new(rel_str.clone(), e, SkipKind::NotCaptured));
+                    continue;
+                }
+            }
         };
+        if !seen.insert(rel.clone()) {
+            continue;
+        }
+        let candidate = root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if let Ok(real) = dunce::canonicalize(&candidate) {
+            if !real.starts_with(&root_canon) {
+                skipped.push(SkipEntry::new(
+                    rel.clone(),
+                    "resolves outside the source folder".to_string(),
+                    SkipKind::NotCaptured,
+                ));
+                continue;
+            }
+        }
+        let rel_str = &rel;
 
         let meta = match std::fs::metadata(&candidate) {
             Ok(m) => m,
             Err(_) => {
-                skipped.push(SkipEntry::new(rel_str.clone(), "file not found".to_string(), SkipKind::NotCaptured));
+                skipped.push(SkipEntry::new(
+                    rel_str.clone(),
+                    "file not found".to_string(),
+                    SkipKind::NotCaptured,
+                ));
                 continue;
             }
         };
 
         if !meta.is_file() {
-            skipped.push(SkipEntry::new(rel_str.clone(), "not a regular file".to_string(), SkipKind::NotCaptured));
+            skipped.push(SkipEntry::new(
+                rel_str.clone(),
+                "not a regular file".to_string(),
+                SkipKind::NotCaptured,
+            ));
             continue;
         }
 
@@ -449,7 +503,11 @@ pub fn scan_explicit(
             }
             Verdict::Unreadable => {
                 stats.unreadable += 1;
-                skipped.push(SkipEntry::new(rel_str.clone(), "unreadable", SkipKind::NotCaptured));
+                skipped.push(SkipEntry::new(
+                    rel_str.clone(),
+                    "unreadable",
+                    SkipKind::NotCaptured,
+                ));
             }
         }
     }
@@ -1222,6 +1280,19 @@ fn count_tree(dir: &Path, budget: &mut usize, cancel: &AtomicBool) -> Option<(us
         }
     }
     Some((files, bytes, false))
+}
+
+/// Files and bytes under `dir` after at most `max_entries` directory entries,
+/// without reading any file or following links: `(files, bytes, truncated)`.
+/// The GUI calls it before deciding whether a folder may be scanned
+/// automatically.
+pub fn quick_count(dir: &Path, max_entries: usize) -> (usize, u64, bool) {
+    let mut budget = max_entries;
+    let cancel = AtomicBool::new(false);
+    match count_tree(dir, &mut budget, &cancel) {
+        Some((files, bytes, capped)) => (files, bytes, capped || budget == 0),
+        None => (0, 0, true),
+    }
 }
 
 fn human_bytes(b: u64) -> String {

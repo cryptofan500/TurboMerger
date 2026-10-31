@@ -23,7 +23,9 @@ pub enum Strictness {
 pub struct SelectionPlan {
     pub version: u32,
     pub mode: SelectionMode,
+    #[serde(skip_serializing_if = "is_false")]
     pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ordering: Option<String>,
     pub on_missing: Strictness,
     pub on_no_match: Strictness,
@@ -31,12 +33,60 @@ pub struct SelectionPlan {
     pub files: Vec<FileSel>,
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 impl SelectionPlan {
+    /// An explicit plan that merges exactly `paths`, in this order
+    /// (`--files-from`).
+    pub fn from_paths(paths: &[String]) -> Self {
+        SelectionPlan {
+            version: 1,
+            mode: SelectionMode::Explicit,
+            ordering: Some("plan".into()),
+            files: paths
+                .iter()
+                .map(|p| FileSel {
+                    path: p.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The plan as TOML (`--emit-selection`).
+    pub fn to_toml(&self) -> Result<String, String> {
+        toml::to_string_pretty(self).map_err(|e| format!("cannot write selection TOML: {e}"))
+    }
+
+    /// `on_no_match = "error"`.
+    pub fn strict(&self) -> bool {
+        self.on_no_match == Strictness::Error
+    }
+
     /// Parse a SelectionPlan from TOML string.
     pub fn from_toml(s: &str) -> Result<Self, String> {
         let plan: Self = toml::from_str(s).map_err(|e| format!("invalid selection TOML: {e}"))?;
         if plan.version != 1 {
-            return Err(format!("unsupported selection plan version: {} (expected 1)", plan.version));
+            return Err(format!(
+                "unsupported selection plan version: {} (expected 1)",
+                plan.version
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for f in &plan.files {
+            let norm = normalize_rel(&f.path).map_err(|e| format!("file '{}': {e}", f.path))?;
+            if !seen.insert(norm) {
+                return Err(format!("file '{}' is listed twice", f.path));
+            }
+            if !f.lines.is_empty() && (!f.sections.is_empty() || !f.match_lines.is_empty()) {
+                return Err(format!(
+                    "file '{}': `lines` cannot be combined with `sections` or `match`",
+                    f.path
+                ));
+            }
         }
         if plan.complete {
             for f in &plan.files {
@@ -78,30 +128,35 @@ impl SelectionPlan {
 #[serde(default, deny_unknown_fields)]
 pub struct FileSel {
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
     pub exclude: bool,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exclude_sections: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub preamble: Option<bool>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub lines: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
-    #[serde(rename = "match", default)]
+    #[serde(rename = "match", skip_serializing_if = "Vec::is_empty")]
     pub match_lines: Vec<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "is_false")]
     pub heading_context: bool,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sheets: Vec<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exclude_sheets: Vec<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rows: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub header_row: Option<u32>,
-    #[serde(rename = "sheet", default)]
+    #[serde(rename = "sheet", skip_serializing_if = "Vec::is_empty")]
     pub sheet_overrides: Vec<SheetSel>,
 }
 
@@ -122,10 +177,11 @@ impl FileSel {
 #[serde(default, deny_unknown_fields)]
 pub struct SheetSel {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub header_row: Option<u32>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rows: Vec<String>,
 }
 
@@ -198,5 +254,21 @@ columns = ["Name", "Score"]
         assert_eq!(plan.files[0].sections.len(), 2);
         assert_eq!(plan.files[1].sheet_overrides.len(), 1);
         assert_eq!(plan.files[1].sheet_overrides[0].header_row, Some(4));
+        let back = SelectionPlan::from_toml(&plan.to_toml().unwrap()).unwrap();
+        assert_eq!(back, plan, "emit-selection round trip");
+    }
+
+    #[test]
+    fn typos_duplicates_and_conflicts_are_refused() {
+        let typo = "version = 1\n[[file]]\npath = \"a.md\"\nsection = [\"x\"]\n";
+        assert!(SelectionPlan::from_toml(typo)
+            .unwrap_err()
+            .contains("unknown field"));
+        let dup = "version = 1\n[[file]]\npath = \"a.md\"\n[[file]]\npath = \"./a.md\"\n";
+        assert!(SelectionPlan::from_toml(dup).unwrap_err().contains("twice"));
+        let both = "version = 1\n[[file]]\npath = \"a.md\"\nlines = [\"1-2\"]\nmatch = [\"x\"]\n";
+        assert!(SelectionPlan::from_toml(both).is_err());
+        let up = "version = 1\n[[file]]\npath = \"../a.md\"\n";
+        assert!(SelectionPlan::from_toml(up).is_err());
     }
 }
