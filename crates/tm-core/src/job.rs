@@ -166,6 +166,12 @@ pub struct MergeOptions {
     /// Embed binary files up to N MB in archive mode
     #[serde(default)]
     pub embed_binary: Option<u64>,
+    /// Keep a checkpoint beside the output so a stopped run can continue
+    #[serde(default)]
+    pub checkpoint: bool,
+    /// Continue from the checkpoint beside the output (else start one)
+    #[serde(default)]
+    pub resume: bool,
 }
 
 impl MergeOptions {
@@ -214,6 +220,8 @@ impl MergeOptions {
             budget_tokens: None,
             complete: false,
             embed_binary: None,
+            checkpoint: false,
+            resume: false,
         }
     }
 }
@@ -333,6 +341,8 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         embed_binary: options.embed_binary,
         archive_also: Vec::new(),
         budget_tokens: options.budget_tokens,
+        checkpoint: options.checkpoint,
+        resume: options.resume,
     };
 
     Ok(ResolvedJob {

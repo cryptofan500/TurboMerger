@@ -10,6 +10,7 @@
 //! chunk or one block at a time. The bytes written are the same as the
 //! in-memory pipeline's (tests/golden.rs).
 
+mod checkpoint;
 mod git;
 mod pipeline;
 mod process;
@@ -181,6 +182,12 @@ pub struct MergeConfig {
     pub archive_also: Vec<PathBuf>,
     /// Token budget ceiling: fail gate if exceeded.
     pub budget_tokens: Option<u64>,
+    /// Keep a checkpoint beside the output (`<output>.tm-checkpoint/`) so a
+    /// stopped run can continue with `resume` (S10 4.3; not with `redact`).
+    pub checkpoint: bool,
+    /// Continue from that checkpoint when there is one (else start one):
+    /// unchanged files are taken from it instead of being read again.
+    pub resume: bool,
 }
 
 impl Default for MergeConfig {
@@ -211,6 +218,8 @@ impl Default for MergeConfig {
             embed_binary: None,
             archive_also: Vec::new(),
             budget_tokens: None,
+            checkpoint: false,
+            resume: false,
         }
     }
 }
@@ -384,6 +393,12 @@ where
     if cfg.complete && cfg.format != OutputFormat::Markdown {
         anyhow::bail!("the archive twin (--complete) is written in the markdown format only");
     }
+    let checkpointing = cfg.checkpoint || cfg.resume;
+    if checkpointing && cfg.redact {
+        anyhow::bail!(
+            "--checkpoint / --resume cannot be used with --redact: the checkpoint would keep unredacted text and the harvested secret values on disk"
+        );
+    }
 
     // Order files (a stable copy so the caller's slice is untouched).
     let mut ordered: Vec<&PathBuf> = files.iter().collect();
@@ -402,7 +417,14 @@ where
         scan_skips
     };
 
-    let mut spool = Spool::new_near(output)?;
+    // With a checkpoint the spool is its named file (it outlives a killed
+    // run); otherwise an unlinked temp file beside the output.
+    let (mut ck, mut spool) = if checkpointing {
+        let (c, s) = checkpoint::Checkpoint::open(output, root, cfg)?;
+        (Some(c), s)
+    } else {
+        (None, Spool::new_near(output)?)
+    };
     let mut blocks: Vec<Block> = Vec::with_capacity(total_files);
     let mut merge_skips: Vec<SkipEntry> = Vec::new();
 
@@ -431,13 +453,38 @@ where
             .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
             .collect()
     });
-    let weights: Vec<u64> = crate::threads::on_pool(|| {
+    let mut weights: Vec<u64> = crate::threads::on_pool(|| {
         ordered
             .par_iter()
             .zip(lens.par_iter())
             .map(|(p, &len)| work_weight(p, len))
             .collect()
     });
+    // --resume: files the checkpoint holds, unchanged since (size and
+    // modification time), come from it; the workers skip them (weight 0).
+    let key = |p: &Path| relative_display(root, p);
+    let stamps: Vec<Option<checkpoint::Stamp>> = if checkpointing {
+        crate::threads::on_pool(|| {
+            ordered
+                .par_iter()
+                .map(|p| checkpoint::Stamp::of(p))
+                .collect()
+        })
+    } else {
+        Vec::new()
+    };
+    let mut restored: Vec<Option<checkpoint::Entry>> = match ck.as_mut() {
+        Some(c) if c.found > 0 => ordered
+            .iter()
+            .zip(&stamps)
+            .map(|(p, s)| c.take(&key(p), *s))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let is_restored: Vec<bool> = restored.iter().map(Option::is_some).collect();
+    for (w, _) in weights.iter_mut().zip(&is_restored).filter(|(_, r)| **r) {
+        *w = 0;
+    }
     let watch = ctl.watch;
     if let Some(w) = watch {
         w.bytes_total.store(lens.iter().sum(), AtomicOrd::Relaxed);
@@ -452,7 +499,7 @@ where
     // Every worker takes the next file as soon as it is free; results are
     // written in order (pipeline.rs), so no chunk waits for its slowest file.
     let work = |i: usize| -> process::Processed {
-        if cancelled(cancel_flag) {
+        if cancelled(cancel_flag) || is_restored.get(i).copied().unwrap_or(false) {
             return process::Processed::empty(false);
         }
         let p = process::process_file(ordered[i], root, cfg, cancel_flag, ocr.as_ref());
@@ -511,6 +558,27 @@ where
                 Next::Item(i, p) => (i, p),
             };
             let path = ordered[i];
+            // Taken from the checkpoint: its blocks and its skip, in its place.
+            if let Some(entry) = restored.get_mut(i).and_then(Option::take) {
+                done += 1;
+                let (from_ck, skip) = entry.restore();
+                let rel = from_ck
+                    .first()
+                    .map(|b| b.relative.clone())
+                    .or_else(|| skip.as_ref().map(|s| s.path.clone()))
+                    .unwrap_or_default();
+                blocks.extend(from_ck);
+                merge_skips.extend(skip);
+                if let Some(w) = watch {
+                    w.bytes_done.fetch_add(lens[i], AtomicOrd::Relaxed);
+                }
+                if let Some(c) = ck.as_mut() {
+                    c.resumed += 1;
+                }
+                progress_callback(done, total_files, &rel);
+                return Ok(());
+            }
+            let stamp = stamps.get(i).copied().flatten();
             known_secrets.extend(p.harvested);
             dense_candidates.extend(p.dense);
             done += 1;
@@ -546,6 +614,7 @@ where
                     w.bytes_done.fetch_add(lens[i], AtomicOrd::Relaxed);
                 }
                 progress_callback(done, total_files, &rel);
+                let failed = streamed.is_err();
                 match streamed {
                     Ok(out) => {
                         known_secrets.extend(out.harvested);
@@ -564,6 +633,16 @@ where
                         merge_skips.push(SkipEntry::new(rel, reason, kind));
                     }
                 }
+                let skip = if failed { merge_skips.last() } else { None };
+                journal(
+                    &mut ck,
+                    &mut spool,
+                    cancel_flag,
+                    key(path),
+                    stamp,
+                    &blocks[first..],
+                    skip,
+                )?;
                 return Ok(());
             }
             match p.result {
@@ -585,6 +664,16 @@ where
                         None => {
                             b.span = spool.append(&content)?;
                             blocks.push(b);
+                            let last = blocks.len() - 1;
+                            journal(
+                                &mut ck,
+                                &mut spool,
+                                cancel_flag,
+                                key(path),
+                                stamp,
+                                &blocks[last..],
+                                None,
+                            )?;
                         }
                     }
                 }
@@ -592,13 +681,29 @@ where
                     let rel = if cfg.reproducible { nfc(&rel) } else { rel };
                     progress_callback(done, total_files, &rel);
                     merge_skips.push(SkipEntry::new(rel, reason, kind));
+                    journal(
+                        &mut ck,
+                        &mut spool,
+                        cancel_flag,
+                        key(path),
+                        stamp,
+                        &[],
+                        merge_skips.last(),
+                    )?;
                 }
             }
             Ok(())
         },
     )?;
     if ended == Ended::Cancelled || cancelled(cancel_flag) {
+        // What is done stays done: the next --resume starts after it.
+        if let Some(c) = ck.as_mut() {
+            let _ = c.flush(&mut spool);
+        }
         return Err(Cancelled.into());
+    }
+    if let Some(c) = ck.as_mut() {
+        c.flush(&mut spool)?;
     }
 
     // The OCR stage: every picture the text merge queued, a batch per engine
@@ -904,6 +1009,25 @@ where
         ));
     }
 
+    // The outputs are in place: the checkpoint has done its job — unless the
+    // run finished early, when it is what the next --resume continues from.
+    if let Some(c) = ck {
+        if c.resumed > 0 {
+            outcome.notes.push(format!(
+                "resumed: {} of {} files came from the checkpoint, the rest were read",
+                c.resumed, total_files
+            ));
+        }
+        if outcome.partial {
+            outcome.notes.push(format!(
+                "checkpoint kept in {}: run the same command with --resume to finish",
+                c.dir().display()
+            ));
+        } else {
+            c.remove(spool);
+        }
+    }
+
     // Claude-skill emission (T3-4): best-effort, into the scanned repo.
     if cfg.emit_skill && !cfg.remote {
         match write_skill(root, &blocks, &outcome, cfg.reproducible) {
@@ -913,6 +1037,26 @@ where
     }
 
     Ok(outcome)
+}
+
+/// Journal one finished file in the checkpoint (`--checkpoint`/`--resume`).
+/// Nothing is journaled once the run is cancelled: a worker that saw the
+/// cancel may hand over an empty result.
+fn journal(
+    ck: &mut Option<checkpoint::Checkpoint>,
+    spool: &mut Spool,
+    cancel: &AtomicBool,
+    key: String,
+    stamp: Option<checkpoint::Stamp>,
+    blocks: &[Block],
+    skip: Option<&SkipEntry>,
+) -> std::io::Result<()> {
+    if let (Some(c), Some(stamp), false) = (ck.as_mut(), stamp, cancelled(cancel)) {
+        if let Some(e) = checkpoint::Entry::new(key, stamp, blocks, skip) {
+            c.record(&e, spool)?;
+        }
+    }
+    Ok(())
 }
 
 /// Blocks in consecutive runs whose texts total at most `CHUNK_BYTES`.

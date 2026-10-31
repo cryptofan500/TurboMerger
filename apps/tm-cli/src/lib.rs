@@ -309,6 +309,12 @@ pub struct MergeCmd {
     /// With --complete: embed only files up to N MB (default: no cap); a larger one is withheld and named (exit 3)
     #[arg(long, value_name = "MB")]
     pub embed_binary: Option<u64>,
+    /// Keep a checkpoint beside the output (OUT.tm-checkpoint/) so a stopped run (Ctrl-C, kill, crash, deadline) can continue with --resume; removed when the merge is written. Not with --redact
+    #[arg(long)]
+    pub checkpoint: bool,
+    /// Continue from the checkpoint beside the output: files unchanged since (size and modification time) are not read again; the output equals an uninterrupted run's. Starts a checkpoint when there is none
+    #[arg(long, conflicts_with = "checkpoint")]
+    pub resume: bool,
 }
 
 fn duration_arg(s: &str) -> Result<Duration, String> {
@@ -561,6 +567,8 @@ fn run_merge(a: MergeCmd) -> i32 {
     options.budget_tokens = a.budget_tokens;
     options.complete = a.complete;
     options.embed_binary = a.embed_binary;
+    options.checkpoint = a.checkpoint;
+    options.resume = a.resume;
 
     // Exact file selection (ADR 0020): a list or a plan merges exactly the
     // named files and never walks the source folder.
@@ -646,6 +654,21 @@ fn run_merge(a: MergeCmd) -> i32 {
     if options.complete && a.format.as_str() != "markdown" {
         eprintln!("error: the archive twin (--complete) is written in the markdown format only");
         return EXIT_USAGE;
+    }
+    if options.checkpoint || options.resume {
+        let why = if options.redact_secrets {
+            Some("--checkpoint / --resume cannot be used with --redact (the checkpoint would keep unredacted text and secret values on disk)")
+        } else if options.remote {
+            Some("--checkpoint / --resume need a local folder (a remote clone is temporary)")
+        } else if a.out.is_none() {
+            Some("--checkpoint / --resume need an explicit OUTPUT path (the checkpoint sits beside it)")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            eprintln!("error: {why}");
+            return EXIT_USAGE;
+        }
     }
 
     if a.list_only || a.emit_selection.is_some() {

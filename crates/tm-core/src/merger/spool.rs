@@ -47,6 +47,31 @@ impl Spool {
         })
     }
 
+    /// A named spool that outlives the process (`--checkpoint`, S10 4.3):
+    /// the file at `path`, cut to `end` bytes (0 = a new spool) and
+    /// continued from there.
+    pub(crate) fn at(path: &Path, end: u64) -> io::Result<Spool> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        file.set_len(end)?;
+        Ok(Spool {
+            file,
+            end,
+            buf: Vec::with_capacity(BUFFER),
+            buf_start: end,
+        })
+    }
+
+    /// Everything appended so far is on disk (written and `fdatasync`ed).
+    pub(crate) fn sync(&mut self) -> io::Result<()> {
+        self.flush()?;
+        self.file.sync_data()
+    }
+
     pub(crate) fn append(&mut self, text: &str) -> io::Result<Span> {
         if !self.buf.is_empty() && self.buf.len() + text.len() > BUFFER {
             self.flush()?;

@@ -651,3 +651,145 @@ fn restore_rebuilds_a_twin_and_never_overwrites_silently() {
     let o = tm(&["restore", twin.to_str().unwrap()], tmp.path());
     assert_eq!(o.status.code(), Some(2), "--dest or --check is required");
 }
+
+/// Lines in a checkpoint journal (header included), 0 if there is none yet.
+fn journal_lines(dir: &Path) -> usize {
+    fs::read(dir.join("journal.jsonl"))
+        .map(|b| b.iter().filter(|&&c| c == b'\n').count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_killed_run_resumes_to_the_same_bytes() {
+    // S10 4.3 (HANDOFF_S8, DeepSeek B13): kill -9 part way through a
+    // checkpointed merge, change one finished file, --resume: the output is
+    // byte for byte what an uninterrupted run of the changed tree writes,
+    // the finished files are not read again, and the checkpoint is removed.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(src.join("deep")).unwrap();
+    for i in 0..120 {
+        fs::write(
+            src.join(format!("f{i:03}.rs")),
+            format!("pub fn f{i}() -> u32 {{ {i} }}\n"),
+        )
+        .unwrap();
+    }
+    fs::write(src.join("deep/notes.md"), "# notes\n\ntext\n").unwrap();
+    fs::write(src.join("blob.bin"), [0u8, 1, 2, 3, 0, 0, 0, 9]).unwrap();
+    let base = ["--reproducible", "--threads", "2"];
+    let args = |out: &str, extra: &[&str]| -> Vec<String> {
+        ["merge", "src", out]
+            .iter()
+            .chain(base.iter())
+            .chain(extra.iter())
+            .map(|s| s.to_string())
+            .collect()
+    };
+    let run = |a: Vec<String>| {
+        let a: Vec<&str> = a.iter().map(String::as_str).collect();
+        tm(&a, tmp.path())
+    };
+
+    // The run that is killed: slow files, a journal line after every file.
+    let ck = tmp.path().join("part.md.tm-checkpoint");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_turbomerger"))
+        .args(args("part.md", &["--checkpoint", "-q"]))
+        .current_dir(tmp.path())
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env("TURBOMERGER_STATE_DIR", tmp.path().join("state"))
+        .env("TURBOMERGER_CACHE_DIR", tmp.path().join("cache"))
+        .env("TM_TEST_SLOW_FILE_MS", "40")
+        .env("TM_TEST_CHECKPOINT_FLUSH_MS", "0")
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    while journal_lines(&ck) < 41 {
+        assert!(start.elapsed().as_secs() < 60, "the journal never grew");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "finished before the kill"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child.kill().unwrap(); // SIGKILL: no clean-up of any kind
+    child.wait().unwrap();
+    let journaled = journal_lines(&ck) - 1;
+    assert!(
+        (40..122).contains(&journaled),
+        "{journaled} files journaled"
+    );
+    assert!(
+        !tmp.path().join("part.md").exists(),
+        "a killed run writes no output"
+    );
+    assert!(ck.join("spool").is_file() && ck.join("CACHEDIR.TAG").is_file());
+
+    // f000.rs was finished before the kill; it changes (size and time).
+    fs::write(src.join("f000.rs"), "pub fn f0() -> u32 { 1000 }\n").unwrap();
+    let o = run(args("full.md", &["-q"]));
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+
+    let o = run(args("part.md", &["--resume"]));
+    let said = format!("{}{}", stdout(&o), String::from_utf8_lossy(&o.stderr));
+    assert_eq!(o.status.code(), Some(0), "{said}");
+    let resumed: usize = said
+        .split("resumed: ")
+        .nth(1)
+        .and_then(|t| t.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no resumed note: {said}"));
+    assert_eq!(
+        resumed,
+        journaled - 1,
+        "every journaled file but the changed one"
+    );
+    assert_eq!(
+        fs::read(tmp.path().join("part.md")).unwrap(),
+        fs::read(tmp.path().join("full.md")).unwrap(),
+        "the resumed output differs from the uninterrupted one"
+    );
+    assert!(
+        !ck.exists(),
+        "the checkpoint is removed once the merge is written"
+    );
+}
+
+#[test]
+fn resume_refuses_what_it_cannot_continue() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.rs"), "fn a() {}\n").unwrap();
+    // Usage errors (exit 2), nothing written.
+    for args in [
+        vec!["merge", "src", "o.md", "--resume", "--redact"],
+        vec!["merge", "src", "--resume"],
+        vec!["merge", "src", "o.md", "--resume", "--checkpoint"],
+    ] {
+        let o = tm(&args, tmp.path());
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+    }
+    assert!(!tmp.path().join("o.md.tm-checkpoint").exists());
+    // A checkpoint made with other content options is not mixed in.
+    let o = tm(&["merge", "src", "o.md", "--checkpoint", "-q"], tmp.path());
+    assert_eq!(o.status.code(), Some(0));
+    assert!(
+        !tmp.path().join("o.md.tm-checkpoint").exists(),
+        "removed after success"
+    );
+    fs::create_dir_all(tmp.path().join("o.md.tm-checkpoint")).unwrap();
+    fs::write(
+        tmp.path().join("o.md.tm-checkpoint/journal.jsonl"),
+        "{\"tm_checkpoint\":1,\"fingerprint\":\"0000\"}\n",
+    )
+    .unwrap();
+    let o = tm(&["merge", "src", "o.md", "--resume", "-q"], tmp.path());
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("other merge options"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}

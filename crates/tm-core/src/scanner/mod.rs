@@ -758,6 +758,10 @@ fn prune_dir_reason(
     if SKIP_DIRS_ALWAYS.contains(name_lower) {
         return Some("dependency / tool-cache directory");
     }
+    // `<output>.tm-checkpoint/` (merger/checkpoint.rs): resume data.
+    if name_lower.ends_with(".tm-checkpoint") {
+        return Some("TurboMerger checkpoint (merge --resume data)");
+    }
     if name_lower == "target"
         && path
             .parent()
