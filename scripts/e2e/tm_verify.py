@@ -45,6 +45,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from decimal import Decimal
 
 try:  # Python 3.11+
@@ -1181,6 +1182,24 @@ def build_fixtures(root):
     hid.sheet_state = "hidden"
     wb.create_sheet("Empty")
     wb.save(os.path.join(root, "cases.xlsx"))
+    # ISO dates (OOXML t="d"), as other writers store them; S8 found them
+    # kept raw (`2026-10-13T12:00:00.000Z`) in a real workbook.
+    iso = openpyxl.Workbook(iso_dates=True)
+    ws = iso.active
+    ws.title = "ISO"
+    for i, h in enumerate(["id", "checked", "day", "clock"], 1):
+        ws.cell(row=1, column=i, value=h)
+    ws.append(["a", dt.datetime(2026, 10, 13, 12, 0, 0), dt.date(2024, 2, 29), dt.time(9, 30)])
+    ws.append(["b", dt.datetime(2024, 1, 31, 13, 45, 7, 500000), dt.datetime(2026, 10, 13), None])
+    iso_path = os.path.join(root, "isodates.xlsx")
+    iso.save(iso_path)
+    with zipfile.ZipFile(iso_path) as z:
+        members = [(i, z.read(i.filename)) for i in z.infolist()]
+    with zipfile.ZipFile(iso_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for info, data in members:
+            if info.filename == "xl/worksheets/sheet1.xml":
+                data = data.replace(b">2026-10-13T12:00:00<", b">2026-10-13T12:00:00.000Z<")
+            z.writestr(info, data)
     with open(os.path.join(root, "roster.csv"), "w", encoding="utf-8", newline="") as f:
         f.write('Rank,Program,City,Why,Website\r\n1,"Mercy, Lorain",Lorain,"two\r\nlines","https://a.example"\r\n'
                 '2,"Say ""hi""",X,,https://b.example\r\n\r\n3,Third,Y,"pipe | and \\ back",\r\n')
@@ -1212,6 +1231,8 @@ heading_context = true
 [[file]]
 path = "code.py"
 lines = ["2-4", "10"]
+[[file]]
+path = "isodates.xlsx"
 '''
     with open(os.path.join(root, "sel.toml"), "w", encoding="utf-8") as f:
         f.write(sel)
@@ -1306,7 +1327,7 @@ def cmd_selftest(bin_arg):
         plan = os.path.join(tmp, "complete.toml")
         with open(plan, "w", encoding="utf-8") as f:
             f.write('version = 1\nmode = "explicit"\nordering = "plan"\ncomplete = true\n' +
-                    "".join(f'[[file]]\npath = "{p}"\n' for p in ("cases.xlsx", "roster.csv", "dossier.md", "code.py")))
+                    "".join(f'[[file]]\npath = "{p}"\n' for p in ("cases.xlsx", "roster.csv", "dossier.md", "code.py", "isodates.xlsx")))
         r = subprocess.run([tm, "merge", src, ar, "--selection", plan, "--complete", "--embed-binary", "5", "--format",
                             "markdown", "--yes", "-q"], capture_output=True, text=True, env=env)
         if r.returncode != 0:

@@ -94,9 +94,108 @@ pub fn canon(data: &Data) -> Option<Cell> {
         Data::Bool(b) => cell(if *b { "TRUE" } else { "FALSE" }.into(), 'b'),
         Data::DateTime(dt) => cell(canon_datetime(dt), 'd'),
         Data::DateTimeIso(s) | Data::DurationIso(s) if s.is_empty() => None,
-        Data::DateTimeIso(s) | Data::DurationIso(s) => cell(s.clone(), 'd'),
+        // ISO text (OOXML `t="d"`, ODS date/time values) takes the same text
+        // as a serial date; anything else stays the string it was.
+        Data::DateTimeIso(s) | Data::DurationIso(s) => match canon_iso(s) {
+            Some(text) => cell(text, 'd'),
+            None => cell(s.clone(), 's'),
+        },
         Data::Error(e) => cell(e.to_string(), 'e'),
     }
+}
+
+/// ISO 8601 text → canonical date, time, date-time or duration text, read
+/// the way openpyxl reads an OOXML `t="d"` cell (the verifier's oracle):
+/// `YYYY-MM-DD`, `[T]hh:mm[:ss[.fff]]`, both joined by `T` (or a space) with
+/// an optional `Z`, or a `[-]P[nD]T[nH][nM][n[.f]S]` duration; fractions are
+/// cut to milliseconds and midnight drops the clock. `None` for anything
+/// else, including an impossible date and a UTC offset (openpyxl drops the
+/// offset silently; keeping the text keeps it).
+fn canon_iso(s: &str) -> Option<String> {
+    static RE: OnceLock<[Regex; 2]> = OnceLock::new();
+    let [when, span] = RE.get_or_init(|| {
+        let r = |p: &str| Regex::new(p).expect("static regex");
+        [
+            r(r"^(?:([0-9]{4})-([0-9]{2})-([0-9]{2}))?[T ]?(?:([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.([0-9]+))?)?)?Z?$"),
+            r(r"^(-)?P(?:([0-9]+)D)?(?:T(?:([0-9]+)H)?(?:([0-9]+)M)?(?:([0-9]+)(?:\.([0-9]+))?S)?)?$"),
+        ]
+    });
+    let num = |m: Option<regex::Match<'_>>| m.map_or(Some(0), |m| m.as_str().parse::<u64>().ok());
+    // ".5" → 500, ".123456" → 123 (openpyxl reads at most three digits).
+    let millis = |m: Option<regex::Match<'_>>| {
+        let digits = m.map_or(&b""[..], |m| m.as_str().as_bytes());
+        (0..3).fold(0u64, |ms, i| {
+            ms * 10 + digits.get(i).map_or(0, |d| u64::from(d - b'0'))
+        })
+    };
+    let frac = |ms: u64| {
+        if ms > 0 {
+            format!(".{ms:03}")
+        } else {
+            String::new()
+        }
+    };
+    if let Some(c) = when.captures(s) {
+        let (has_date, has_time) = (c.get(1).is_some(), c.get(4).is_some());
+        if has_date || has_time {
+            let (h, mi, sec, ms) = (
+                num(c.get(4))?,
+                num(c.get(5))?,
+                num(c.get(6))?,
+                millis(c.get(7)),
+            );
+            if h > 23 || mi > 59 || sec > 59 {
+                return None;
+            }
+            let clock = format!("{h:02}:{mi:02}:{sec:02}{}", frac(ms));
+            if !has_date {
+                return Some(clock);
+            }
+            let (y, mo, d) = (num(c.get(1))?, num(c.get(2))?, num(c.get(3))?);
+            let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+            let month_days = match mo {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                2 if leap => 29,
+                2 => 28,
+                _ => return None,
+            };
+            if y == 0 || d == 0 || d > month_days {
+                return None;
+            }
+            let day = format!("{y:04}-{mo:02}-{d:02}");
+            return Some(if (h, mi, sec, ms) == (0, 0, 0, 0) {
+                day
+            } else {
+                format!("{day} {clock}")
+            });
+        }
+    }
+    let c = span.captures(s)?;
+    if (2..=5).all(|i| c.get(i).is_none()) {
+        return None;
+    }
+    let total_ms = num(c.get(2))?
+        .checked_mul(24)?
+        .checked_add(num(c.get(3))?)?
+        .checked_mul(60)?
+        .checked_add(num(c.get(4))?)?
+        .checked_mul(60)?
+        .checked_add(num(c.get(5))?)?
+        .checked_mul(1000)?
+        .checked_add(millis(c.get(6)))?;
+    let (h, rem) = (total_ms / 3_600_000, total_ms % 3_600_000);
+    let (m, rem) = (rem / 60_000, rem % 60_000);
+    let sign = if c.get(1).is_some() && total_ms > 0 {
+        "-"
+    } else {
+        ""
+    };
+    Some(format!(
+        "{sign}{h}:{m:02}:{:02}{}",
+        rem / 1000,
+        frac(rem % 1000)
+    ))
 }
 
 fn canon_datetime(dt: &calamine::ExcelDateTime) -> String {
@@ -971,6 +1070,51 @@ mod tests {
             "0123",
             "not a NUM shape, no marker needed"
         );
+    }
+
+    #[test]
+    fn iso_dates_read_like_serial_dates() {
+        // OOXML `t="d"` cells and ODS date/time values arrive as ISO text
+        // (S8: `2026-10-13T12:00:00.000Z` was kept raw, so the decoder read
+        // it as a string and the sheet's sha256 disagreed with its cells).
+        let d = |s: &str| canon(&Data::DateTimeIso(s.into())).unwrap();
+        let dur = |s: &str| canon(&Data::DurationIso(s.into())).unwrap();
+        let date = |text: &str| Cell {
+            text: text.into(),
+            kind: 'd',
+        };
+        assert_eq!(d("2026-10-13T12:00:00.000Z"), date("2026-10-13 12:00:00"));
+        assert_eq!(d("2026-10-13T00:00:00Z"), date("2026-10-13"));
+        assert_eq!(d("2024-02-29"), date("2024-02-29"));
+        assert_eq!(d("2024-01-31T13:45"), date("2024-01-31 13:45:00"));
+        assert_eq!(d("2024-01-31T13:45:07.5"), date("2024-01-31 13:45:07.500"));
+        assert_eq!(
+            d("2024-01-31T13:45:07.123456"),
+            date("2024-01-31 13:45:07.123")
+        );
+        assert_eq!(d("09:30:00"), date("09:30:00"));
+        assert_eq!(d("PT1H30M"), date("1:30:00"));
+        assert_eq!(dur("PT36H00M07.25S"), date("36:00:07.250"));
+        assert_eq!(dur("PT90M"), date("1:30:00"));
+        assert_eq!(dur("-PT2H"), date("-2:00:00"));
+        for text in [
+            "2026-10-13 12:00:00",
+            "2024-01-31 13:45:07.500",
+            "36:00:07.250",
+        ] {
+            assert!(looks_typed(text), "the decoder must read {text} as a date");
+        }
+        // What is not a valid ISO date stays the text it was, as a string:
+        // an impossible day, an offset (openpyxl would drop it), plain words.
+        for raw in ["2026-02-30T10:00:00", "2026-10-13T12:00:00+02:00", "soon"] {
+            assert_eq!(
+                canon(&Data::DateTimeIso(raw.into())).unwrap(),
+                Cell {
+                    text: raw.into(),
+                    kind: 's'
+                }
+            );
+        }
     }
 
     #[test]
