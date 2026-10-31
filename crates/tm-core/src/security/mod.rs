@@ -374,7 +374,7 @@ pub fn sensitive_reason(path: &Path) -> Option<&'static str> {
         "md", "markdown", "txt", "text", "csv", "tsv", "json", "yaml", "yml", "toml", "ini",
         "conf", "cfg", "env", "log", "xlsx", "rtf",
     ];
-    if DATA_EXTS.contains(&ext) {
+    if DATA_EXTS.contains(&ext) && !is_project_doc(path, stem, ext) {
         for marker in [
             "credential",
             "password",
@@ -392,6 +392,30 @@ pub fn sensitive_reason(path: &Path) -> Option<&'static str> {
     }
 
     None
+}
+
+/// A prose document ABOUT secrets, not a store of them: a Markdown/text file
+/// inside a docs or ADR folder, or a standard project document. Its name
+/// alone does not exclude it; the merge-time density check
+/// (`is_credential_dump`) still excludes one that really holds a dump.
+fn is_project_doc(path: &Path, stem: &str, ext: &str) -> bool {
+    if !matches!(ext, "md" | "markdown" | "txt" | "text") {
+        return false;
+    }
+    let standard = matches!(
+        stem,
+        "readme" | "changelog" | "security" | "contributing" | "history" | "news"
+    );
+    standard
+        || path.parent().is_some_and(|dir| {
+            dir.components().any(|c| {
+                let c = c.as_os_str().to_string_lossy().to_ascii_lowercase();
+                matches!(
+                    c.as_str(),
+                    "docs" | "doc" | "documentation" | "adr" | "adrs" | "decisions"
+                )
+            })
+        })
 }
 
 /// Binary file signatures (magic bytes)
@@ -713,8 +737,11 @@ pub fn redact_secrets(content: &str) -> (String, Vec<RedactionEvent>) {
             // entropy is judged on the value capture when the rule has one,
             // so key names ("password = ") don't inflate it
             let gate_target = caps.name("v").map(|v| v.as_str()).unwrap_or(s);
+            // The generic `secret = …` / `api_key = …` rules have only a
+            // label to go on, so code on the right-hand side is spared.
             let benign = SECRET_STOPWORDS.iter().any(|w| lower.contains(w))
-                || (rule.entropy_gate && calculate_entropy(gate_target) < ENTROPY_THRESHOLD);
+                || (rule.entropy_gate && calculate_entropy(gate_target) < ENTROPY_THRESHOLD)
+                || (rule.name.starts_with("Generic") && value_is_code(gate_target));
             out.push_str(&text[last..m.start()]);
             if benign {
                 out.push_str(s);
@@ -1019,7 +1046,36 @@ fn labeled_value_is_secret(v: &str) -> bool {
     if SECRET_STOPWORDS.iter().any(|w| lower.contains(w)) || lower.contains("://") {
         return false;
     }
+    if value_is_code(v) {
+        return false;
+    }
     v.bytes().any(|b| !b.is_ascii_alphanumeric()) || calculate_entropy(v) >= 3.0
+}
+
+/// The second factor for a labeled value (S8, DeepSeek A7): a value that is
+/// code — a path (`::o200k_base`, `a::b`), a call, an arrow, or a member
+/// chain of identifiers starting in lower case (`outcome.tokens_o200k`,
+/// `e.tmp.path`) — is never a secret, whatever its label (`tokens = …`,
+/// `let secret = …`). A JWT (`eyJ…`) is dotted too and stays a secret.
+fn value_is_code(v: &str) -> bool {
+    if v.starts_with("eyJ") {
+        return false;
+    }
+    if v.starts_with([':', '.'])
+        || v.contains("::")
+        || v.contains("->")
+        || v.contains("=>")
+        || v.contains('(')
+    {
+        return true;
+    }
+    let segments: Vec<&str> = v.trim_end_matches([',', ';']).split('.').collect();
+    segments.len() >= 2
+        && segments.iter().all(|seg| {
+            let mut chars = seg.chars();
+            matches!(chars.next(), Some('a'..='z' | '_' | '$'))
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        })
 }
 
 static EMAIL_PASS_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -1167,6 +1223,63 @@ mod tests {
             assert!(
                 sensitive_reason(Path::new(name)).is_none(),
                 "{} should NOT be sensitive",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn labeled_code_values_are_not_secrets() {
+        // S8 1.7 (DeepSeek A7): lines from TurboMerger's own source that
+        // `--redact` mangled (job.rs, merger/mod.rs, render.rs, tokens.rs,
+        // tm-mcp tests) stay as they are.
+        let code = "        tokens = outcome.tokens_o200k,\n\
+        tokens_o200k: outcome.tokens_o200k,\n\
+    std::sync::LazyLock::new(|| tiktoken_rs::o200k_base().expect(\"o200k_base tokenizer\"));\n\
+    let secret = e.tmp.path().join(\"x_merged.md\");\n\
+    let token: Token = self.cfg.token_v2;\n";
+        let (out, _) = redact_secrets(code);
+        assert_eq!(out, code, "code mangled: {out}");
+        assert!(harvest_labeled_values(code).is_empty());
+        // Real labeled values still go, dotted or not.
+        for line in [
+            "password: Vr7wKp2walKotwica91\n",
+            "DB_PASSWORD: Xk2mQv9rT4w\n",
+            "SUPABASE_JWT_SECRET=4f2a91c3-77b2-4f0e-9a01-2b8cd91e55aa\n",
+            "password: Pass.word2024\n",
+            "token = q8Zt3xNv7Rb2Lm9Dw4Ys\n",
+            "secret = eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl\n",
+        ] {
+            let (out, _) = redact_secrets(line);
+            assert!(out.contains("[REDACTED]"), "{line:?} kept: {out}");
+        }
+    }
+
+    #[test]
+    fn sensitive_keeps_documents_about_secrets() {
+        // S8 1.4 (DeepSeek B3.4): a file ABOUT secrets is not a secret.
+        for name in [
+            "docs/adr/0013-phase1-secret-masking.md",
+            "docs/password-policy.md",
+            "project/doc/vault-setup.txt",
+            "adr/0007-secret-store.md",
+        ] {
+            assert!(
+                sensitive_reason(Path::new(name)).is_none(),
+                "{} is documentation",
+                name
+            );
+        }
+        // Data files, and prose outside a docs folder, still match by name.
+        for name in [
+            "docs/passwords.csv",
+            "docs/api_keys.json",
+            "notes/SSM_CREDENTIALS_2026-06-29T1200Z.md",
+            "passwords.txt",
+        ] {
+            assert!(
+                sensitive_reason(Path::new(name)).is_some(),
+                "{} should stay sensitive",
                 name
             );
         }

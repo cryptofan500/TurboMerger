@@ -320,3 +320,50 @@ fn chained_changes_to_one_file_fold_in_order() {
         "step two\n"
     );
 }
+
+#[test]
+fn files_without_a_final_newline_round_trip_as_identical() {
+    // S8 1.3 (DeepSeek B3.2): the fence adds a newline the file never had,
+    // so pasting the merged snapshot back proposed to add one.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("abc.txt"), "abc").unwrap();
+    fs::write(root.join("crlf.txt"), "x\r\ny").unwrap();
+    fs::write(root.join("normal.txt"), "n\n").unwrap();
+    let policy = ApplyPolicy::default().with_state_dir(tmp.path().join("state"));
+    let scan = scan_text_files(&root, &ScanOptions::default()).expect("scan");
+    for (format, name) in [
+        (OutputFormat::Markdown, "out.md"),
+        (OutputFormat::Cxml, "out.xml"),
+    ] {
+        let out = tmp.path().join(name);
+        let cfg = MergeConfig {
+            format,
+            ..MergeConfig::default()
+        };
+        merge_files_with_progress(
+            &root,
+            &scan.files,
+            &out,
+            &cfg,
+            &AtomicBool::new(false),
+            |_, _, _| {},
+            &scan.skipped,
+        )
+        .expect("merge");
+        let changes = parse_reply(&fs::read_to_string(&out).unwrap());
+        let built = build_preview(&root, &changes, &policy).expect("preview");
+        assert_eq!(built.preview.files.len(), 3, "{name}");
+        for f in &built.preview.files {
+            assert!(
+                f.ok && f.identical,
+                "{name}: {} not identical (+{} -{})",
+                f.rel_path,
+                f.adds,
+                f.dels
+            );
+        }
+        assert!(built.ready.is_empty(), "{name}");
+    }
+}

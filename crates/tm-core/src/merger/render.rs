@@ -319,19 +319,20 @@ fn write_markdown<W: Write>(w: &mut W, ctx: &RenderCtx, blocks: &[&Block]) -> Re
         // Archive twin (ADR 0020): one JSON line per file so a rebuild can be
         // byte-identical. A text file rebuilds from its block (`eol` and
         // `final_newline` undo what the Markdown fence changes); a file its
-        // block cannot reproduce byte for byte (workbooks, PDFs, a BOM,
-        // non-UTF-8, mixed line ends) is `binary` and is embedded as base64
-        // when `--embed-binary` allows its size.
-        let facts: Vec<(&Block, Vec<u8>, ArchiveFacts)> = blocks
-            .iter()
-            .map(|b| {
-                let data = std::fs::read(ctx.root.join(&b.relative)).unwrap_or_default();
-                let f = ArchiveFacts::of(b, &data);
-                (*b, data, f)
-            })
-            .collect();
+        // block does not give back byte for byte (workbooks, PDFs, a BOM,
+        // non-UTF-8, mixed line ends, a slice, text changed by a slimming
+        // flag or by redaction) is `binary` and is embedded as base64 when
+        // `--embed-binary` allows its size. One source file is held at a
+        // time; embedded files are read again in the second pass.
+        let max_embed = ctx.cfg.embed_binary.map(|mb| mb * 1024 * 1024);
+        let mut embed: Vec<&Block> = Vec::new();
         writeln!(w, "## __manifest__\n\n```jsonlines")?;
-        for (b, data, f) in &facts {
+        for b in blocks {
+            let data = std::fs::read(ctx.root.join(&b.relative)).unwrap_or_default();
+            let f = ArchiveFacts::of(&ctx.content(b)?, &data);
+            if !f.text_ok && max_embed.is_some_and(|cap| data.len() as u64 <= cap) {
+                embed.push(b);
+            }
             let line = serde_json::json!({
                 "path": b.relative,
                 "bytes": data.len(),
@@ -339,7 +340,7 @@ fn write_markdown<W: Write>(w: &mut W, ctx: &RenderCtx, blocks: &[&Block]) -> Re
                 "kind": if f.text_ok { "text" } else { "binary" },
                 "lang": b.lang,
                 "eol": f.eol,
-                "final_newline": data.last() == Some(&b'\n'),
+                "final_newline": f.final_newline,
                 "bom": f.bom,
                 "utf8": f.utf8,
                 "mode": file_mode(&ctx.root.join(&b.relative)),
@@ -347,26 +348,21 @@ fn write_markdown<W: Write>(w: &mut W, ctx: &RenderCtx, blocks: &[&Block]) -> Re
             writeln!(w, "{}", line)?;
         }
         writeln!(w, "```\n")?;
-        if let Some(mb_cap) = ctx.cfg.embed_binary {
-            let max_bytes = mb_cap * 1024 * 1024;
-            for (b, data, f) in &facts {
-                if f.text_ok || data.len() as u64 > max_bytes {
-                    continue;
-                }
-                // 76-character lines (RFC 2045) keep the twin easy to diff.
-                let b64 = crate::remote::base64(data);
-                let wrapped: Vec<&str> = b64
-                    .as_bytes()
-                    .chunks(76)
-                    .map(|c| std::str::from_utf8(c).unwrap_or(""))
-                    .collect();
-                writeln!(
-                    w,
-                    "## __binary__: {}\n\n```base64\n{}\n```\n",
-                    b.relative,
-                    wrapped.join("\n")
-                )?;
-            }
+        for b in embed {
+            let data = std::fs::read(ctx.root.join(&b.relative)).unwrap_or_default();
+            // 76-character lines (RFC 2045) keep the twin easy to diff.
+            let b64 = crate::remote::base64(&data);
+            let wrapped: Vec<&str> = b64
+                .as_bytes()
+                .chunks(76)
+                .map(|c| std::str::from_utf8(c).unwrap_or(""))
+                .collect();
+            writeln!(
+                w,
+                "## __binary__: {}\n\n```base64\n{}\n```\n",
+                b.relative,
+                wrapped.join("\n")
+            )?;
         }
     }
     Ok(())
@@ -833,6 +829,7 @@ pub(super) fn generate_tree(folder: &str, blocks: &[&Block]) -> String {
 /// What an archive rebuild needs to know about one source file.
 struct ArchiveFacts {
     eol: &'static str,
+    final_newline: bool,
     bom: bool,
     utf8: bool,
     /// The block's text reproduces the file byte for byte.
@@ -840,7 +837,11 @@ struct ArchiveFacts {
 }
 
 impl ArchiveFacts {
-    fn of(b: &Block, data: &[u8]) -> Self {
+    /// `content` is the block's text exactly as the fence carries it. The
+    /// rebuild is compared with the file itself, so whatever changed the
+    /// text (a slimming flag, a slice, redaction, a grid, a lossy decode)
+    /// makes the file `binary` without a rule per cause.
+    fn of(content: &str, data: &[u8]) -> Self {
         let crlf = data.windows(2).filter(|w| w == b"\r\n").count();
         let lf = data.iter().filter(|&&c| c == b'\n').count();
         let lone_cr = data.iter().filter(|&&c| c == b'\r').count() - crlf;
@@ -850,24 +851,43 @@ impl ArchiveFacts {
             (_, 0, 0) => "crlf",
             _ => "mixed",
         };
+        let final_newline = data.last() == Some(&b'\n');
         let bom = data.starts_with(&[0xEF, 0xBB, 0xBF])
             || data.starts_with(&[0xFF, 0xFE])
             || data.starts_with(&[0xFE, 0xFF]);
         let utf8 = std::str::from_utf8(data).is_ok();
-        let text_ok = b.lang != "tm-grid"
-            && utf8
+        let text_ok = utf8
             && !bom
             && eol != "mixed"
-            && !b.compressed
-            && b.redactions.is_empty()
-            && b.utf8_note.is_none();
+            && rebuilt_from_block(content, eol, final_newline).as_bytes() == data;
         ArchiveFacts {
             eol,
+            final_newline,
             bom,
             utf8,
             text_ok,
         }
     }
+}
+
+/// What a restore makes of a block (`tm_verify.py restore` does the same):
+/// the fenced text, then the manifest's `eol` and `final_newline` applied.
+fn rebuilt_from_block(content: &str, eol: &str, final_newline: bool) -> String {
+    // The fence adds a newline to text without one; the reader drops one.
+    let mut body = content.strip_suffix('\n').unwrap_or(content).to_string();
+    if eol == "crlf" {
+        body = body.replace("\r\n", "\n");
+        if body.ends_with('\r') {
+            body.pop();
+        }
+    }
+    if final_newline {
+        body.push('\n');
+    }
+    if eol == "crlf" {
+        body = body.replace('\n', "\r\n");
+    }
+    body
 }
 
 /// Unix permission bits of a file (0 elsewhere), for the archive manifest.

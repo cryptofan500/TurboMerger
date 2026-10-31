@@ -596,17 +596,17 @@ fn parse_cxml(
 
 /// Apply parsed hunks to `original`. Exact placement at the stated line is
 /// tried first, then the old block is searched forward (LLM line numbers
-/// drift). Line endings of the original (CRLF vs LF) are preserved.
+/// drift). Every line keeps its own ending (`\n` or `\r\n`), so a file with
+/// mixed endings changes only where the diff changes it; an added line takes
+/// the ending of the line it replaces, else of the nearest line before it.
+/// Context lines are the file's own text (chat UIs strip trailing spaces).
 pub fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, String> {
-    let had_crlf = original.contains("\r\n");
-    let orig: Vec<&str> = if original.is_empty() {
-        Vec::new()
-    } else {
-        original.lines().collect()
-    };
+    let orig: Vec<(&str, &str)> = original.split_inclusive('\n').map(split_eol).collect();
+    let texts: Vec<&str> = orig.iter().map(|&(t, _)| t).collect();
     let orig_ends_nl = original.is_empty() || original.ends_with('\n');
+    let mut near_eol: &str = dominant_eol(original);
 
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<(String, &str)> = Vec::new();
     let mut cursor = 0usize;
     let mut no_eol = false;
 
@@ -624,7 +624,7 @@ pub fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, String> {
             // Pure insertion: trust the stated position, clamped.
             ideal.clamp(cursor, orig.len())
         } else {
-            find_block(&orig, &old_block, cursor, ideal).ok_or_else(|| {
+            find_block(&texts, &old_block, cursor, ideal).ok_or_else(|| {
                 format!(
                     "hunk {} (@@ -{} +{}) does not match the current file content",
                     hi + 1,
@@ -633,20 +633,40 @@ pub fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, String> {
                 )
             })?
         };
-        out.extend(orig[cursor..pos].iter().map(|s| s.to_string()));
+        for &(t, e) in &orig[cursor..pos] {
+            out.push((t.to_string(), e));
+            near_eol = if e.is_empty() { near_eol } else { e };
+        }
+        // Endings of deleted lines, reused in order by the lines added
+        // in their place.
+        let mut freed: std::collections::VecDeque<&str> = Default::default();
+        let mut k = pos;
         for l in &h.lines {
             match l {
-                HunkLine::Ctx(s) | HunkLine::Ins(s) => out.push(s.clone()),
-                HunkLine::Del(_) => {}
+                HunkLine::Ctx(_) => {
+                    let (t, e) = orig[k];
+                    out.push((t.to_string(), e));
+                    near_eol = if e.is_empty() { near_eol } else { e };
+                    freed.clear();
+                    k += 1;
+                }
+                HunkLine::Del(_) => {
+                    let e = orig[k].1;
+                    if !e.is_empty() {
+                        freed.push_back(e);
+                        near_eol = e;
+                    }
+                    k += 1;
+                }
+                HunkLine::Ins(s) => out.push((s.clone(), freed.pop_front().unwrap_or(near_eol))),
             }
         }
-        cursor = pos + old_block.len();
+        cursor = k;
         no_eol = h.new_no_eol;
     }
     let trailing = cursor < orig.len();
-    out.extend(orig[cursor..].iter().map(|s| s.to_string()));
+    out.extend(orig[cursor..].iter().map(|&(t, e)| (t.to_string(), e)));
 
-    let mut res = out.join("\n");
     // The original's trailing newline wins unless the last hunk rewrote the
     // end of the file and flagged no-newline.
     let ends_nl = if trailing {
@@ -654,13 +674,37 @@ pub fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, String> {
     } else {
         !no_eol && (orig_ends_nl || orig.is_empty())
     };
-    if ends_nl && !res.is_empty() {
-        res.push('\n');
-    }
-    if had_crlf {
-        res = res.replace('\n', "\r\n");
+    let mut res = String::with_capacity(original.len() + 64);
+    let last = out.len().saturating_sub(1);
+    for (i, (t, e)) in out.iter().enumerate() {
+        res.push_str(t);
+        if i < last || ends_nl {
+            // The old last line had no ending; a line now follows it.
+            res.push_str(if e.is_empty() { near_eol } else { e });
+        }
     }
     Ok(res)
+}
+
+/// One `split_inclusive('\n')` piece as (text, ending).
+fn split_eol(line: &str) -> (&str, &str) {
+    if let Some(t) = line.strip_suffix("\r\n") {
+        (t, "\r\n")
+    } else if let Some(t) = line.strip_suffix('\n') {
+        (t, "\n")
+    } else {
+        (line, "")
+    }
+}
+
+/// The ending most of `text`'s lines use (`\n` when it has none).
+fn dominant_eol(text: &str) -> &'static str {
+    let crlf = text.matches("\r\n").count();
+    if crlf > text.matches('\n').count() - crlf {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
 /// Find `block` in `orig` at/after `cursor`: exact position first, then scan.
@@ -680,10 +724,11 @@ fn find_block(orig: &[&str], block: &[&str], cursor: usize, ideal: usize) -> Opt
 }
 
 /// Re-terminate `new` content with the original's line endings so a CRLF file
-/// doesn't come back as a whole-file LF rewrite.
+/// doesn't come back as a whole-file LF rewrite (a mixed file: the ending most
+/// of its lines use).
 fn match_line_endings(new: &str, original: &str) -> String {
     let normalized = new.replace("\r\n", "\n");
-    if original.contains("\r\n") {
+    if dominant_eol(original) == "\r\n" {
         normalized.replace('\n', "\r\n")
     } else {
         normalized
@@ -823,8 +868,25 @@ pub fn build_preview(
                 // A body carrying `\r`s is byte-authoritative (round-tripped
                 // source content); an ending-agnostic body adapts to the
                 // target file's endings.
-                ChangeBody::Full(c) if c.contains('\r') => Ok((c.clone(), disk)),
-                ChangeBody::Full(c) => Ok((match_line_endings(c, &disk.content), disk)),
+                ChangeBody::Full(c) => {
+                    let mut body = if c.contains('\r') {
+                        c.clone()
+                    } else {
+                        match_line_endings(c, &disk.content)
+                    };
+                    // A fence cannot say "no newline at the end" (the parser
+                    // ends every body with one), so a file without a final
+                    // newline keeps that state: a pasted snapshot is a no-op.
+                    if disk.exists && !disk.content.is_empty() && !disk.content.ends_with('\n') {
+                        let cut = body
+                            .strip_suffix("\r\n")
+                            .or_else(|| body.strip_suffix('\n'));
+                        if let Some(cut) = cut {
+                            body.truncate(cut.len());
+                        }
+                    }
+                    Ok((body, disk))
+                }
                 ChangeBody::Diff(hunks) => {
                     apply_hunks(&base_content, hunks).map(|next| (next, disk))
                 }
@@ -1556,6 +1618,42 @@ mod tests {
         }];
         assert_eq!(apply_hunks(original, &hunks).unwrap(), "A\r\nb\r\n");
         assert_eq!(match_line_endings("x\ny\n", "p\r\nq\r\n"), "x\r\ny\r\n");
+    }
+
+    #[test]
+    fn mixed_endings_keep_each_lines_own_terminator() {
+        // S8 1.2 (DeepSeek B3.1): a one-line diff on a mixed-ending file
+        // changed only that line, not every ending to CRLF.
+        let hunk = |lines| Hunk {
+            old_start: 2,
+            new_start: 2,
+            lines,
+            new_no_eol: false,
+        };
+        let change_b = hunk(vec![HunkLine::Del("b".into()), HunkLine::Ins("B".into())]);
+        assert_eq!(
+            apply_hunks("a\nb\r\nc\n", &[change_b]).unwrap(),
+            "a\nB\r\nc\n"
+        );
+        // An added line takes the ending of the line before it; context is
+        // the file's own text (the reply lost its trailing space).
+        let add = hunk(vec![
+            HunkLine::Ctx("b".into()),
+            HunkLine::Ins("new".into()),
+            HunkLine::Ctx("c".into()),
+        ]);
+        assert_eq!(
+            apply_hunks("a\nb \r\nc\n", &[add]).unwrap(),
+            "a\nb \r\nnew\r\nc\n"
+        );
+        // A line added after a last line without an ending gives it one.
+        let append = Hunk {
+            old_start: 1,
+            new_start: 1,
+            lines: vec![HunkLine::Ctx("x".into()), HunkLine::Ins("y".into())],
+            new_no_eol: true,
+        };
+        assert_eq!(apply_hunks("x", &[append]).unwrap(), "x\ny");
     }
 
     #[test]

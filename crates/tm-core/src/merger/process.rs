@@ -2,6 +2,7 @@
 
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::LazyLock;
@@ -75,41 +76,65 @@ pub(super) fn process_file(
         return streamed();
     }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let result = if super::stream::container_of(name) == Some(super::stream::Container::Gzip) {
-        // Small gzip (`changelog.gz`, `notes.txt.gz`): inflate inline, with a
-        // hard limit — the trailer's size is only a hint, so a file that
-        // inflates past it after all goes to the streaming path.
-        let relative = relative_display(root, path);
-        match inflate_limited(path, super::stream::GZIP_INLINE_MAX) {
-            Ok(Some(bytes)) => {
-                let lang_from = relative
-                    .strip_suffix(".gz")
-                    .or_else(|| relative.strip_suffix(".GZ"))
-                    .unwrap_or(&relative)
-                    .to_string();
-                process_bytes(
-                    relative,
-                    &lang_from,
-                    bytes,
-                    Some("inflated from gzip"),
-                    cfg,
-                    &mut harvested,
-                    &mut dense,
-                )
-            }
-            Ok(None) => return streamed(),
-            Err(e) => Err((relative, e, SkipKind::NotCaptured)),
+    // A parser that panics on a malformed file (pdf_oxide, calamine, a
+    // tree-sitter grammar …) costs that file only: the release profile
+    // unwinds (ADR 0018), so the panic stops here instead of aborting the
+    // whole merge with no output.
+    let attempt = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(debug_assertions)]
+        if std::env::var("TM_TEST_PANIC_FILE").is_ok_and(|n| n == name) {
+            panic!("TM_TEST_PANIC_FILE hook");
         }
-    } else {
-        let mut ctx = Inner {
-            cfg,
-            harvested: &mut harvested,
-            dense: &mut dense,
-            cancel,
-            ocr,
-            wait: &mut wait,
-        };
-        process_file_inner(path, root, &mut ctx)
+        if super::stream::container_of(name) == Some(super::stream::Container::Gzip) {
+            // Small gzip (`changelog.gz`, `notes.txt.gz`): inflate inline, with a
+            // hard limit — the trailer's size is only a hint, so a file that
+            // inflates past it after all goes to the streaming path.
+            let relative = relative_display(root, path);
+            match inflate_limited(path, super::stream::GZIP_INLINE_MAX) {
+                Ok(Some(bytes)) => {
+                    let lang_from = relative
+                        .strip_suffix(".gz")
+                        .or_else(|| relative.strip_suffix(".GZ"))
+                        .unwrap_or(&relative)
+                        .to_string();
+                    Some(process_bytes(
+                        relative,
+                        &lang_from,
+                        bytes,
+                        Some("inflated from gzip"),
+                        cfg,
+                        &mut harvested,
+                        &mut dense,
+                    ))
+                }
+                Ok(None) => None,
+                Err(e) => Some(Err((relative, e, SkipKind::NotCaptured))),
+            }
+        } else {
+            let mut ctx = Inner {
+                cfg,
+                harvested: &mut harvested,
+                dense: &mut dense,
+                cancel,
+                ocr,
+                wait: &mut wait,
+            };
+            Some(process_file_inner(path, root, &mut ctx))
+        }
+    }));
+    let result = match attempt {
+        Ok(Some(result)) => result,
+        Ok(None) => return streamed(),
+        Err(panic) => {
+            harvested.clear();
+            dense.clear();
+            wait = None;
+            Err((
+                relative_display(root, path),
+                format!("the parser crashed on this file ({})", panic_text(&*panic)),
+                SkipKind::NotCaptured,
+            ))
+        }
     };
     Processed {
         result,
@@ -118,6 +143,16 @@ pub(super) fn process_file(
         stream: false,
         wait,
     }
+}
+
+/// The first line of a panic's message, for the report (at most 160 chars).
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
+    let msg = panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".into());
+    msg.lines().next().unwrap_or("").chars().take(160).collect()
 }
 
 /// What one file's processing reads and fills in.

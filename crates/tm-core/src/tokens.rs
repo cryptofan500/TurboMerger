@@ -46,17 +46,43 @@ fn safe_cut(text: &str, near: usize) -> Option<usize> {
     None
 }
 
+/// Where a newline-free stretch may be cut with the same guarantee: just
+/// after an ASCII letter or digit that is followed by an ASCII character that
+/// is neither (nor `'`, which can start a contraction such as `'s`). Every
+/// o200k pre-token holding that letter or digit ends there: letter runs,
+/// digit runs and their contractions cannot take a space or punctuation.
+fn word_cut(text: &str, near: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    (1..near.min(bytes.len())).rev().find(|&i| {
+        let (a, b) = (bytes[i - 1], bytes[i]);
+        a.is_ascii_alphanumeric() && b.is_ascii() && !b.is_ascii_alphanumeric() && b != b'\''
+    })
+}
+
+/// Text held before counting when it has no cut point at all (one 200 MB
+/// word): past this it is cut anyway, which can split one pre-token — the
+/// count may then be off by a token per cut.
+const FORCED_CUT: usize = 16 << 20;
+
 /// Exact o200k count of a file's UTF-8 text without holding all of it:
-/// read in pieces of about 4 MiB, cut at `safe_cut` points.
+/// read in pieces of about 4 MiB, cut at `safe_cut` points (`word_cut` in a
+/// long line), so memory stays near [`FORCED_CUT`] for any file.
 pub fn count_file(path: &Path) -> io::Result<usize> {
     count_reader(std::fs::File::open(path)?, 4 << 20)
 }
 
-fn count_reader(mut reader: impl Read, chunk: usize) -> io::Result<usize> {
+fn count_reader(reader: impl Read, chunk: usize) -> io::Result<usize> {
+    count_bounded(reader, chunk, FORCED_CUT.max(chunk)).map(|(n, _)| n)
+}
+
+/// `count_reader` with the cut limit as a parameter; also returns the most
+/// text it held at once (tests check the bound).
+fn count_bounded(mut reader: impl Read, chunk: usize, cap: usize) -> io::Result<(usize, usize)> {
     let mut pending = String::new();
     let mut raw = vec![0u8; chunk];
     let mut carry: Vec<u8> = Vec::new();
     let mut total = 0usize;
+    let mut peak = 0usize;
     loop {
         let n = reader.read(&mut raw)?;
         if n == 0 {
@@ -71,8 +97,17 @@ fn count_reader(mut reader: impl Read, chunk: usize) -> io::Result<usize> {
         };
         pending.push_str(std::str::from_utf8(&carry[..valid]).expect("validated"));
         carry.drain(..valid);
+        peak = peak.max(pending.len());
         if pending.len() >= chunk {
-            if let Some(cut) = safe_cut(&pending, pending.len() - 1) {
+            let end = pending.len() - 1;
+            let mut cut = safe_cut(&pending, end);
+            if cut.is_none() && pending.len() >= cap {
+                cut = word_cut(&pending, end).or_else(|| {
+                    // No boundary at all: cut at a character boundary.
+                    (1..=end).rev().find(|&i| pending.is_char_boundary(i))
+                });
+            }
+            if let Some(cut) = cut {
                 total += count(&pending[..cut]);
                 pending.drain(..cut);
             }
@@ -84,7 +119,7 @@ fn count_reader(mut reader: impl Read, chunk: usize) -> io::Result<usize> {
             "text ends inside a UTF-8 sequence",
         ));
     }
-    Ok(total + count(&pending))
+    Ok((total + count(&pending), peak))
 }
 
 #[cfg(test)]
@@ -129,6 +164,24 @@ mod tests {
         // A chat UI does not parse `<|endoftext|>` in pasted text as one
         // special token; neither do we.
         assert!(count("<|endoftext|>") > 1);
+    }
+
+    #[test]
+    fn long_lines_are_cut_with_bounded_memory() {
+        // S8 1.5 (DeepSeek B3.7): a file without newlines was held whole.
+        let prose: String = (0..3000).map(|i| format!("word{i} ünï, {{x}} ")).collect();
+        let b64: String = (0..3000).map(|i| format!("QUJD{i}+/x=")).collect();
+        for text in [&prose, &b64] {
+            let whole = count(text);
+            let (n, peak) = count_bounded(text.as_bytes(), 256, 2048).unwrap();
+            assert_eq!(n, whole, "word cuts keep the count exact");
+            assert!(peak <= 2048 + 256 + 4, "held {peak} bytes");
+        }
+        // No boundary at all: still bounded, the count off by a few tokens.
+        let blob = "a".repeat(6000);
+        let (n, peak) = count_bounded(blob.as_bytes(), 256, 1024).unwrap();
+        assert!(peak <= 1024 + 256 + 4, "held {peak} bytes");
+        assert!(n.abs_diff(count(&blob)) <= 12, "{n} vs {}", count(&blob));
     }
 
     #[test]

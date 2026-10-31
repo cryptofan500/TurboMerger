@@ -8,6 +8,22 @@ Stops the silent content loss, corruption and write-anywhere paths found in the
 2026-09-24 audit (`TURBOMERGER_refactor_september24_2026_v2.md`, findings N-xx).
 Every fix ships with its repro turned into a test (96 → 156 Rust tests).
 
+### Correctness fixes (2026-10-31, session 8)
+
+- A parser crash on one malformed file no longer aborts the whole merge: release builds
+  unwind and every file is processed under a panic guard; the file is reported as not
+  captured (ADR 0018 addendum). Found by fuzzing: 2 of 120 corrupted PDFs aborted 7.x.
+- `apply`: a diff keeps each line's own ending (a mixed LF/CRLF file is no longer turned
+  all-CRLF), and context lines keep the file's own text.
+- Pasting a merged snapshot back is a no-op for files without a final newline.
+- `--complete`: a file is `kind: text` only when its block rebuilds it byte for byte
+  (slimming flags, slices and redaction make it `binary`, embedded with
+  `--embed-binary`); the archive pass holds one source file at a time.
+- `--redact`: documents about secrets in `docs/`/ADR folders are no longer excluded by
+  name (the content check still excludes a real dump); code on the right of a label
+  (`tokens = outcome.tokens_o200k`, `let secret = path.join(..)`, `a::b`) is not a secret.
+- Token counting of a part with very long lines holds at most ~16 MiB of text.
+
 ### All text, every file (branch `feature/large-input-doc-extraction`, 2026-10-19/20)
 
 Added:

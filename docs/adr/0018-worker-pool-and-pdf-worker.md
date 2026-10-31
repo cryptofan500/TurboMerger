@@ -32,3 +32,18 @@
   identical output, so the next step is every PDF in a reusable worker pool, for crash
   isolation under `panic = "abort"` (Phase 3 part 2, maintainer's decision ❓ g).
   Files over 64 MiB still parse one at a time (Phase 9: a bounded in-flight window).
+
+## Addendum S8 (2026-10-31): the release profile unwinds
+
+- **Finding:** a byte-corruption fuzz of one arXiv PDF (120 variants, release build)
+  aborted the merge twice (`pdf_oxide` 0.3.78: `document.rs:25363` char boundary,
+  `document.rs:6540` subtract overflow; exit 134, no output at all). Truncation alone
+  (5–99 %) never crashed it.
+- **Decision:** `panic = "unwind"` in `[profile.release]`, plus a per-file
+  `catch_unwind` in `merger/process.rs` around every file's processing, so a panic in
+  any parser (PDF, workbook, Office XML, tree-sitter) costs that file only: it is "not
+  captured" with the reason and the run finishes (exit 3). The PDF-only `catch_unwind`
+  in `extract::pdf_parse` now works in release too. Out-of-memory and stack overflow
+  still need the worker (> 256 MiB PDFs keep it); a reusable worker pool for every PDF
+  stays open (❓ g).
+- **Cost:** binary size before/after is in the S8 handoff (low-memory dev profile).

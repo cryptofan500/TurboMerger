@@ -133,3 +133,31 @@ fn credential_dump_values_are_masked_only_as_whole_tokens() {
         "{text}"
     );
 }
+
+#[test]
+fn documents_about_secrets_merge_but_dumps_in_docs_do_not() {
+    // S8 1.4 (DeepSeek B3.4): the file-name rule dropped an ADR about secret
+    // masking. Under docs/ the name no longer decides; the content does.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(root.join("docs/adr")).unwrap();
+    fs::write(
+        root.join("docs/adr/0013-phase1-secret-masking.md"),
+        "# ADR 0013: secret masking\n\nWe mask secrets before a merge leaves the machine.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("docs/SSM_CREDENTIALS_2026.md"),
+        "# account notes\npassword: Vr7wKp2walKotwica91\nzbig77@wp-post.org:Tr4mwaj9Nocny88\nRENDER key svcKey-Zx9Kq2Mv7Rt4Lp8Wb\n",
+    )
+    .unwrap();
+    let text = merge_to_string(&root, &tmp.path().join("docs.md"));
+    assert!(
+        text.contains("## docs/adr/0013-phase1-secret-masking.md"),
+        "the ADR must be merged: {text}"
+    );
+    assert!(
+        text.contains("`docs/SSM_CREDENTIALS_2026.md` — credential-dense"),
+        "a dump inside docs/ is still excluded by its content: {text}"
+    );
+}

@@ -90,7 +90,11 @@ cfb = "0.7.3"
 
 # Profiles are only honoured at the workspace root.
 [profile.release]
-panic = "abort"
+# "unwind", not "abort": a parser panic on one malformed file must cost that
+# file, not the whole run (ADR 0018, S8: 2 of 120 corrupted PDFs aborted a
+# release merge with no output; the per-file guard in merger/process.rs
+# needs unwinding to catch them).
+panic = "unwind"
 codegen-units = 1
 lto = true
 # 3, not "z": 25-30 % faster merges for +8 % binary size (ADR 0016, N-39).
