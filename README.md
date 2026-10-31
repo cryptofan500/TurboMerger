@@ -351,6 +351,19 @@ prototypes/                  reference oracles for the document and photo pipeli
 docs/adr/                    architecture decision records
 ```
 
+## Exact selections, spreadsheets and archive twins
+
+| Flag / command | What it does |
+|---|---|
+| `merge SRC OUT --selection PLAN.tmsel.toml` | Merge exactly the files (and parts of files) the plan lists; never walks `SRC` ([ADR 0020](docs/adr/0020-selection-plans-and-slices.md)). A missing file or a selector that matches nothing is "not captured" (exit 3). |
+| `--files-from LIST` (`-` = stdin, `-0` = NUL) | The same with a plain path list. |
+| `--list-only`, `--emit-selection FILE` | Show / save what would be merged, as a plan you can edit. |
+| `--budget-tokens N` | Exit 5 if the output would be over N tokens. |
+| `outline FILE` | Headings of a Markdown file, sheets of a workbook — to write selectors. |
+| `--complete --embed-binary MB` | Archive twin: a manifest plus files that cannot be rebuilt from their text embedded as base64; `scripts/e2e/tm_verify.py restore` rebuilds every file byte for byte. |
+
+Workbooks and selected CSV/TSV are written as TM-GRID/1 blocks ([ADR 0021](docs/adr/0021-tm-grid-spreadsheet-text.md)). In the desktop app, **Load plan…** and **Save as plan…** do the same as `--selection` and `--emit-selection`. Check any bundle with `python3 -P scripts/e2e/tm_verify.py all --merged M.md --json M.json --src-root SRC --selection PLAN --work EMPTY_DIR`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
