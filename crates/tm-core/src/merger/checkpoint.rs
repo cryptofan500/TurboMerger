@@ -50,7 +50,7 @@ const TAG_TEXT: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
 # TurboMerger checkpoint (merge --checkpoint / --resume); removed when the merge is written.\n\
 # Cache directory tag: https://bford.info/cachedir/\n";
 /// Journal format: another one is refused, never guessed at.
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 /// Journal lines are written at least this often (and before each streamed
 /// file, at the end of the text stage, and on Ctrl-C).
 const FLUSH_EVERY: Duration = Duration::from_secs(2);
@@ -135,6 +135,10 @@ struct JBlock {
     note: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     compressed: bool,
+    /// Archive members and continuation segments (stream.rs): output that
+    /// is not a file of the tree.
+    #[serde(default, skip_serializing_if = "is_false")]
+    synthetic: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -170,9 +174,10 @@ fn kind_from(s: &str) -> SkipKind {
 
 impl Entry {
     /// A file's journal entry: its blocks (a file, or the segments of a
-    /// streamed one) and/or the reason it was skipped. `None` when a block
-    /// cannot come back from the journal alone (redactions, pieces, git
-    /// sections — none occur in the text stage of a checkpointed merge).
+    /// streamed one: its segments and archive members, flagged synthetic)
+    /// and/or the reason it was skipped. `None` when a block cannot come
+    /// back from the journal alone (redactions, pieces — neither occurs in
+    /// the text stage of a checkpointed merge).
     pub(super) fn new(
         path: String,
         stamp: Stamp,
@@ -182,7 +187,7 @@ impl Entry {
     ) -> io::Result<Option<Entry>> {
         let mut out = Vec::with_capacity(blocks.len());
         for b in blocks {
-            if !b.redactions.is_empty() || b.synthetic || b.piece.is_some() {
+            if !b.redactions.is_empty() || b.piece.is_some() {
                 return Ok(None);
             }
             out.push(JBlock {
@@ -194,6 +199,7 @@ impl Entry {
                 tokens: b.tokens,
                 note: b.utf8_note.clone(),
                 compressed: b.compressed,
+                synthetic: b.synthetic,
             });
         }
         Ok(Some(Entry {
@@ -225,7 +231,7 @@ impl Entry {
                 utf8_note: b.note,
                 redactions: Vec::new(),
                 compressed: b.compressed,
-                synthetic: false,
+                synthetic: b.synthetic,
                 piece: None,
             })
             .collect();
@@ -527,6 +533,13 @@ mod tests {
             ("a.rs", 5, 3)
         );
         assert_eq!((b.lang.as_str(), b.tokens, b.compressed), ("rust", 7, true));
+        assert!(!b.synthetic);
+        let mut member = block("p.zip!/m.txt", 0, 5);
+        member.synthetic = true;
+        let e = Entry::new("p.zip".into(), stamp, &[member], None, &spool)
+            .unwrap()
+            .expect("archive members are journaled");
+        assert!(e.restore().0[0].synthetic, "and come back as members");
         assert_eq!(b.utf8_note.as_deref(), Some("decoded from windows-1252"));
         let s = skip.unwrap();
         assert_eq!((s.path.as_str(), s.kind), ("a.bin", SkipKind::Binary));
