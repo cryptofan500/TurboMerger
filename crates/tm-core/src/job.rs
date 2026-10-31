@@ -331,6 +331,7 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         grid_chunk_rows: options.grid_chunk_rows.unwrap_or(150),
         complete: options.complete,
         embed_binary: options.embed_binary,
+        archive_also: Vec::new(),
         budget_tokens: options.budget_tokens,
     };
 
@@ -612,6 +613,28 @@ pub fn run_merge(
     );
     if files.is_empty() && skipped.is_empty() {
         return Err(JobError::Empty);
+    }
+    // A complete plan keeps every file it names (HANDOFF_S8 §6.11 B.3): one
+    // the scanner leaves out (binary, a photo without OCR, an archive format
+    // TurboMerger cannot open) still goes into the archive twin. Only regular
+    // files inside the root qualify; the scan's report entry stays as it is.
+    let explicit = options
+        .selection
+        .as_ref()
+        .is_some_and(|p| p.mode == crate::selection::SelectionMode::Explicit);
+    if job.merge_config.complete && explicit {
+        let inside = dunce::canonicalize(&job.root).unwrap_or_else(|_| job.root.clone());
+        job.merge_config.archive_also = skipped
+            .iter()
+            .filter_map(|s| crate::selection::normalize_rel(&s.path).ok())
+            .map(|rel| {
+                job.root
+                    .join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))
+            })
+            .filter(|p| {
+                p.is_file() && dunce::canonicalize(p).is_ok_and(|real| real.starts_with(&inside))
+            })
+            .collect();
     }
 
     let watch = crate::merger::MergeWatch::default();

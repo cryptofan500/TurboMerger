@@ -170,8 +170,14 @@ pub struct MergeConfig {
     pub grid_chunk_rows: usize,
     /// Archive twin mode: appends manifest block for offline restoration.
     pub complete: bool,
-    /// Embed binary files as base64 up to N MB in archive mode.
+    /// Archive mode: embed only files up to N MB; a larger file is withheld,
+    /// named in the Merge Report and counted in `archive_gaps`. `None` = no
+    /// cap (every file its text block cannot rebuild is embedded).
     pub embed_binary: Option<u64>,
+    /// Archive mode: files a complete plan names that the scanner did not
+    /// hand to the merge (binary, a photo without OCR, an archive format it
+    /// cannot open). Not merged as text; the archive twin keeps their bytes.
+    pub archive_also: Vec<PathBuf>,
     /// Token budget ceiling: fail gate if exceeded.
     pub budget_tokens: Option<u64>,
 }
@@ -202,6 +208,7 @@ impl Default for MergeConfig {
             grid_chunk_rows: 150,
             complete: false,
             embed_binary: None,
+            archive_also: Vec::new(),
             budget_tokens: None,
         }
     }
@@ -229,6 +236,10 @@ pub struct MergeOutcome {
     /// Figure crops kept beside the output (`keep_figures`), and where.
     pub figures_kept: usize,
     pub figures_dir: Option<PathBuf>,
+    /// `--complete`: source files the archive twin cannot restore byte for
+    /// byte, with the reason (withheld under redaction or over the embed cap,
+    /// unreadable, not processed).
+    pub archive_gaps: Vec<(String, String)>,
 }
 
 /// Where kept figures go: `<output stem>_assets/` beside the output file.
@@ -339,6 +350,9 @@ where
     let cancel_flag = ctl.cancel;
     let finishing = || ctl.finish.is_some_and(|f| f.load(AtomicOrd::Relaxed));
     let total_files = files.len();
+    if cfg.complete && cfg.format != OutputFormat::Markdown {
+        anyhow::bail!("the archive twin (--complete) is written in the markdown format only");
+    }
 
     // Order files (a stable copy so the caller's slice is untouched).
     let mut ordered: Vec<&PathBuf> = files.iter().collect();
@@ -427,6 +441,7 @@ where
     };
     let mut done = 0usize;
     let mut partial = false;
+    let mut unprocessed = vec![false; total_files];
     progress_callback(0, total_files, "");
     let ended = pipeline::ordered(
         total_files,
@@ -451,6 +466,7 @@ where
                 Next::Skipped(i) => {
                     // Finishing early: what is left is reported, never dropped.
                     partial = true;
+                    unprocessed[i] = true;
                     done += 1;
                     let rel = relative_display(root, ordered[i]);
                     progress_callback(done, total_files, &rel);
@@ -665,6 +681,33 @@ where
     }
     outcome.skipped = merge_skips.clone();
 
+    // Archive twin (`--complete`): every source file is read once before
+    // anything is written, so the report and the exit code can name each one
+    // that cannot come back byte for byte.
+    let archive = if cfg.complete {
+        let rel = |p: &Path| {
+            let r = relative_display(root, p);
+            if cfg.reproducible {
+                nfc(&r)
+            } else {
+                r
+            }
+        };
+        let sources: Vec<(PathBuf, String, bool)> = ordered
+            .iter()
+            .enumerate()
+            .map(|(i, p)| ((*p).clone(), rel(p), !unprocessed[i]))
+            .chain(cfg.archive_also.iter().map(|p| (p.clone(), rel(p), true)))
+            .collect();
+        render::archive_plan(&sources, &blocks, &spool, cfg, cancel_flag)?
+    } else {
+        Vec::new()
+    };
+    outcome.archive_gaps = archive
+        .iter()
+        .filter_map(|e| e.gap().map(|why| (e.relative.clone(), why)))
+        .collect();
+
     let all_skips: Vec<&SkipEntry> = scan_skips.iter().chain(merge_skips.iter()).collect();
     let all_blocks: Vec<&Block> = blocks.iter().collect();
     let folder = render::display_path(
@@ -700,6 +743,7 @@ where
         outcome: &outcome,
         skips: &all_skips,
         spool: Some(&spool),
+        archive: &archive,
     };
 
     // Partition into parts by token budget, counting every token each part
@@ -768,6 +812,18 @@ where
     drop(ctx);
     outcome.outputs = outputs;
     outcome.notes = notes;
+    if !outcome.archive_gaps.is_empty() {
+        outcome.notes.push(format!(
+            "archive twin: {} of {} source files cannot be restored byte for byte (named under \"Archive twin\" in the Merge Report)",
+            outcome.archive_gaps.len(),
+            archive.len()
+        ));
+    }
+    if cfg.complete && n_parts > 1 {
+        outcome.notes.push(
+            "archive twin: each part carries the manifest and embedded bytes of its own files; --max-tokens does not count them".into(),
+        );
+    }
     if let (true, Some(dir)) = (outcome.figures_kept > 0, &outcome.figures_dir) {
         outcome.notes.push(format!(
             "{} figures kept in {}",

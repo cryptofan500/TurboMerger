@@ -500,3 +500,82 @@ fn metatrader_and_editor_formats_merge_by_extension_audio_video_never() {
         assert_eq!(s["reason"], "binary extension", "{name}");
     }
 }
+
+#[test]
+fn complete_plans_keep_every_named_file_and_name_what_cannot_come_back() {
+    // HANDOFF_S8 §6.10–6.11 (S9): the archive twin holds every file a plan
+    // names (a picture the scanner skips included), never embeds bytes under
+    // --redact, and exits 3 naming each file it cannot restore.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), "plain text\n").unwrap();
+    let png: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR not a real picture";
+    fs::write(src.join("pic.png"), png).unwrap();
+    fs::write(src.join("notes.md"), "password: Vr7wKp2walKotwica91\n").unwrap();
+    let plan = tmp.path().join("plan.toml");
+    fs::write(
+        &plan,
+        "version = 1\nmode = \"explicit\"\ncomplete = true\n[[file]]\npath = \"a.txt\"\n[[file]]\npath = \"pic.png\"\n[[file]]\npath = \"notes.md\"\n",
+    )
+    .unwrap();
+    let stderr = |o: &Output| String::from_utf8_lossy(&o.stderr).into_owned();
+    let run = |name: &str, extra: &[&str]| {
+        let out = tmp.path().join(name);
+        let mut args = vec![
+            "merge",
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--selection",
+            plan.to_str().unwrap(),
+            "--yes",
+            "-q",
+        ];
+        args.extend_from_slice(extra);
+        let o = tm(&args, tmp.path());
+        (o, fs::read_to_string(&out).unwrap_or_default())
+    };
+
+    let (o, text) = run("whole.md", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(text.contains("## __binary__: pic.png"), "{text}");
+    let pic = text
+        .lines()
+        .find(|l| l.starts_with('{') && l.contains("\"path\":\"pic.png\""))
+        .unwrap_or_else(|| panic!("pic.png not in the manifest:\n{text}"));
+    assert!(
+        pic.contains("\"kind\":\"binary\"") && pic.contains(&format!("\"bytes\":{}", png.len())),
+        "{pic}"
+    );
+
+    let (o, text) = run("redacted.md", &["--redact"]);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    for name in ["pic.png", "notes.md"] {
+        assert!(
+            stderr(&o).contains(&format!("not restorable: {name}")),
+            "{}",
+            stderr(&o)
+        );
+    }
+    assert!(
+        !text.contains("## __binary__:"),
+        "bytes embedded under --redact:\n{text}"
+    );
+    assert!(!text.contains("Vr7wKp2walKotwica91"));
+
+    let (o, _) = run("capped.md", &["--embed-binary", "0"]);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("not restorable: pic.png"),
+        "{}",
+        stderr(&o)
+    );
+
+    let (o, _) = run("twin.json", &["--format", "json"]);
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "the twin is Markdown only: {}",
+        stderr(&o)
+    );
+}

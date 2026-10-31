@@ -21,3 +21,25 @@
 - **Consequences:** a bundle is rebuilt from its plan, never edited by hand; the
   independent verifier (`scripts/e2e/tm_verify.py slices`) re-cuts every slice in Python
   and compares bytes. Plans name personal files, so they live with the bundles, not in the repo.
+
+## Addendum (2026-10-31, session 9): the archive twin (`--complete`)
+
+- **Contract.** With redaction off, every source file of a `--complete` merge comes back
+  byte for byte from the Markdown output alone: its text block rebuilds it (`kind: "text"`,
+  checked by size and SHA-256 of the rebuilt text) or its bytes are embedded (`kind:
+  "binary"`, a `## __binary__:` block). A file that cannot come back is named in the
+  manifest (`kind: "withheld"` or `"missing"`, with `reason`), in the Merge Report
+  ("Archive twin") and on stderr, and the CLI exits 3.
+- **Which files.** Every file the merge was given, plus, in an explicit plan, every named
+  file the scanner leaves out (a picture, a photo without OCR, an archive format TurboMerger
+  cannot open). Continuation segments and archive members are output, not files, and get no
+  manifest line.
+- **Redaction.** With `--redact`, no source bytes are embedded: bytes the redactor never
+  read (other sheets, metadata, a block that was redacted) must not ride along with a
+  redacted text. A shareable redacted output and a byte-exact private archive are two
+  different files.
+- **Cap.** None by default; `--embed-binary MB` withholds (and names) a larger file.
+- **Reads.** Pass 1 reads each file once, streamed (size, SHA-256, line ends, BOM, UTF-8),
+  before anything is written; pass 2 streams the base64 and hashes again, and a file that
+  changed in between fails the merge. An unreadable file is `missing`, never an empty file.
+- **Format.** Markdown only; `--complete` with another format is a usage error (exit 2).

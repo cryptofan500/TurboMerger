@@ -2,13 +2,14 @@
 //! headers, tree, contents and report come from block metadata, and each
 //! block's text is read from the spool only while it is being written.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrd};
 
 use anyhow::Result;
 
 use super::spool::Spool;
-use super::{Block, MergeConfig, MergeOutcome, OutputFormat};
+use super::{Block, Cancelled, MergeConfig, MergeOutcome, OutputFormat};
 use crate::scanner::{SkipEntry, SkipKind};
 use crate::tokens;
 use sha2::Digest;
@@ -36,6 +37,8 @@ pub(super) struct RenderCtx<'a> {
     pub(super) skips: &'a [&'a SkipEntry],
     /// Block texts. `None` only while measuring empty parts.
     pub(super) spool: Option<&'a Spool>,
+    /// Source files of a `--complete` merge (empty otherwise).
+    pub(super) archive: &'a [ArchiveEntry],
 }
 
 impl RenderCtx<'_> {
@@ -104,6 +107,7 @@ pub(super) fn partition(ctx: &RenderCtx, max_tokens: Option<usize>) -> Vec<Vec<u
         outcome: ctx.outcome,
         skips: ctx.skips,
         spool: None,
+        archive: ctx.archive,
     };
     let single = render_to_string(&probe, &[])
         .map(|s| tokens::count(&s))
@@ -316,54 +320,7 @@ fn write_markdown<W: Write>(w: &mut W, ctx: &RenderCtx, blocks: &[&Block]) -> Re
     }
 
     if ctx.cfg.complete {
-        // Archive twin (ADR 0020): one JSON line per file so a rebuild can be
-        // byte-identical. A text file rebuilds from its block (`eol` and
-        // `final_newline` undo what the Markdown fence changes); a file its
-        // block does not give back byte for byte (workbooks, PDFs, a BOM,
-        // non-UTF-8, mixed line ends, a slice, text changed by a slimming
-        // flag or by redaction) is `binary` and is embedded as base64 when
-        // `--embed-binary` allows its size. One source file is held at a
-        // time; embedded files are read again in the second pass.
-        let max_embed = ctx.cfg.embed_binary.map(|mb| mb * 1024 * 1024);
-        let mut embed: Vec<&Block> = Vec::new();
-        writeln!(w, "## __manifest__\n\n```jsonlines")?;
-        for b in blocks {
-            let data = std::fs::read(ctx.root.join(&b.relative)).unwrap_or_default();
-            let f = ArchiveFacts::of(&ctx.content(b)?, &data);
-            if !f.text_ok && max_embed.is_some_and(|cap| data.len() as u64 <= cap) {
-                embed.push(b);
-            }
-            let line = serde_json::json!({
-                "path": b.relative,
-                "bytes": data.len(),
-                "sha256": format!("{:x}", sha2::Sha256::digest(data)),
-                "kind": if f.text_ok { "text" } else { "binary" },
-                "lang": b.lang,
-                "eol": f.eol,
-                "final_newline": f.final_newline,
-                "bom": f.bom,
-                "utf8": f.utf8,
-                "mode": file_mode(&ctx.root.join(&b.relative)),
-            });
-            writeln!(w, "{}", line)?;
-        }
-        writeln!(w, "```\n")?;
-        for b in embed {
-            let data = std::fs::read(ctx.root.join(&b.relative)).unwrap_or_default();
-            // 76-character lines (RFC 2045) keep the twin easy to diff.
-            let b64 = crate::remote::base64(&data);
-            let wrapped: Vec<&str> = b64
-                .as_bytes()
-                .chunks(76)
-                .map(|c| std::str::from_utf8(c).unwrap_or(""))
-                .collect();
-            writeln!(
-                w,
-                "## __binary__: {}\n\n```base64\n{}\n```\n",
-                b.relative,
-                wrapped.join("\n")
-            )?;
-        }
+        write_archive(w, ctx)?;
     }
     Ok(())
 }
@@ -448,6 +405,40 @@ fn write_markdown_report<W: Write>(w: &mut W, ctx: &RenderCtx) -> Result<()> {
         for (rel, note) in &notes {
             writeln!(w, "- `{}` — {}", display_path(rel), note)?;
         }
+    }
+    if ctx.cfg.complete {
+        write_archive_report(w, ctx)?;
+    }
+    Ok(())
+}
+
+/// The archive twin's part of the Merge Report: how every source file comes
+/// back, and each one that cannot, with the reason.
+fn write_archive_report<W: Write>(w: &mut W, ctx: &RenderCtx) -> Result<()> {
+    let (mut text, mut embedded) = (0usize, 0usize);
+    let mut gaps: Vec<(&str, String)> = Vec::new();
+    for e in ctx.archive {
+        match (&e.facts, e.gap()) {
+            (Ok((_, Restore::Text)), _) => text += 1,
+            (Ok((_, Restore::Embedded)), _) => embedded += 1,
+            (_, Some(why)) => gaps.push((e.relative.as_str(), why)),
+            _ => {}
+        }
+    }
+    writeln!(w, "\n### Archive twin\n")?;
+    writeln!(
+        w,
+        "- {} source files: {} rebuild from their text block, {} embedded as bytes, {} cannot be restored byte for byte",
+        ctx.archive.len(),
+        text,
+        embedded,
+        gaps.len()
+    )?;
+    for (rel, why) in gaps.iter().take(MANIFEST_MAX) {
+        writeln!(w, "- `{}` — **not restorable:** {}", display_path(rel), why)?;
+    }
+    if gaps.len() > MANIFEST_MAX {
+        writeln!(w, "- …and {} more", gaps.len() - MANIFEST_MAX)?;
     }
     Ok(())
 }
@@ -826,48 +817,335 @@ pub(super) fn generate_tree(folder: &str, blocks: &[&Block]) -> String {
     out
 }
 
-/// What an archive rebuild needs to know about one source file.
-struct ArchiveFacts {
+// ------------------------------------------------------------- archive twin
+
+/// What a rebuild needs to know about one source file, from one streamed
+/// read (memory stays bounded whatever the file's size).
+pub(super) struct FileFacts {
+    bytes: u64,
+    sha256: String,
     eol: &'static str,
     final_newline: bool,
     bom: bool,
     utf8: bool,
-    /// The block's text reproduces the file byte for byte.
-    text_ok: bool,
+    mode: u32,
 }
 
-impl ArchiveFacts {
-    /// `content` is the block's text exactly as the fence carries it. The
-    /// rebuild is compared with the file itself, so whatever changed the
-    /// text (a slimming flag, a slice, redaction, a grid, a lossy decode)
-    /// makes the file `binary` without a rule per cause.
-    fn of(content: &str, data: &[u8]) -> Self {
-        let crlf = data.windows(2).filter(|w| w == b"\r\n").count();
-        let lf = data.iter().filter(|&&c| c == b'\n').count();
-        let lone_cr = data.iter().filter(|&&c| c == b'\r').count() - crlf;
-        let eol = match (crlf, lf - crlf, lone_cr) {
-            (0, 0, 0) => "none",
-            (0, _, 0) => "lf",
-            (_, 0, 0) => "crlf",
-            _ => "mixed",
-        };
-        let final_newline = data.last() == Some(&b'\n');
-        let bom = data.starts_with(&[0xEF, 0xBB, 0xBF])
-            || data.starts_with(&[0xFF, 0xFE])
-            || data.starts_with(&[0xFE, 0xFF]);
-        let utf8 = std::str::from_utf8(data).is_ok();
-        let text_ok = utf8
-            && !bom
-            && eol != "mixed"
-            && rebuilt_from_block(content, eol, final_newline).as_bytes() == data;
-        ArchiveFacts {
-            eol,
-            final_newline,
-            bom,
-            utf8,
-            text_ok,
+/// How one source file comes back from the archive twin.
+pub(super) enum Restore {
+    /// Its block rebuilds it byte for byte.
+    Text,
+    /// Its bytes are embedded as base64.
+    Embedded,
+    /// Its bytes are deliberately left out; the text says why.
+    Withheld(String),
+}
+
+/// One source file of a `--complete` merge (ADR 0020). Every file the merge
+/// was given has one, whether or not it produced a text block.
+pub(super) struct ArchiveEntry {
+    /// Where the bytes are read: the file itself, not its display path.
+    path: PathBuf,
+    /// The manifest path: the same text as the file's block header.
+    pub(super) relative: String,
+    /// The file's own block (its first segment), when it has one.
+    block: Option<usize>,
+    lang: String,
+    /// `Err`: the file could not be read (why).
+    facts: std::result::Result<(FileFacts, Restore), String>,
+}
+
+impl ArchiveEntry {
+    /// Why this file cannot be restored byte for byte, when it cannot.
+    pub(super) fn gap(&self) -> Option<String> {
+        match &self.facts {
+            Err(why) | Ok((_, Restore::Withheld(why))) => Some(why.clone()),
+            Ok(_) => None,
         }
     }
+
+    fn manifest_line(&self) -> serde_json::Value {
+        match &self.facts {
+            Ok((f, how)) => {
+                let mut line = serde_json::json!({
+                    "path": self.relative,
+                    "bytes": f.bytes,
+                    "sha256": f.sha256,
+                    "kind": match how {
+                        Restore::Text => "text",
+                        Restore::Embedded => "binary",
+                        Restore::Withheld(_) => "withheld",
+                    },
+                    "lang": self.lang,
+                    "eol": f.eol,
+                    "final_newline": f.final_newline,
+                    "bom": f.bom,
+                    "utf8": f.utf8,
+                    "mode": f.mode,
+                });
+                if let Restore::Withheld(why) = how {
+                    line["reason"] = why.as_str().into();
+                }
+                line
+            }
+            Err(why) => serde_json::json!({
+                "path": self.relative,
+                "bytes": null,
+                "sha256": null,
+                "kind": "missing",
+                "lang": self.lang,
+                "reason": why,
+            }),
+        }
+    }
+}
+
+/// Pass 1 of the archive twin, before anything is written: every source
+/// file (`sources`: real path, display path, processed — in merge order) is
+/// read once, streamed, and how it comes back is decided, so the report and
+/// the exit code can name each file that cannot. A file comes back from its
+/// block only when the rebuilt block has the file's exact size and SHA-256.
+/// Otherwise its bytes are embedded — unless redaction is on (bytes the
+/// redactor never read must not ride along; HANDOFF_S8 §6.10 item 1) or the
+/// file is over `--embed-binary`.
+pub(super) fn archive_plan(
+    sources: &[(PathBuf, String, bool)],
+    blocks: &[Block],
+    spool: &Spool,
+    cfg: &MergeConfig,
+    cancel: &AtomicBool,
+) -> Result<Vec<ArchiveEntry>> {
+    // A file's own block carries its path; continuations and archive
+    // members are `synthetic` output, not files on disk.
+    let own: std::collections::HashMap<&str, usize> = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| !b.synthetic)
+        .map(|(i, b)| (b.relative.as_str(), i))
+        .collect();
+    let mut entries = Vec::with_capacity(sources.len());
+    for (path, rel, processed) in sources {
+        if cancel.load(AtomicOrd::Relaxed) {
+            return Err(Cancelled.into());
+        }
+        let block = own.get(rel.as_str()).copied();
+        let facts = if !processed {
+            Err("not processed — the run was finished early".to_string())
+        } else {
+            match read_facts(path) {
+                Err(e) => Err(format!("unreadable at the archive pass: {e}")),
+                Ok(f) => {
+                    let rebuilds = match block {
+                        Some(bi) if f.utf8 && !f.bom && f.eol != "mixed" => {
+                            let content = spool.read(blocks[bi].span)?;
+                            let rebuilt = rebuilt_from_block(&content, f.eol, f.final_newline);
+                            rebuilt.len() as u64 == f.bytes
+                                && format!("{:x}", sha2::Sha256::digest(rebuilt.as_bytes()))
+                                    == f.sha256
+                        }
+                        _ => false,
+                    };
+                    let how = if rebuilds {
+                        Restore::Text
+                    } else if cfg.redact {
+                        Restore::Withheld(
+                            "redaction is on: original bytes are never embedded (they may hold what the text redacted)".into(),
+                        )
+                    } else if let Some(mb) = cfg
+                        .embed_binary
+                        .filter(|&mb| f.bytes > mb.saturating_mul(1 << 20))
+                    {
+                        Restore::Withheld(format!(
+                            "{} bytes, over the --embed-binary cap of {mb} MB",
+                            f.bytes
+                        ))
+                    } else {
+                        Restore::Embedded
+                    };
+                    Ok((f, how))
+                }
+            }
+        };
+        entries.push(ArchiveEntry {
+            path: path.clone(),
+            relative: rel.clone(),
+            block,
+            lang: block.map_or_else(String::new, |bi| blocks[bi].lang.clone()),
+            facts,
+        });
+    }
+    Ok(entries)
+}
+
+/// Size, SHA-256, line ends, BOM and UTF-8 validity of a file, read once in
+/// 1 MiB pieces.
+fn read_facts(path: &Path) -> std::io::Result<FileFacts> {
+    let mut file = std::fs::File::open(path)?;
+    let mode = mode_bits(&file.metadata()?);
+    let mut buf = vec![0u8; 1 << 20];
+    let mut hasher = sha2::Sha256::new();
+    let (mut bytes, mut lf, mut crlf, mut cr) = (0u64, 0u64, 0u64, 0u64);
+    let mut head: Vec<u8> = Vec::with_capacity(3);
+    let mut last: Option<u8> = None;
+    let (mut utf8, mut cut) = (true, Vec::new());
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let chunk = &buf[..n];
+        hasher.update(chunk);
+        bytes += n as u64;
+        head.extend(chunk.iter().take(3 - head.len()));
+        for &c in chunk {
+            match c {
+                b'\n' => {
+                    lf += 1;
+                    crlf += u64::from(last == Some(b'\r'));
+                }
+                b'\r' => cr += 1,
+                _ => {}
+            }
+            last = Some(c);
+        }
+        utf8 = utf8 && utf8_continues(&mut cut, chunk);
+    }
+    let eol = match (crlf, lf - crlf, cr - crlf) {
+        (0, 0, 0) => "none",
+        (0, _, 0) => "lf",
+        (_, 0, 0) => "crlf",
+        _ => "mixed",
+    };
+    Ok(FileFacts {
+        bytes,
+        sha256: format!("{:x}", hasher.finalize()),
+        eol,
+        final_newline: last == Some(b'\n'),
+        bom: head.starts_with(&[0xEF, 0xBB, 0xBF])
+            || head.starts_with(&[0xFF, 0xFE])
+            || head.starts_with(&[0xFE, 0xFF]),
+        utf8: utf8 && cut.is_empty(),
+        mode,
+    })
+}
+
+/// Streamed UTF-8 check of one chunk; `cut` carries a character split by the
+/// end of the previous chunk.
+fn utf8_continues(cut: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let joined;
+    let data = if cut.is_empty() {
+        chunk
+    } else {
+        joined = [cut.as_slice(), chunk].concat();
+        &joined[..]
+    };
+    match std::str::from_utf8(data) {
+        Ok(_) => {
+            cut.clear();
+            true
+        }
+        Err(e) if e.error_len().is_none() => {
+            *cut = data[e.valid_up_to()..].to_vec();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The archive twin of one part: the manifest of the source files this part
+/// carries (a file goes with its own block; one without a block goes in the
+/// last part), then each embedded file as base64.
+fn write_archive<W: Write>(w: &mut W, ctx: &RenderCtx) -> Result<()> {
+    writeln!(w, "## __manifest__\n\n```jsonlines")?;
+    // Measuring an empty part (no spool) writes only the frame.
+    let mine: Vec<&ArchiveEntry> = match ctx.spool {
+        None => Vec::new(),
+        Some(_) => ctx
+            .archive
+            .iter()
+            .filter(|e| e.block.map_or(ctx.n_parts - 1, |bi| ctx.part_of[bi]) == ctx.idx)
+            .collect(),
+    };
+    for e in &mine {
+        writeln!(w, "{}", e.manifest_line())?;
+    }
+    writeln!(w, "```\n")?;
+    for e in mine {
+        if let Ok((f, Restore::Embedded)) = &e.facts {
+            write_embedded(w, e, f)?;
+        }
+    }
+    Ok(())
+}
+
+/// Pass 2: one file's bytes as base64 in 76-character lines (RFC 2045),
+/// streamed a few hundred lines at a time. The bytes are hashed again on the
+/// way; if they are not the ones pass 1 recorded, the file changed during
+/// the merge and the twin would not match its manifest, so the merge fails.
+fn write_embedded<W: Write>(w: &mut W, e: &ArchiveEntry, f: &FileFacts) -> Result<()> {
+    let changed = |what: String| {
+        anyhow::anyhow!(
+            "{} changed while the archive twin was written ({what}); nothing was written — run the merge again",
+            e.relative
+        )
+    };
+    let mut file = std::fs::File::open(&e.path)
+        .map_err(|err| changed(format!("cannot open it again: {err}")))?;
+    // Escaped like a block header, so a control character cannot end the line.
+    writeln!(
+        w,
+        "## __binary__: {}\n\n```base64",
+        display_path(&e.relative)
+    )?;
+    // A multiple of 57 bytes: every piece but the last fills whole lines.
+    let mut buf = vec![0u8; 57 * 16 * 1024];
+    let mut hasher = sha2::Sha256::new();
+    let mut total = 0u64;
+    loop {
+        let n = fill(&mut file, &mut buf).map_err(|err| changed(format!("read failed: {err}")))?;
+        hasher.update(&buf[..n]);
+        total += n as u64;
+        let b64 = crate::remote::base64(&buf[..n]);
+        for line in b64.as_bytes().chunks(76) {
+            w.write_all(line)?;
+            w.write_all(b"\n")?;
+        }
+        if n < buf.len() {
+            break;
+        }
+    }
+    if total == 0 {
+        // The empty line an empty file always had between the fences.
+        writeln!(w)?;
+    }
+    writeln!(w, "```\n")?;
+    let sha = format!("{:x}", hasher.finalize());
+    if total != f.bytes || sha != f.sha256 {
+        return Err(changed(format!(
+            "{} B sha256 {} when first read, {} B {} now",
+            f.bytes,
+            &f.sha256[..12],
+            total,
+            &sha[..12]
+        )));
+    }
+    Ok(())
+}
+
+/// Read until `buf` is full or the reader ends; the number of bytes read.
+fn fill(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
 }
 
 /// What a restore makes of a block (`tm_verify.py restore` does the same):
@@ -890,18 +1168,16 @@ fn rebuilt_from_block(content: &str, eol: &str, final_newline: bool) -> String {
     body
 }
 
-/// Unix permission bits of a file (0 elsewhere), for the archive manifest.
-fn file_mode(p: &Path) -> u32 {
+/// Unix permission bits (0 elsewhere), for the archive manifest.
+fn mode_bits(meta: &std::fs::Metadata) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p)
-            .map(|m| m.permissions().mode() & 0o7777)
-            .unwrap_or(0)
+        meta.permissions().mode() & 0o7777
     }
     #[cfg(not(unix))]
     {
-        let _ = p;
+        let _ = meta;
         0
     }
 }

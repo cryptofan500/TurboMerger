@@ -8,6 +8,26 @@ Stops the silent content loss, corruption and write-anywhere paths found in the
 2026-09-24 audit (`TURBOMERGER_refactor_september24_2026_v2.md`, findings N-xx).
 Every fix ships with its repro turned into a test (96 → 156 Rust tests).
 
+### Archive twin and ISO dates (2026-10-31, session 9)
+
+- **Security fix:** with `--complete --redact --embed-binary`, a redacted file's original
+  bytes were embedded as base64, so the secret came back from the twin. Under `--redact`
+  the twin embeds no source bytes; such files are `withheld`, named, and the exit code is 3.
+- A file that vanished or became unreadable before the archive pass was recorded and
+  "restored" as an empty file; it is now `missing` with the reason. A file that changes
+  between the two archive reads fails the merge (nothing written).
+- Continuation segments and zip/tar members were archived as empty files at made-up
+  paths (`pack.zip!/inner.txt`); the archive file itself is embedded instead.
+- `--complete` embeds every file its text cannot rebuild (no cap by default);
+  `--embed-binary MB` caps it, and a file over the cap is named (exit 3) instead of listed
+  without bytes. A complete plan keeps the bytes of named files the scanner skips
+  (pictures, photos without OCR). `--complete` is Markdown only (exit 2 otherwise), and
+  `--embed-binary` is accepted with a plan's `complete = true`.
+- The archive pass reads each file once, streamed; base64 is written in pieces.
+- Workbook cells stored as ISO dates (OOXML `t="d"`, ODS date/time values) are written
+  like serial dates (`2026-10-13 12:00:00`, not `2026-10-13T12:00:00.000Z`), so each
+  sheet's checksum matches its cells.
+
 ### Desktop guards (2026-10-31, session 8)
 
 - MERGE stops before writing one file over 1.5 M tokens or 50 MB (estimate from the scan,

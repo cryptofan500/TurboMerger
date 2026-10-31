@@ -12,8 +12,9 @@
 //! - 2 usage error
 //! - 3 completed, but content was NOT captured (unsupported documents or
 //!   photos, too large, unreadable, credential-dense, a failed git section),
-//!   or anything at all was skipped under `--fail-on-skip`; apply: some
-//!   proposals were held or refused
+//!   or anything at all was skipped under `--fail-on-skip`, or a
+//!   `--complete` archive twin cannot restore a file byte for byte; apply:
+//!   some proposals were held or refused
 //!
 //! - 4 cancelled (Ctrl-C, `--deadline`, `--on-stall fail`: nothing written)
 //!   or partial (`--on-deadline partial`, `--keep-partial`: what was done is
@@ -298,10 +299,10 @@ pub struct MergeCmd {
     /// Spreadsheet table chunk size in rows (default 150; 0 = one table per sheet)
     #[arg(long, value_name = "N", default_value_t = 150)]
     pub grid_chunk_rows: usize,
-    /// Archive twin: whole files only, appends manifest block
+    /// Archive twin (markdown only): a manifest plus the bytes of every file its text block cannot rebuild, so each file comes back byte for byte; a file that cannot is named and the exit code is 3
     #[arg(long)]
     pub complete: bool,
-    /// With --complete: embed binary files up to N MB as base64
+    /// With --complete: embed only files up to N MB (default: no cap); a larger one is withheld and named (exit 3)
     #[arg(long, value_name = "MB")]
     pub embed_binary: Option<u64>,
 }
@@ -555,10 +556,6 @@ fn run_merge(a: MergeCmd) -> i32 {
     options.budget_tokens = a.budget_tokens;
     options.complete = a.complete;
     options.embed_binary = a.embed_binary;
-    if a.embed_binary.is_some() && !a.complete {
-        eprintln!("error: --embed-binary needs --complete");
-        return EXIT_USAGE;
-    }
 
     // Exact file selection (ADR 0020): a list or a plan merges exactly the
     // named files and never walks the source folder.
@@ -635,6 +632,15 @@ fn run_merge(a: MergeCmd) -> i32 {
         if plan.complete && !a.complete {
             options.complete = true;
         }
+    }
+    // After the plan: `complete = true` there counts like --complete.
+    if options.embed_binary.is_some() && !options.complete {
+        eprintln!("error: --embed-binary needs --complete (or `complete = true` in the plan)");
+        return EXIT_USAGE;
+    }
+    if options.complete && a.format.as_str() != "markdown" {
+        eprintln!("error: the archive twin (--complete) is written in the markdown format only");
+        return EXIT_USAGE;
     }
 
     if a.list_only || a.emit_selection.is_some() {
@@ -794,6 +800,9 @@ fn run_merge(a: MergeCmd) -> i32 {
         .count();
     let code = if o.partial {
         EXIT_PARTIAL
+    } else if !o.archive_gaps.is_empty() {
+        // --complete promised every file back byte for byte.
+        EXIT_SKIPS
     } else {
         merge_exit_code(o.files_processed, &all, a.fail_on_skip)
     };
@@ -818,6 +827,12 @@ fn run_merge(a: MergeCmd) -> i32 {
     }
     for note in &o.notes {
         eprintln!("warning: {}", note);
+    }
+    for (path, why) in o.archive_gaps.iter().take(20) {
+        eprintln!("  not restorable: {path} — {why}");
+    }
+    if o.archive_gaps.len() > 20 {
+        eprintln!("  …and {} more (Merge Report)", o.archive_gaps.len() - 20);
     }
     if o.partial {
         eprintln!(

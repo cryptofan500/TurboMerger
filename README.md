@@ -360,7 +360,7 @@ docs/adr/                    architecture decision records
 | `--list-only`, `--emit-selection FILE` | Show / save what would be merged, as a plan you can edit. |
 | `--budget-tokens N` | Exit 5 if the output would be over N tokens. |
 | `outline FILE` | Headings of a Markdown file, sheets of a workbook — to write selectors. |
-| `--complete --embed-binary MB` | Archive twin: a manifest plus files that cannot be rebuilt from their text embedded as base64; `scripts/e2e/tm_verify.py restore` rebuilds every file byte for byte. |
+| `--complete [--embed-binary MB]` | Archive twin (Markdown only): a manifest plus the bytes of every file its text cannot rebuild, so `scripts/e2e/tm_verify.py restore` rebuilds each file byte for byte. A file that cannot come back (over the cap, withheld under `--redact`, unreadable) is named and the exit code is 3. |
 
 Workbooks and selected CSV/TSV are written as TM-GRID/1 blocks ([ADR 0021](docs/adr/0021-tm-grid-spreadsheet-text.md)). In the desktop app, **Load plan…** and **Save as plan…** do the same as `--selection` and `--emit-selection`. Check any bundle with `python3 -P scripts/e2e/tm_verify.py all --merged M.md --json M.json --src-root SRC --selection PLAN --work EMPTY_DIR`.
 

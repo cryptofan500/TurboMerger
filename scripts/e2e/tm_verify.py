@@ -45,6 +45,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import zipfile
 from decimal import Decimal
 
@@ -1046,6 +1047,11 @@ def cmd_cold(merged, src_root, work, selection=None):
 
 # ------------------------------------------------------------------ restore
 
+def display_path(rel):
+    """TurboMerger's block-header form of a path: control characters as \\u{hex}."""
+    return "".join(f"\\u{{{ord(c):x}}}" if unicodedata.category(c) == "Cc" else c for c in rel)
+
+
 def cmd_restore(archive, out_dir, src_root=None):
     gate = Gate("restore")
     with open(archive, encoding="utf-8", newline="") as f:
@@ -1061,12 +1067,20 @@ def cmd_restore(archive, out_dir, src_root=None):
     os.makedirs(out_dir, exist_ok=True)
     for e in entries:
         rel = e["path"]
+        parts = rel.replace("\\", "/").split("/")
+        if os.path.isabs(rel) or re.match(r"^[A-Za-z]:", rel) or ".." in parts or "" in parts:
+            gate.fail(f"{rel}: unsafe path (absolute, drive, empty or '..' part) — not written")
+            continue
+        if e.get("kind") in ("withheld", "missing"):
+            gate.fail(f"{rel}: {e['kind']} — {e.get('reason', 'no reason given')}")
+            continue
         target = os.path.join(out_dir, rel)
         os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
-        if rel in bins:
-            data = base64.b64decode("".join(bins[rel].split()))
-        elif e.get("kind") == "text" and rel in content:
-            body = content[rel]["content"]
+        head = display_path(rel)
+        if head in bins:
+            data = base64.b64decode("".join(bins[head].split()))
+        elif e.get("kind") == "text" and head in content:
+            body = content[head]["content"]
             if e.get("eol") == "crlf":
                 body = body.replace("\r\n", "\n")
                 if body.endswith("\r"):  # the CR of the last CRLF sits before the closing fence
@@ -1347,6 +1361,26 @@ def cmd_selftest(bin_arg):
             ok = False
         else:
             print("  [ok] a one-byte change in the archive is detected by restore")
+        # Redaction must never leak through the twin (HANDOFF_S8 §6.10 item 1).
+        secret = "Vr7wKp2walKotwica91"
+        with open(os.path.join(src, "secret.md"), "w", encoding="utf-8") as f:
+            f.write(f"# Notes\npassword: {secret}\n")
+        leak_plan = os.path.join(tmp, "leak.toml")
+        with open(leak_plan, "w", encoding="utf-8") as f:
+            f.write('version = 1\nmode = "explicit"\ncomplete = true\n[[file]]\npath = "secret.md"\n'
+                    '[[file]]\npath = "cases.xlsx"\n')
+        lk = os.path.join(tmp, "leak.md")
+        r = subprocess.run([tm, "merge", src, lk, "--selection", leak_plan, "--redact", "--format", "markdown",
+                            "--yes", "-q"], capture_output=True, text=True, env=env)
+        with open(lk, encoding="utf-8", newline="") as f:
+            ltext = f.read()
+        decoded = b"".join(base64.b64decode("".join(b["content"].split()))
+                           for b in md_blocks(ltext) if b["path"].startswith("__binary__: "))
+        if secret in ltext or secret.encode() in decoded or r.returncode != 3:
+            print(f"  [!!] --complete --redact leaked the secret or did not exit 3 (exit {r.returncode})")
+            ok = False
+        else:
+            print("  [ok] --complete --redact embeds no source bytes; withheld files are named (exit 3)")
         ok &= detected == len(mutations)
     print("SELFTEST", "PASS" if ok else "FAIL")
     return EXIT_OK if ok else EXIT_GATE
