@@ -579,3 +579,75 @@ fn complete_plans_keep_every_named_file_and_name_what_cannot_come_back() {
         stderr(&o)
     );
 }
+
+#[test]
+fn restore_rebuilds_a_twin_and_never_overwrites_silently() {
+    // HANDOFF_S8 §6.10 item 3.5 (S9): the CLI's own restore.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::write(src.join("a.txt"), "one\r\ntwo\r\n").unwrap();
+    fs::write(src.join("d/b.bin.txt"), b"caf\xe9").unwrap();
+    let twin = tmp.path().join("twin.md");
+    let o = tm(
+        &[
+            "merge",
+            src.to_str().unwrap(),
+            twin.to_str().unwrap(),
+            "--complete",
+            "--yes",
+            "-q",
+        ],
+        tmp.path(),
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let dest = tmp.path().join("back");
+    let run = |extra: &[&str]| {
+        let mut args = vec!["restore", twin.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        tm(&args, tmp.path())
+    };
+    let o = run(&["--dest", dest.to_str().unwrap()]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        stdout(&o).starts_with("restored=2 identical=0"),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"one\r\ntwo\r\n");
+    assert_eq!(fs::read(dest.join("d/b.bin.txt")).unwrap(), b"caf\xe9");
+    let o = run(&["--dest", dest.to_str().unwrap()]);
+    assert!(
+        stdout(&o).starts_with("restored=0 identical=2"),
+        "{}",
+        stdout(&o)
+    );
+    fs::write(dest.join("a.txt"), "changed\n").unwrap();
+    let o = run(&["--dest", dest.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("nothing was written"));
+    assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"changed\n");
+    let o = run(&["--dest", dest.to_str().unwrap(), "--overwrite"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"one\r\ntwo\r\n");
+    let o = run(&["--check"]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(stdout(&o).contains("(checked, nothing written)"));
+    let o = tm(&["restore", twin.to_str().unwrap()], tmp.path());
+    assert_eq!(o.status.code(), Some(2), "--dest or --check is required");
+}

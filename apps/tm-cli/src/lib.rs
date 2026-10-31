@@ -76,6 +76,10 @@ pub enum Command {
     Explain(ExplainCmd),
     /// Serve the Model Context Protocol on stdio.
     Mcp(McpCmd),
+    /// Rebuild every file of an archive twin (`merge --complete`) under --dest,
+    /// byte for byte: all or nothing, never outside --dest, never over a
+    /// different existing file without --overwrite.
+    Restore(RestoreCmd),
     /// Outline a file's structure (headings in Markdown, sheets in spreadsheets).
     Outline {
         file: PathBuf,
@@ -412,6 +416,7 @@ pub fn run(argv: &[OsString]) -> Option<i32> {
             allow_remote: m.allow_remote,
         }),
         Command::Outline { file, json } => run_outline(file, json),
+        Command::Restore(r) => run_restore(r),
         Command::Worker { kind } => pdf_worker::serve(&kind),
         Command::Completions { shell } => {
             clap_complete::generate(
@@ -933,6 +938,73 @@ fn selection_summary(f: &tm_core::selection::FileSel) -> String {
         parts.push(format!("max_tokens={t}"));
     }
     parts.join(" ")
+}
+
+#[derive(Args, Debug)]
+pub struct RestoreCmd {
+    /// The archive twin: one Markdown output, or every part of a split one
+    #[arg(required = true, value_name = "ARCHIVE")]
+    pub archive: Vec<PathBuf>,
+    /// Folder to rebuild the files in (created when missing)
+    #[arg(long, value_name = "DIR", required_unless_present = "check")]
+    pub dest: Option<PathBuf>,
+    /// Replace existing files whose bytes differ (default: write nothing and exit 3)
+    #[arg(long)]
+    pub overwrite: bool,
+    /// Decode and check every file against the manifest; write nothing
+    #[arg(long)]
+    pub check: bool,
+}
+
+fn run_restore(a: RestoreCmd) -> i32 {
+    // --check without --dest compares with nothing on disk.
+    let dest = a.dest.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("turbomerger-restore-check-{}", std::process::id()))
+    });
+    let opts = tm_core::restore::RestoreOptions {
+        overwrite: a.overwrite,
+        check_only: a.check,
+    };
+    let r = match tm_core::restore::restore(&a.archive, &dest, opts) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return EXIT_ERROR;
+        }
+    };
+    println!(
+        "restored={} identical={} not_restorable={} conflicts={} bytes={}{}",
+        r.restored.len(),
+        r.identical.len(),
+        r.not_restorable.len(),
+        r.conflicts.len(),
+        r.bytes,
+        if a.check {
+            " (checked, nothing written)"
+        } else {
+            ""
+        }
+    );
+    for w in &r.warnings {
+        eprintln!("warning: {w}");
+    }
+    for (p, why) in &r.not_restorable {
+        eprintln!("not restorable: {p} — {why}");
+    }
+    for p in &r.conflicts {
+        eprintln!("exists with other bytes: {p}");
+    }
+    if !r.conflicts.is_empty() {
+        eprintln!(
+            "nothing was written: {} existing file(s) differ (--overwrite replaces them)",
+            r.conflicts.len()
+        );
+    }
+    if r.conflicts.is_empty() && r.not_restorable.is_empty() {
+        EXIT_OK
+    } else {
+        EXIT_SKIPS
+    }
 }
 
 fn run_outline(file: PathBuf, json: bool) -> i32 {

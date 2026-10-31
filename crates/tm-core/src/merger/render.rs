@@ -39,6 +39,8 @@ pub(super) struct RenderCtx<'a> {
     pub(super) spool: Option<&'a Spool>,
     /// Source files of a `--complete` merge (empty otherwise).
     pub(super) archive: &'a [ArchiveEntry],
+    /// Identity of this merge's archive, repeated in every part's manifest.
+    pub(super) archive_set: String,
 }
 
 impl RenderCtx<'_> {
@@ -108,6 +110,7 @@ pub(super) fn partition(ctx: &RenderCtx, max_tokens: Option<usize>) -> Vec<Vec<u
         skips: ctx.skips,
         spool: None,
         archive: ctx.archive,
+        archive_set: ctx.archive_set.clone(),
     };
     let single = render_to_string(&probe, &[])
         .map(|s| tokens::count(&s))
@@ -900,6 +903,16 @@ impl ArchiveEntry {
     }
 }
 
+/// The identity of a merge's archive: SHA-256 (16 hex) of every manifest line.
+pub(super) fn archive_set_id(entries: &[ArchiveEntry]) -> String {
+    let mut h = sha2::Sha256::new();
+    for e in entries {
+        h.update(e.manifest_line().to_string().as_bytes());
+        h.update(b"\n");
+    }
+    format!("{:x}", h.finalize())[..16].to_string()
+}
+
 /// Pass 1 of the archive twin, before anything is written: every source
 /// file (`sources`: real path, display path, processed — in merge order) is
 /// read once, streamed, and how it comes back is decided, so the report and
@@ -1059,6 +1072,16 @@ fn utf8_continues(cut: &mut Vec<u8>, chunk: &[u8]) -> bool {
 /// last part), then each embedded file as base64.
 fn write_archive<W: Write>(w: &mut W, ctx: &RenderCtx) -> Result<()> {
     writeln!(w, "## __manifest__\n\n```jsonlines")?;
+    // The part header: restore refuses a set with a part missing, given
+    // twice, or taken from another merge (HANDOFF_S8 §6.11 C).
+    let header = serde_json::json!({
+        "archive": "tm-twin/1",
+        "set": ctx.archive_set,
+        "part": ctx.idx + 1,
+        "parts": ctx.n_parts,
+        "files": ctx.archive.len(),
+    });
+    writeln!(w, "{header}")?;
     // Measuring an empty part (no spool) writes only the frame.
     let mine: Vec<&ArchiveEntry> = match ctx.spool {
         None => Vec::new(),

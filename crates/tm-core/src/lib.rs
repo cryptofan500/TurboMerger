@@ -13,6 +13,7 @@ pub mod merger;
 pub mod progress;
 pub mod remote;
 pub mod repomap;
+pub mod restore;
 pub mod scanner;
 pub mod security;
 pub mod selection;

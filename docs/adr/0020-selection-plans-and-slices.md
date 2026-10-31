@@ -43,3 +43,12 @@
   before anything is written; pass 2 streams the base64 and hashes again, and a file that
   changed in between fails the merge. An unreadable file is `missing`, never an empty file.
 - **Format.** Markdown only; `--complete` with another format is a usage error (exit 2).
+- **Parts.** Each part's manifest carries its own files and starts with a header line
+  `{"archive":"tm-twin/1","set":…,"part":k,"parts":n,"files":N}`; the set id is the
+  SHA-256 of every manifest line. A restore needs every part, once, of one set.
+- **Restore.** `turbomerger restore ARCHIVE… --dest DIR` indexes the parts (streamed),
+  checks every entry (safe relative path, block present, no duplicate) and the existing
+  files, decodes each file into a temporary file checked against the manifest, and moves
+  them into place only when all pass. Never outside DIR, never through a symlink, never
+  over a different file without `--overwrite`. `scripts/e2e/tm_verify.py restore` stays the
+  independent second reader.

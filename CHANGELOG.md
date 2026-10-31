@@ -24,6 +24,12 @@ Every fix ships with its repro turned into a test (96 → 156 Rust tests).
   (pictures, photos without OCR). `--complete` is Markdown only (exit 2 otherwise), and
   `--embed-binary` is accepted with a plan's `complete = true`.
 - The archive pass reads each file once, streamed; base64 is written in pieces.
+- New `turbomerger restore ARCHIVE… --dest DIR`: rebuilds every file of a twin, streamed
+  and all or nothing (each file is checked against the manifest's size and SHA-256 in a
+  temporary file before any is moved into place); refuses absolute, `..` and symlinked
+  paths, and an existing file with other bytes unless `--overwrite`; `--check` verifies
+  without writing. Every part's manifest starts with a part header (`tm-twin/1`, set id,
+  part k of n, file count), so a missing, doubled or foreign part is refused.
 - Workbook cells stored as ISO dates (OOXML `t="d"`, ODS date/time values) are written
   like serial dates (`2026-10-13 12:00:00`, not `2026-10-13T12:00:00.000Z`), so each
   sheet's checksum matches its cells.

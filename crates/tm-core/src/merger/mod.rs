@@ -744,6 +744,7 @@ where
         skips: &all_skips,
         spool: Some(&spool),
         archive: &archive,
+        archive_set: render::archive_set_id(&archive),
     };
 
     // Partition into parts by token budget, counting every token each part

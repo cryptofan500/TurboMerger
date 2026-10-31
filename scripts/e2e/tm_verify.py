@@ -1061,7 +1061,12 @@ def cmd_restore(archive, out_dir, src_root=None):
     if man is None:
         gate.fail("no ## __manifest__ block")
         return gate
-    entries = [json.loads(x) for x in man["content"].splitlines() if x.strip()]
+    lines = [json.loads(x) for x in man["content"].splitlines() if x.strip()]
+    entries = [x for x in lines if "path" in x]
+    for h in (x for x in lines if "archive" in x):
+        if h.get("parts", 1) != 1:
+            gate.fail(f"this archive is part {h.get('part')} of {h.get('parts')}: use `turbomerger restore` with every part")
+            return gate
     bins = {b["path"][len("__binary__: "):]: b["content"] for b in blocks if b["path"].startswith("__binary__: ")}
     content = {b["path"]: b for b in blocks}
     os.makedirs(out_dir, exist_ok=True)
@@ -1350,6 +1355,25 @@ def cmd_selftest(bin_arg):
         rg = cmd_restore(ar, os.path.join(tmp, "restored"), src)
         print(rg.report())
         ok &= rg.ok
+        # Two independent readers of the twin must agree: this script's restore
+        # and the binary's own `restore` (S9; a binary without it says exit 2).
+        native = os.path.join(tmp, "restored_native")
+        r = subprocess.run([tm, "restore", ar, "--dest", native], capture_output=True, text=True, env=env)
+        if r.returncode == 2 and "restore" in r.stderr and not os.path.exists(native):
+            print("  [--] this binary has no `restore` command (made before S9)")
+        else:
+            def tree(d):
+                out = {}
+                for base, _, names in os.walk(d):
+                    for n in names:
+                        fp = os.path.join(base, n)
+                        with open(fp, "rb") as f:
+                            out[os.path.relpath(fp, d)] = hashlib.sha256(f.read()).hexdigest()
+                return out
+            same = r.returncode == 0 and tree(native) == tree(os.path.join(tmp, "restored"))
+            print(f"  [{'ok' if same else '!!'}] native `turbomerger restore` "
+                  f"{'matches' if same else 'DIFFERS from'} this script's restore (exit {r.returncode})")
+            ok &= same
         with open(ar, encoding="utf-8", newline="") as f:
             atext = f.read()
         bad = os.path.join(tmp, "archive_bad.md")
