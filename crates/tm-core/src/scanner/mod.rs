@@ -395,6 +395,72 @@ pub struct ScanResult {
     pub skipped: Vec<SkipEntry>,
 }
 
+/// Explicit file scanner: checks named paths directly without walking directories.
+pub fn scan_explicit(
+    root: &Path,
+    paths: &[String],
+    options: &ScanOptions,
+) -> std::io::Result<ScanResult> {
+    let mut files = Vec::new();
+    let mut skipped = Vec::new();
+    let mut stats = ScanStats::default();
+
+    for rel_str in paths {
+        let p_rel = rel_str.replace('\\', std::path::MAIN_SEPARATOR_STR);
+        let candidate = if Path::new(&p_rel).is_absolute() {
+            PathBuf::from(&p_rel)
+        } else {
+            root.join(&p_rel)
+        };
+
+        let meta = match std::fs::metadata(&candidate) {
+            Ok(m) => m,
+            Err(_) => {
+                skipped.push(SkipEntry::new(rel_str.clone(), "file not found".to_string(), SkipKind::NotCaptured));
+                continue;
+            }
+        };
+
+        if !meta.is_file() {
+            skipped.push(SkipEntry::new(rel_str.clone(), "not a regular file".to_string(), SkipKind::NotCaptured));
+            continue;
+        }
+
+        let len = meta.len();
+
+        match classify(&candidate, len, options) {
+            Verdict::TextByExt => {
+                files.push(candidate);
+                stats.by_extension += 1;
+            }
+            Verdict::TextByContent => {
+                files.push(candidate);
+                stats.by_content += 1;
+            }
+            Verdict::Document => {
+                files.push(candidate);
+                stats.by_document += 1;
+            }
+            Verdict::Skip(reason, kind) => {
+                if kind == SkipKind::Binary {
+                    stats.skipped_binary += 1;
+                }
+                skipped.push(SkipEntry::new(rel_str.clone(), reason, kind));
+            }
+            Verdict::Unreadable => {
+                stats.unreadable += 1;
+                skipped.push(SkipEntry::new(rel_str.clone(), "unreadable", SkipKind::NotCaptured));
+            }
+        }
+    }
+
+    Ok(ScanResult {
+        files,
+        stats,
+        skipped,
+    })
+}
+
 /// What a running scan reports (see `scan_with`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanProgress {

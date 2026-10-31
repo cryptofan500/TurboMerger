@@ -247,6 +247,14 @@ fn process_bytes(
         content = content.replace("\r\n", "\n");
     }
 
+    if let Some(plan) = &cfg.selection {
+        if let Some(file_sel) = plan.find_file(&relative) {
+            if let Ok((sliced, _report)) = crate::slice::slice_text(&content, file_sel) {
+                content = sliced;
+            }
+        }
+    }
+
     if cfg.redact {
         *harvested = crate::security::harvest_labeled_values(&content);
     }
@@ -385,10 +393,13 @@ fn process_document(
             crate::extract::extract_queued(path, kind, queue, &relative)
         }
         _ => {
+            let grid_sel = ctx.cfg.selection.as_ref().and_then(|plan| plan.find_file(&relative)).map(|f| f.to_grid_select());
             let opts = crate::extract::ExtractOptions {
                 ocr: ctx.cfg.extract_images_text,
                 ocr_cmd: None,
                 cancel: Some(ctx.cancel),
+                grid_select: grid_sel.as_ref(),
+                grid_chunk_rows: ctx.cfg.grid_chunk_rows,
             };
             crate::extract::extract(path, kind, &opts).map(Queued::Done)
         }
@@ -444,6 +455,14 @@ fn document_block(
         content = content.replace("\r\n", "\n");
     }
 
+    if let Some(plan) = &cfg.selection {
+        if let Some(file_sel) = plan.find_file(&relative) {
+            if let Ok((sliced, _report)) = crate::slice::slice_text(&content, file_sel) {
+                content = sliced;
+            }
+        }
+    }
+
     let redactions = if cfg.redact {
         *harvested = crate::security::harvest_labeled_values(&content);
         let (clean, events) = crate::security::redact_secrets(&content);
@@ -459,8 +478,7 @@ fn document_block(
         Block {
             relative,
             span: Default::default(),
-            // Extracted prose, not source: a plain fence with no language hint.
-            lang: String::new(),
+            lang: extracted.lang,
             tokens,
             utf8_note: Some(extracted.note),
             redactions,

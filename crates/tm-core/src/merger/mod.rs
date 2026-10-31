@@ -111,6 +111,7 @@ pub enum Ordering {
     Path,
     EntryFirst,
     ImportantLast,
+    Plan,
 }
 
 impl Ordering {
@@ -118,6 +119,7 @@ impl Ordering {
         match s.to_ascii_lowercase().as_str() {
             "entry-first" | "entryfirst" | "entry" => Ordering::EntryFirst,
             "important-last" | "importantlast" => Ordering::ImportantLast,
+            "plan" => Ordering::Plan,
             _ => Ordering::Path,
         }
     }
@@ -162,6 +164,16 @@ pub struct MergeConfig {
     /// Per-file cap in bytes for text that only shows its size once read —
     /// inflated gzip, archive members, streamed files. 0 = no cap.
     pub max_file_size: u64,
+    /// Granular selection plan for files, slices and sheets.
+    pub selection: Option<crate::selection::SelectionPlan>,
+    /// Spreadsheet chunk interval (default 150; 0 = one table per sheet).
+    pub grid_chunk_rows: usize,
+    /// Archive twin mode: appends manifest block for offline restoration.
+    pub complete: bool,
+    /// Embed binary files as base64 up to N MB in archive mode.
+    pub embed_binary: Option<u64>,
+    /// Token budget ceiling: fail gate if exceeded.
+    pub budget_tokens: Option<u64>,
 }
 
 impl Default for MergeConfig {
@@ -186,6 +198,11 @@ impl Default for MergeConfig {
             extract_images_text: false,
             keep_figures: false,
             max_file_size: 0,
+            selection: None,
+            grid_chunk_rows: 150,
+            complete: false,
+            embed_binary: None,
+            budget_tokens: None,
         }
     }
 }
@@ -671,6 +688,7 @@ where
     };
     let mut ctx = RenderCtx {
         cfg,
+        root,
         folder,
         source_label,
         nonce,
@@ -1055,6 +1073,9 @@ fn entry_rank(rel: &str) -> i32 {
 }
 
 fn order_files(root: &Path, files: &mut [&PathBuf], ordering: Ordering, reproducible: bool) {
+    if ordering == Ordering::Plan {
+        return;
+    }
     if reproducible {
         // The same order on every OS: NFC path strings, not OS path bytes.
         let key = |p: &PathBuf| nfc(&relative_display(root, p));
@@ -1070,6 +1091,7 @@ fn order_files(root: &Path, files: &mut [&PathBuf], ordering: Ordering, reproduc
                     (std::cmp::Reverse(entry_rank(&k)), std::cmp::Reverse(k))
                 });
             }
+            Ordering::Plan => {}
         }
         return;
     }
@@ -1089,6 +1111,7 @@ fn order_files(root: &Path, files: &mut [&PathBuf], ordering: Ordering, reproduc
                 rb.cmp(&ra).then_with(|| b.cmp(a))
             });
         }
+        Ordering::Plan => {}
     }
 }
 

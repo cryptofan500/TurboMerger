@@ -11,12 +11,14 @@ use super::spool::Spool;
 use super::{Block, MergeConfig, MergeOutcome, OutputFormat};
 use crate::scanner::{SkipEntry, SkipKind};
 use crate::tokens;
+use sha2::Digest;
 
 const MANIFEST_MAX: usize = 1000;
 
 /// Everything a part writer needs besides its own blocks.
 pub(super) struct RenderCtx<'a> {
     pub(super) cfg: &'a MergeConfig,
+    pub(super) root: &'a Path,
     /// Display name of the root folder (control characters escaped).
     pub(super) folder: String,
     /// What the header calls the source (never an absolute path by default).
@@ -90,6 +92,7 @@ pub(super) fn partition(ctx: &RenderCtx, max_tokens: Option<usize>) -> Vec<Vec<u
     // per-entry allowance for its " · part N" suffix).
     let mut probe = RenderCtx {
         cfg: ctx.cfg,
+        root: ctx.root,
         folder: ctx.folder.clone(),
         source_label: ctx.source_label.clone(),
         nonce: ctx.nonce.clone(),
@@ -260,6 +263,11 @@ fn write_markdown<W: Write>(w: &mut W, ctx: &RenderCtx, blocks: &[&Block]) -> Re
     writeln!(w, "> {}\n", UNTRUSTED_NOTE)?;
     writeln!(w, "---\n")?;
 
+    let has_grid = blocks.iter().any(|b| b.lang == "tm-grid");
+    if has_grid {
+        writeln!(w, "> **Reading the spreadsheet blocks (TM-GRID/1).** A workbook block starts with `TM-GRID/1`; each sheet starts with `@sheet …` and must end with `@end …` — a sheet without `@end` was cut off. In a table the first column `row` is the row number in the original sheet; the other columns follow the sheet's own header row. Cell text is escaped: `<br>` is a line break inside a cell, `\\|` a literal pipe, `\\\\` a backslash, `\\r` `\\t` carriage return and tab. A leading `'` marks text that would otherwise read as a number, TRUE/FALSE, date or error (`'1403811331` is an ID, not a quantity). Blank cells are blank. Cite rows as `[sheet name!row N]`.\n")?;
+    }
+
     if ctx.cfg.include_tree && ctx.first() {
         let tree = generate_tree(&ctx.folder, ctx.all);
         let fence = fence_for(&tree);
@@ -305,6 +313,41 @@ fn write_markdown<W: Write>(w: &mut W, ctx: &RenderCtx, blocks: &[&Block]) -> Re
     if ctx.report_here() && ctx.report_at_end() {
         writeln!(w, "---\n")?;
         write_markdown_report(w, ctx)?;
+    }
+
+    if ctx.cfg.complete {
+        writeln!(w, "## __manifest__\n\n```jsonlines")?;
+        for b in blocks {
+            let p = ctx.root.join(&b.relative);
+            let bytes = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            let sha = std::fs::read(&p).map(|data| format!("{:x}", sha2::Sha256::digest(&data))).unwrap_or_default();
+            let is_bin = b.lang == "tm-grid" || b.relative.ends_with(".xlsx") || b.relative.ends_with(".xls") || b.relative.ends_with(".pdf");
+            let kind = if is_bin { "binary" } else { "text" };
+            let line = serde_json::json!({
+                "path": b.relative,
+                "bytes": bytes,
+                "sha256": sha,
+                "kind": kind,
+            });
+            writeln!(w, "{}", line)?;
+        }
+        writeln!(w, "```\n")?;
+
+        if let Some(mb_cap) = ctx.cfg.embed_binary {
+            let max_bytes = mb_cap * 1024 * 1024;
+            for b in blocks {
+                let p = ctx.root.join(&b.relative);
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                if matches!(ext.as_str(), "xlsx" | "xls" | "pdf" | "png" | "jpg" | "jpeg") {
+                    if let Ok(data) = std::fs::read(&p) {
+                        if (data.len() as u64) <= max_bytes {
+                            let b64 = crate::remote::base64(&data);
+                            writeln!(w, "## __binary__: {}\n\n```base64\n{}\n```\n", b.relative, b64)?;
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

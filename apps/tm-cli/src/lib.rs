@@ -43,6 +43,8 @@ pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_SKIPS: i32 = 3;
 /// Cancelled (Ctrl-C, deadline, stall) or a partial output.
 pub const EXIT_PARTIAL: i32 = 4;
+/// Verification gate failed (e.g. budget exceeded).
+pub const EXIT_GATE_FAILED: i32 = 5;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -73,6 +75,12 @@ pub enum Command {
     Explain(ExplainCmd),
     /// Serve the Model Context Protocol on stdio.
     Mcp(McpCmd),
+    /// Outline a file's structure (headings in Markdown, sheets in spreadsheets).
+    Outline {
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a shell-completion script.
     Completions {
         #[arg(value_enum)]
@@ -116,6 +124,7 @@ pub enum OrderingArg {
     Path,
     EntryFirst,
     ImportantLast,
+    Plan,
 }
 
 impl OrderingArg {
@@ -124,6 +133,7 @@ impl OrderingArg {
             OrderingArg::Path => "path",
             OrderingArg::EntryFirst => "entry-first",
             OrderingArg::ImportantLast => "important-last",
+            OrderingArg::Plan => "plan",
         }
     }
 }
@@ -267,6 +277,33 @@ pub struct MergeCmd {
     /// Never ask the long-run question; report it and keep going
     #[arg(long)]
     pub yes: bool,
+    /// Read file paths from a file (or '-' for stdin)
+    #[arg(long, value_name = "FILE")]
+    pub files_from: Option<String>,
+    /// NUL-separated list with --files-from
+    #[arg(short = '0', long = "null")]
+    pub null: bool,
+    /// Selection plan TOML file
+    #[arg(long, value_name = "FILE.toml")]
+    pub selection: Option<PathBuf>,
+    /// Dry run: list files, sizes and token estimates
+    #[arg(long)]
+    pub list_only: bool,
+    /// Write the resolved selection plan as TOML
+    #[arg(long, value_name = "FILE")]
+    pub emit_selection: Option<PathBuf>,
+    /// Merge normally, then exit 5 if total output exceeds N o200k tokens
+    #[arg(long, value_name = "N")]
+    pub budget_tokens: Option<u64>,
+    /// Spreadsheet table chunk size in rows (default 150; 0 = one table per sheet)
+    #[arg(long, value_name = "N", default_value_t = 150)]
+    pub grid_chunk_rows: usize,
+    /// Archive twin: whole files only, appends manifest block
+    #[arg(long)]
+    pub complete: bool,
+    /// With --complete: embed binary files up to N MB as base64
+    #[arg(long, value_name = "MB")]
+    pub embed_binary: Option<u64>,
 }
 
 fn duration_arg(s: &str) -> Result<Duration, String> {
@@ -373,6 +410,7 @@ pub fn run(argv: &[OsString]) -> Option<i32> {
             output_dir: m.output_dir,
             allow_remote: m.allow_remote,
         }),
+        Command::Outline { file, json } => run_outline(file, json),
         Command::Worker { kind } => pdf_worker::serve(&kind),
         Command::Completions { shell } => {
             clap_complete::generate(
@@ -513,6 +551,106 @@ fn run_merge(a: MergeCmd) -> i32 {
     options.reproducible = a.reproducible;
     options.remote = remote_label.is_some();
     options.source_label = remote_label;
+    options.grid_chunk_rows = a.grid_chunk_rows;
+    options.budget_tokens = a.budget_tokens;
+    options.complete = a.complete;
+    options.embed_binary = a.embed_binary;
+
+    if let Some(files_from) = &a.files_from {
+        use std::io::Read;
+        let content = if files_from == "-" {
+            let mut buf = String::new();
+            if std::io::stdin().read_to_string(&mut buf).is_err() {
+                eprintln!("error: cannot read file list from stdin");
+                return EXIT_USAGE;
+            }
+            buf
+        } else {
+            match std::fs::read_to_string(files_from) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: cannot read files-from '{}': {e}", files_from);
+                    return EXIT_USAGE;
+                }
+            }
+        };
+        let paths: Vec<String> = if a.null {
+            content.split('\0').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+        } else {
+            content.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|s| s.to_string())
+                .collect()
+        };
+        options.selected_paths = Some(paths);
+    }
+
+    if let Some(sel_path) = &a.selection {
+        match std::fs::read_to_string(sel_path) {
+            Ok(content) => {
+                match tm_core::selection::SelectionPlan::from_toml(&content) {
+                    Ok(plan) => {
+                        options.selection = Some(plan);
+                    }
+                    Err(e) => {
+                        eprintln!("error: invalid selection plan '{}': {e}", sel_path.display());
+                        return EXIT_USAGE;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("error: cannot read selection file '{}': {e}", sel_path.display());
+                return EXIT_USAGE;
+            }
+        }
+    }
+
+    if a.list_only {
+        let job = match tm_core::job::resolve_job(&options) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return EXIT_ERROR;
+            }
+        };
+        let scan = if let Some(plan) = &options.selection {
+            if plan.mode == tm_core::selection::SelectionMode::Explicit {
+                let paths: Vec<String> = plan.files.iter().filter(|f| !f.exclude).map(|f| f.path.clone()).collect();
+                tm_core::scanner::scan_explicit(&job.root, &paths, &job.scan_options).unwrap_or_else(|_| tm_core::scanner::ScanResult { files: Vec::new(), stats: Default::default(), skipped: Vec::new() })
+            } else {
+                let flag = std::sync::atomic::AtomicBool::new(false);
+                tm_core::scanner::scan_with(&job.root, &job.scan_options, &flag, &|_| {}).unwrap_or_else(|_| tm_core::scanner::ScanResult { files: Vec::new(), stats: Default::default(), skipped: Vec::new() })
+            }
+        } else {
+            let flag = std::sync::atomic::AtomicBool::new(false);
+            tm_core::scanner::scan_with(&job.root, &job.scan_options, &flag, &|_| {}).unwrap_or_else(|_| tm_core::scanner::ScanResult { files: Vec::new(), stats: Default::default(), skipped: Vec::new() })
+        };
+        let mut files = scan.files;
+        let mut skipped = scan.skipped;
+        let keep_order = job.merge_config.ordering == tm_core::merger::Ordering::Plan;
+        tm_core::job::apply_selection(
+            &job.root,
+            &mut files,
+            &mut skipped,
+            &options.selected_paths,
+            &options.force_include,
+            &options.exclude_paths,
+            &options.exclude_dirs,
+            keep_order,
+        );
+        for f in &files {
+            let rel = tm_core::scanner::relative_display(&job.root, f);
+            let bytes = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+            println!("{rel} ({bytes} bytes)");
+        }
+        println!("\nTotal files: {}", files.len());
+        let not_captured = skipped.iter().any(|s| s.kind == tm_core::scanner::SkipKind::NotCaptured);
+        if not_captured {
+            return EXIT_SKIPS;
+        }
+        return EXIT_OK;
+    }
 
     // Ctrl-C cancels the job (temp files are cleaned up); a second one quits.
     let token = CancelToken::new();
@@ -627,7 +765,56 @@ fn run_merge(a: MergeCmd) -> i32 {
             not_captured
         );
     }
+    if let Some(budget) = a.budget_tokens {
+        if o.tokens_o200k as u64 > budget {
+            eprintln!(
+                "verification gate failed: output has ~{} tokens, exceeding --budget-tokens {}",
+                o.tokens_o200k, budget
+            );
+            return EXIT_GATE_FAILED;
+        }
+    }
     code
+}
+
+fn run_outline(file: PathBuf, json: bool) -> i32 {
+    match tm_core::extract::outline_file(&file) {
+        Ok(val) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&val).unwrap());
+            } else {
+                let kind = val.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                if kind == "markdown" {
+                    println!("Markdown headings in {}:", file.display());
+                    if let Some(headings) = val.get("headings").and_then(|h| h.as_array()) {
+                        for h in headings {
+                            let line = h.get("line").and_then(|l| l.as_u64()).unwrap_or(0);
+                            let lvl = h.get("level").and_then(|l| l.as_u64()).unwrap_or(1) as usize;
+                            let text = h.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                            println!("{:4}: {} {}", line, "#".repeat(lvl), text);
+                        }
+                    }
+                } else if kind == "spreadsheet" {
+                    println!("Sheets in {}:", file.display());
+                    if let Some(sheets) = val.get("sheets").and_then(|s| s.as_array()) {
+                        for s in sheets {
+                            let name = s.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            let rows = s.get("rows").and_then(|r| r.as_u64()).unwrap_or(0);
+                            let cols = s.get("cols").and_then(|c| c.as_u64()).unwrap_or(0);
+                            println!("  Sheet '{}': {} rows, {} cols", name, rows, cols);
+                        }
+                    }
+                } else {
+                    println!("File: {}", file.display());
+                }
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("error outlining file '{}': {e}", file.display());
+            EXIT_ERROR
+        }
+    }
 }
 
 fn run_map(a: MapCmd) -> i32 {

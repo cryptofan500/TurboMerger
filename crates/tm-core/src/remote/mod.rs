@@ -139,7 +139,7 @@ fn https_host(url: &str) -> Option<&str> {
 }
 
 /// Standard base64 (for the basic-auth header; no dependency needed).
-fn base64(input: &[u8]) -> String {
+pub(crate) fn base64(input: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {

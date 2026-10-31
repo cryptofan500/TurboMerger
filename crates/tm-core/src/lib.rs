@@ -15,6 +15,8 @@ pub mod remote;
 pub mod repomap;
 pub mod scanner;
 pub mod security;
+pub mod selection;
+pub mod slice;
 pub mod threads;
 pub mod tokens;
 

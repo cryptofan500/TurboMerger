@@ -253,7 +253,9 @@ function App() {
         event.payload.type === "drop" &&
         event.payload.paths.length > 0
       ) {
-        changeSource(event.payload.paths[0]);
+        const dropPath = event.payload.paths[0];
+        changeSource(dropPath);
+        handleScan(dropPath, false);
       }
     });
     return () => { p.then((f) => f()); };
@@ -281,7 +283,10 @@ function App() {
 
   const selectSource = async () => {
     const selected = await open({ directory: true, multiple: false, title: "Select Codebase to Merge" });
-    if (selected && typeof selected === "string") changeSource(selected);
+    if (selected && typeof selected === "string") {
+      changeSource(selected);
+      handleScan(selected, false);
+    }
   };
 
   const selectOutput = async () => {
@@ -300,7 +305,7 @@ function App() {
     await invoke<boolean>("cancel_job", { job: jobId }).catch(console.error);
   };
 
-  const buildOptions = () => {
+  const buildOptions = (src?: string) => {
     const toList = (s: string) => s.split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
     // Exact include list only when the user actually excluded something in
     // the curate panel for THIS source.
@@ -309,7 +314,7 @@ function App() {
         ? scanReport.included.map((e) => e.path).filter((p) => !excluded.has(p))
         : null;
     return {
-      folder_path: sourcePath,
+      folder_path: src ?? sourcePath,
       output_path: outputPath || null,
       include_venv: includeVenv,
       include_tree: includeTree,
@@ -370,8 +375,9 @@ function App() {
     }
   };
 
-  const handleScan = async () => {
-    if (!sourcePath || isRemote) return;
+  const handleScan = async (overridePath?: string, openModal = true) => {
+    const target = overridePath ?? sourcePath;
+    if (!target || isRemote) return;
     const job = newJobId();
     try {
       setJobId(job);
@@ -379,7 +385,7 @@ function App() {
       setError(null);
       setProgress(null);
       const report = await invoke<ScanReport>("scan_folder", {
-        options: buildOptions(),
+        options: buildOptions(target),
         job,
         progress: progressChannel(false),
       });
@@ -397,7 +403,7 @@ function App() {
           setForceInclude(new Set());
         }
       } catch { /* corrupt selection */ }
-      setCurateOpen(true);
+      if (openModal) setCurateOpen(true);
       setStatus("ready");
     } catch (err) {
       const msg = String(err);
@@ -407,6 +413,67 @@ function App() {
       setJobId(null);
       setProgress(null);
     }
+  };
+
+  const applyDropDumps = () => {
+    if (!scanReport) return;
+    const next = new Set(excluded);
+    for (const e of scanReport.included) {
+      const p = e.path.toLowerCase();
+      if (
+        (p.endsWith(".json") && e.size > 500 * 1024) ||
+        p.endsWith(".sqlite") ||
+        p.endsWith(".db") ||
+        p.includes("out/fast/") ||
+        p.includes("cache/")
+      ) {
+        next.add(e.path);
+      }
+    }
+    setExcluded(next);
+  };
+
+  const applyDropMedia = () => {
+    if (!scanReport) return;
+    const next = new Set(excluded);
+    for (const e of scanReport.included) {
+      const p = e.path.toLowerCase();
+      if (
+        p.includes("podcast") ||
+        p.includes("transcript") ||
+        p.includes("audio") ||
+        p.endsWith(".mp3") ||
+        p.endsWith(".wav") ||
+        p.endsWith(".m4a")
+      ) {
+        next.add(e.path);
+      }
+    }
+    setExcluded(next);
+  };
+
+  const applyDocsAndTables = () => {
+    if (!scanReport) return;
+    const next = new Set(excluded);
+    for (const e of scanReport.included) {
+      const p = e.path.toLowerCase();
+      const isDocOrTable =
+        p.endsWith(".xlsx") ||
+        p.endsWith(".xls") ||
+        p.endsWith(".md") ||
+        p.endsWith(".markdown") ||
+        p.endsWith(".csv") ||
+        p.endsWith(".tsv") ||
+        p.endsWith(".txt");
+      if (!isDocOrTable) {
+        next.add(e.path);
+      }
+    }
+    setExcluded(next);
+  };
+
+  const applyIncludeAll = () => {
+    setExcluded(new Set());
   };
 
   const handleWatchToggle = async () => {
@@ -478,6 +545,131 @@ function App() {
             />
             <button className="btn btn-secondary" onClick={selectSource} disabled={isWorking || watching}>Browse</button>
           </div>
+          {scanReport && (
+            <>
+              <div
+                style={{
+                  marginTop: 8,
+                  padding: "8px 12px",
+                  background: "var(--bg-secondary)",
+                  borderRadius: 6,
+                  border: "1px solid var(--border)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  flexWrap: "wrap",
+                  gap: 8,
+                }}
+              >
+                <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>
+                  <strong>Files:</strong> {scanReport.included.length - excluded.size} / {scanReport.included.length} |{" "}
+                  <strong>Est. Tokens:</strong>{" "}
+                  {formatTokens(
+                    scanReport.included.reduce(
+                      (sum, e) => (excluded.has(e.path) ? sum : sum + e.tokens),
+                      0
+                    )
+                  )}{" "}
+                  | <strong>Budget:</strong>{" "}
+                  {(() => {
+                    const budgetLimit = maxTokens ? parseInt(maxTokens, 10) || 0 : 0;
+                    const activeTokens = scanReport.included.reduce(
+                      (sum, e) => (excluded.has(e.path) ? sum : sum + e.tokens),
+                      0
+                    );
+                    const isOk = budgetLimit === 0 || activeTokens <= budgetLimit;
+                    return (
+                      <span
+                        style={{
+                          color: isOk ? "var(--accent)" : "#f85149",
+                          fontWeight: 600,
+                        }}
+                      >
+                        {budgetLimit === 0
+                          ? "OK"
+                          : isOk
+                          ? "OK"
+                          : `Exceeded (${formatTokens(activeTokens)} / ${formatTokens(budgetLimit)})`}
+                      </span>
+                    );
+                  })()}
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ padding: "3px 8px", fontSize: 12 }}
+                  onClick={() => setCurateOpen(true)}
+                  disabled={isWorking}
+                >
+                  Expand Curate Tree
+                </button>
+              </div>
+
+              <div
+                style={{
+                  marginTop: 6,
+                  display: "flex",
+                  gap: 6,
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: 11,
+                    color: "var(--text-muted)",
+                    textTransform: "uppercase",
+                    fontWeight: 600,
+                    marginRight: 2,
+                  }}
+                >
+                  Quick Filter:
+                </span>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ padding: "3px 8px", fontSize: 12 }}
+                  onClick={applyDropDumps}
+                  disabled={isWorking}
+                  title="Drop JSON > 500KB, SQLite, out/fast/, cache/"
+                >
+                  Drop Dumps &amp; Caches
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ padding: "3px 8px", fontSize: 12 }}
+                  onClick={applyDropMedia}
+                  disabled={isWorking}
+                  title="Drop podcast, transcript, audio"
+                >
+                  Drop Media/Transcripts
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ padding: "3px 8px", fontSize: 12 }}
+                  onClick={applyDocsAndTables}
+                  disabled={isWorking}
+                  title="Keep only XLSX, XLS, MD, CSV, TSV, TXT"
+                >
+                  Docs &amp; Tables Only
+                </button>
+                {excluded.size > 0 && (
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ padding: "3px 8px", fontSize: 12, color: "var(--accent)" }}
+                    onClick={applyIncludeAll}
+                    disabled={isWorking}
+                    title="Reset exclusions"
+                  >
+                    Include All ({scanReport.included.length})
+                  </button>
+                )}
+              </div>
+            </>
+          )}
           {isRemote && (
             <>
               <p className="hint">
@@ -656,7 +848,7 @@ function App() {
               </button>
               <button
                 className="btn btn-secondary"
-                onClick={handleScan}
+                onClick={() => handleScan(undefined, true)}
                 disabled={!sourcePath || isRemote || watching}
                 title={isRemote ? "Curation works on local folders" : "Scan first, then curate what gets merged"}
               >

@@ -38,6 +38,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::OnceLock;
 
 mod child;
+pub mod grid;
 pub mod imgsize;
 mod legacy;
 mod ocr;
@@ -183,12 +184,27 @@ pub struct ExtractOptions<'a> {
     /// The job's cancel flag: an OCR engine still running is stopped (with
     /// everything it started) as soon as it is set.
     pub cancel: Option<&'a AtomicBool>,
+    /// TM-GRID/1 granular sheet and column projection
+    pub grid_select: Option<&'a crate::selection::GridSelect>,
+    /// TM-GRID/1 chunk row interval (default 150)
+    pub grid_chunk_rows: usize,
 }
 
 /// Extracted text plus a one-line provenance note for the Merge Report.
 pub struct Extracted {
     pub text: String,
     pub note: String,
+    pub lang: String,
+}
+
+impl Extracted {
+    pub fn plain(text: String, note: String) -> Self {
+        Self {
+            text,
+            note,
+            lang: String::new(),
+        }
+    }
 }
 
 /// Extract `path`'s text. `Err(reason)` on a broken or empty document — the
@@ -196,7 +212,7 @@ pub struct Extracted {
 pub fn extract(path: &Path, kind: DocKind, opts: &ExtractOptions<'_>) -> Result<Extracted, String> {
     match kind {
         DocKind::Pdf => extract_pdf(path, opts),
-        DocKind::Spreadsheet => extract_spreadsheet(path),
+        DocKind::Spreadsheet => extract_spreadsheet(path, opts),
         DocKind::Docx => extract_zip_xml(path, ZipXml::Docx),
         DocKind::Pptx => extract_zip_xml(path, ZipXml::Pptx),
         DocKind::Odt | DocKind::Odp => extract_zip_xml(path, ZipXml::Odf),
@@ -212,10 +228,10 @@ pub fn extract(path: &Path, kind: DocKind, opts: &ExtractOptions<'_>) -> Result<
             if text.trim().is_empty() {
                 return Err("no text in the document".into());
             }
-            Ok(Extracted {
+            Ok(Extracted::plain(
                 text,
-                note: format!("text extracted from a {}", kind.label()),
-            })
+                format!("text extracted from a {}", kind.label()),
+            ))
         }
     }
 }
@@ -461,7 +477,7 @@ fn compose_pdf(mut pages: Vec<String>, blank: &[usize], ocr: PdfOcr) -> Result<E
         if let Some((e, k)) = &ocr.error {
             note.push_str(&format!("; OCR of {} page{} failed: {e}", k, s(*k)));
         }
-        return Ok(Extracted { text, note });
+        return Ok(Extracted::plain(text, note));
     }
     match ocr.error {
         Some((e, _)) => Err(format!(
@@ -488,10 +504,10 @@ fn compose_image(read: Result<Vec<String>, String>) -> Result<Extracted, String>
     if text.trim().is_empty() {
         return Err("no text found in the image (OCR)".into());
     }
-    Ok(Extracted {
+    Ok(Extracted::plain(
         text,
-        note: "text read from the image with OCR".into(),
-    })
+        "text read from the image with OCR".into(),
+    ))
 }
 
 // --------------------------------------------------------------- OCR as a stage
@@ -650,42 +666,11 @@ pub fn finish_queued(wait: OcrWait, queue: &OcrQueue) -> Result<Extracted, Strin
 
 // ------------------------------------------------------------------- spreadsheets
 
-fn extract_spreadsheet(path: &Path) -> Result<Extracted, String> {
-    use calamine::{open_workbook_auto, Reader};
-    let mut wb = open_workbook_auto(path).map_err(|e| format!("spreadsheet open failed: {e}"))?;
-    let names = wb.sheet_names().to_vec();
-    let mut out = String::new();
-    let mut sheets = 0usize;
-    for name in &names {
-        let range = match wb.worksheet_range(name) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        if range.is_empty() {
-            continue;
-        }
-        sheets += 1;
-        if names.len() > 1 {
-            out.push_str("## ");
-            out.push_str(name);
-            out.push_str("\n\n");
-        }
-        for row in range.rows() {
-            let line: Vec<String> = row.iter().map(|c| c.to_string()).collect();
-            // Drop fully empty trailing rows' noise but keep structure.
-            out.push_str(line.join("\t").trim_end());
-            out.push('\n');
-        }
-        out.push('\n');
-    }
-    let text = out.trim();
-    if text.is_empty() {
-        return Err("spreadsheet has no cells".into());
-    }
-    Ok(Extracted {
-        text: text.to_string(),
-        note: format!("extracted from spreadsheet ({} sheet{})", sheets, s(sheets)),
-    })
+fn extract_spreadsheet(path: &Path, opts: &ExtractOptions<'_>) -> Result<Extracted, String> {
+    let empty_sel = crate::selection::GridSelect::default();
+    let sel = opts.grid_select.unwrap_or(&empty_sel);
+    let chunk_rows = if opts.grid_chunk_rows == 0 { 150 } else { opts.grid_chunk_rows };
+    grid::encode_workbook(path, sel, chunk_rows)
 }
 
 // ------------------------------------------------------------- zip-of-XML formats
@@ -766,7 +751,7 @@ fn extract_zip_xml(path: &Path, fmt: ZipXml) -> Result<Extracted, String> {
         ZipXml::Docx => "extracted from Word document".to_string(),
         ZipXml::Odf => "extracted from OpenDocument".to_string(),
     };
-    Ok(Extracted { text, note })
+    Ok(Extracted::plain(text, note))
 }
 
 fn slide_index(name: &str) -> u32 {
@@ -941,5 +926,58 @@ mod tests {
     #[test]
     fn slide_order_is_numeric() {
         assert!(slide_index("ppt/slides/slide2.xml") < slide_index("ppt/slides/slide10.xml"));
+    }
+}
+
+/// Outline a file's structure (headings in Markdown, sheets in spreadsheets).
+pub fn outline_file(path: &Path) -> Result<serde_json::Value, String> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if ext == "md" || ext == "markdown" {
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let mut headings = Vec::new();
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                let count = trimmed.chars().take_while(|&c| c == '#').count();
+                if count >= 1 && count <= 6 {
+                    let text = trimmed[count..].trim().trim_end_matches('#').trim();
+                    headings.push(serde_json::json!({
+                        "line": idx + 1,
+                        "level": count,
+                        "text": text,
+                    }));
+                }
+            }
+        }
+        Ok(serde_json::json!({
+            "file": path.display().to_string(),
+            "kind": "markdown",
+            "headings": headings,
+        }))
+    } else if matches!(ext.as_str(), "xlsx" | "xls" | "ods") {
+        use calamine::{open_workbook_auto, Reader};
+        let mut wb = open_workbook_auto(path).map_err(|e| format!("cannot open spreadsheet: {e}"))?;
+        let names = wb.sheet_names().to_vec();
+        let mut sheets = Vec::new();
+        for name in &names {
+            if let Ok(range) = wb.worksheet_range(name) {
+                let (rows, cols) = range.get_size();
+                sheets.push(serde_json::json!({
+                    "name": name,
+                    "rows": rows,
+                    "cols": cols,
+                }));
+            }
+        }
+        Ok(serde_json::json!({
+            "file": path.display().to_string(),
+            "kind": "spreadsheet",
+            "sheets": sheets,
+        }))
+    } else {
+        Ok(serde_json::json!({
+            "file": path.display().to_string(),
+            "kind": "unknown",
+        }))
     }
 }

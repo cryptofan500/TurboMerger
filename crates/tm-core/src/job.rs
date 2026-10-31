@@ -140,6 +140,27 @@ pub struct MergeOptions {
     /// `--allow-system-paths`). Never set by the MCP server.
     #[serde(default)]
     pub allow_system_paths: bool,
+    /// Selection plan TOML
+    #[serde(default)]
+    pub selection: Option<crate::selection::SelectionPlan>,
+    /// Exact relative paths to exclude from merge
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
+    /// Exact relative directory prefixes to exclude from merge
+    #[serde(default)]
+    pub exclude_dirs: Vec<String>,
+    /// TM-GRID/1 table chunk row interval (default 150)
+    #[serde(default)]
+    pub grid_chunk_rows: usize,
+    /// Token budget ceiling
+    #[serde(default)]
+    pub budget_tokens: Option<u64>,
+    /// Archive twin complete mode
+    #[serde(default)]
+    pub complete: bool,
+    /// Embed binary files up to N MB in archive mode
+    #[serde(default)]
+    pub embed_binary: Option<u64>,
 }
 
 impl MergeOptions {
@@ -181,6 +202,13 @@ impl MergeOptions {
             ocr_all_pictures: false,
             keep_figures: false,
             allow_system_paths: false,
+            selection: None,
+            exclude_paths: Vec::new(),
+            exclude_dirs: Vec::new(),
+            grid_chunk_rows: 150,
+            budget_tokens: None,
+            complete: false,
+            embed_binary: None,
         }
     }
 }
@@ -266,11 +294,14 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         ocr_all_pictures: options.ocr_all_pictures,
     };
 
+    let ordering_str = options.selection.as_ref().and_then(|s| s.ordering.as_deref()).or(options.ordering.as_deref()).unwrap_or("path");
+    let ordering = MergeOrdering::from_str_lenient(ordering_str);
+
     let merge_config = MergeConfig {
         include_tree: options.include_tree,
         redact: options.redact_secrets,
         format,
-        ordering: MergeOrdering::from_str_lenient(options.ordering.as_deref().unwrap_or("path")),
+        ordering,
         max_tokens: options.max_tokens.filter(|&t| t > 0),
         remove_empty_lines: options.remove_empty_lines,
         truncate_base64: options.truncate_base64,
@@ -286,6 +317,11 @@ pub fn resolve_job(options: &MergeOptions) -> Result<ResolvedJob, String> {
         extract_images_text: options.extract_images_text,
         keep_figures: options.keep_figures && options.extract_images_text,
         max_file_size: config.scanning.max_file_size_mb * 1024 * 1024,
+        selection: options.selection.clone(),
+        grid_chunk_rows: if options.grid_chunk_rows == 0 { 150 } else { options.grid_chunk_rows },
+        complete: options.complete,
+        embed_binary: options.embed_binary,
+        budget_tokens: options.budget_tokens,
     };
 
     Ok(ResolvedJob {
@@ -336,6 +372,9 @@ pub fn apply_selection(
     skipped: &mut Vec<scanner::SkipEntry>,
     selected_paths: &Option<Vec<String>>,
     force_include: &[String],
+    exclude_paths: &[String],
+    exclude_dirs: &[String],
+    keep_order: bool,
 ) {
     for rel in force_include {
         let candidate = root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -359,7 +398,22 @@ pub fn apply_selection(
         let want: std::collections::HashSet<&str> = sel.iter().map(|s| s.as_str()).collect();
         files.retain(|f| want.contains(scanner::relative_display(root, f).as_str()));
     }
-    files.sort();
+    if !exclude_paths.is_empty() {
+        let unpick: std::collections::HashSet<&str> = exclude_paths.iter().map(|s| s.as_str()).collect();
+        files.retain(|f| !unpick.contains(scanner::relative_display(root, f).as_str()));
+    }
+    if !exclude_dirs.is_empty() {
+        files.retain(|f| {
+            let rel = scanner::relative_display(root, f);
+            !exclude_dirs.iter().any(|d| {
+                let clean = d.trim_end_matches('/');
+                rel == clean || rel.starts_with(&format!("{clean}/"))
+            })
+        });
+    }
+    if !keep_order {
+        files.sort();
+    }
 }
 
 /// Where a running job is.
@@ -475,23 +529,41 @@ pub fn run_merge(
             }
         })
     };
-    let scan =
+    let scan = if let Some(plan) = &options.selection {
+        if plan.mode == crate::selection::SelectionMode::Explicit {
+            let paths: Vec<String> = plan.files.iter().filter(|f| !f.exclude).map(|f| f.path.clone()).collect();
+            scanner::scan_explicit(&job.root, &paths, &job.scan_options).map_err(|e| JobError::Scan(e.to_string()))?
+        } else {
+            scanner::scan_with(&job.root, &job.scan_options, cancel.flag(), &on_scan).map_err(|e| {
+                if e.is::<Cancelled>() {
+                    JobError::Cancelled
+                } else {
+                    JobError::Scan(e.to_string())
+                }
+            })?
+        }
+    } else {
         scanner::scan_with(&job.root, &job.scan_options, cancel.flag(), &on_scan).map_err(|e| {
             if e.is::<Cancelled>() {
                 JobError::Cancelled
             } else {
                 JobError::Scan(e.to_string())
             }
-        })?;
+        })?
+    };
     let stats = scan.stats;
     let mut skipped = scan.skipped;
     let mut files = scan.files;
+    let keep_order = job.merge_config.ordering == MergeOrdering::Plan;
     apply_selection(
         &job.root,
         &mut files,
         &mut skipped,
         &options.selected_paths,
         &options.force_include,
+        &options.exclude_paths,
+        &options.exclude_dirs,
+        keep_order,
     );
     if files.is_empty() && skipped.is_empty() {
         return Err(JobError::Empty);
@@ -711,6 +783,9 @@ mod tests {
             &mut skipped,
             &None,
             &["notes.txt".to_string(), "../escape.txt".to_string()],
+            &[],
+            &[],
+            false,
         );
         assert!(files.iter().any(|f| f.ends_with("notes.txt")));
         assert!(skipped.is_empty());
@@ -723,6 +798,9 @@ mod tests {
             &mut skipped,
             &Some(vec!["a.rs".to_string(), "notes.txt".to_string()]),
             &[],
+            &[],
+            &[],
+            false,
         );
         let rels: Vec<String> = files
             .iter()
