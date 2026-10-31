@@ -375,7 +375,7 @@ where
     // batches, and remembered across runs.
     let ocr = cfg.extract_images_text.then(|| {
         let figures = cfg.keep_figures.then(|| figures_dir_for(output));
-        crate::extract::OcrQueue::with_figures(None, figures)
+        crate::extract::OcrQueue::with_figures(None, figures).staging_near(output)
     });
     let mut waiting: Vec<(usize, crate::extract::OcrWait)> = Vec::new();
 

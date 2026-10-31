@@ -25,6 +25,14 @@ Every fix ships with its repro turned into a test (96 → 156 Rust tests).
   first 8 MiB show "≈"; past 100,000 files the window points to the CLI; "Stalled on" waits
   60 s and names the file's size; the redaction switch says it can change code.
 
+### OCR staging and throughput (2026-10-31, session 8)
+
+- OCR pictures are staged in a hidden `.turbomerger-ocr-*` folder beside the output (the
+  system temp folder only when that is not writable): `/tmp` is RAM on many systems.
+- Measured, not changed: one monaddoc batch already keeps ~8.4 of 12 cores busy; two
+  engines at once read the same 24 photos 4.6 % slower with twice the memory, so OCR
+  stays one engine at a time.
+
 ### Correctness fixes (2026-10-30, session 8)
 
 - A parser crash on one malformed file no longer aborts the whole merge: release builds

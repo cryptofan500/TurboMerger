@@ -422,6 +422,9 @@ pub struct OcrQueue {
     /// Figure crops are kept beside the output (`--keep-figures`).
     figures: Option<Figures>,
     staging: OnceLock<Result<tempfile::TempDir, String>>,
+    /// Where the staging folder goes first: beside the output (S8, DeepSeek
+    /// A4) — `/tmp` is RAM on many systems and in the stateless launchers.
+    staging_near: Option<PathBuf>,
     folders: AtomicUsize,
     inner: Mutex<Inner>,
     batch_pages: usize,
@@ -470,6 +473,7 @@ impl OcrQueue {
             cache: cache_dir(),
             figures,
             staging: OnceLock::new(),
+            staging_near: None,
             folders: AtomicUsize::new(0),
             inner: Mutex::new(Inner::default()),
             batch_pages: std::env::var("TURBOMERGER_OCR_BATCH")
@@ -478,6 +482,16 @@ impl OcrQueue {
                 .filter(|&n| n > 0)
                 .unwrap_or(BATCH_PAGES),
         }
+    }
+
+    /// Stage pictures in a folder beside `output` (its parent), falling back
+    /// to the system temporary folder (`TMPDIR`) when that is not writable.
+    pub fn staging_near(mut self, output: &Path) -> OcrQueue {
+        self.staging_near = output
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -519,9 +533,12 @@ impl OcrQueue {
     fn staging(&self) -> Result<&Path, String> {
         self.staging
             .get_or_init(|| {
-                tempfile::Builder::new()
-                    .prefix("turbomerger-ocr-")
-                    .tempdir()
+                let mut b = tempfile::Builder::new();
+                b.prefix(".turbomerger-ocr-");
+                self.staging_near
+                    .as_deref()
+                    .and_then(|dir| b.tempdir_in(dir).ok())
+                    .map_or_else(|| b.tempdir(), Ok)
                     .map_err(|e| format!("OCR: no temporary folder: {e}"))
             })
             .as_ref()
@@ -1165,6 +1182,21 @@ fn sha256_file(path: &Path) -> std::io::Result<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_goes_beside_the_output() {
+        // S8 4.2 (DeepSeek A4): pictures were staged in the system temp
+        // folder, which is RAM on many hosts and in the stateless launchers.
+        let out_dir = tempfile::tempdir().unwrap();
+        let q = OcrQueue::new(None).staging_near(&out_dir.path().join("x.md"));
+        assert_eq!(q.staging().unwrap().parent(), Some(out_dir.path()));
+        #[cfg(target_os = "linux")]
+        {
+            // Not writable: the system temporary folder instead.
+            let q = OcrQueue::new(None).staging_near(Path::new("/proc/x.md"));
+            assert!(q.staging().unwrap().starts_with(std::env::temp_dir()));
+        }
+    }
 
     #[test]
     fn monaddoc_markdown_splits_into_clean_pages() {
