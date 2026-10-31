@@ -8,6 +8,17 @@ Stops the silent content loss, corruption and write-anywhere paths found in the
 2026-09-24 audit (`TURBOMERGER_refactor_september24_2026_v2.md`, findings N-xx).
 Every fix ships with its repro turned into a test (96 → 156 Rust tests).
 
+### PDF determinism and CLI matrix (2026-10-31, session 11)
+
+- A malformed PDF that panics inside pdf_oxide no longer garbles the PDFs parsed after
+  it on the same worker thread (pdf_oxide keeps its object-resolver stack per thread and
+  a panic skips the pop: false "circular reference" errors, lost fonts, raw glyph codes).
+  A thread that saw a parser panic hands every later PDF to a short-lived thread.
+  Reproduced deterministically (3 of 120 arxiv PDFs, one worker thread) and gone; five
+  default-thread runs of a 3.31 GiB corpus are byte-identical.
+- `--checkpoint`/`--resume` with a remote source is refused (exit 2) before anything is
+  cloned.
+
 ### Resume and scanner memory (2026-10-31, session 10)
 
 - `--checkpoint` / `--resume` (ADR 0024): a stopped merge continues where it stopped.
