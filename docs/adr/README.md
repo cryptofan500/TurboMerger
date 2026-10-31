@@ -30,3 +30,4 @@ to their replacement.
 | [0021](0021-tm-grid-spreadsheet-text.md) | TM-GRID/1: spreadsheets as text that keeps every cell in its column | Accepted — implemented |
 | [0022](0022-desktop-guards-memory-and-ocr-parallelism.md) | Desktop guards, memory after a job, one OCR engine at a time | Accepted — implemented |
 | [0023](0023-pieces-max-tokens-contract.md) | Pieces: `--max-tokens` is a contract, one file may span parts | Accepted — implemented |
+| [0024](0024-checkpoint-and-resume.md) | Checkpoint and resume for long merges | Accepted — implemented |

@@ -8,6 +8,19 @@ Stops the silent content loss, corruption and write-anywhere paths found in the
 2026-09-24 audit (`TURBOMERGER_refactor_september24_2026_v2.md`, findings N-xx).
 Every fix ships with its repro turned into a test (96 → 156 Rust tests).
 
+### Resume and scanner memory (2026-10-31, session 10)
+
+- `--checkpoint` / `--resume` (ADR 0024): a stopped merge continues where it stopped.
+  The checkpoint (`OUT.tm-checkpoint/`: named spool + journal) is removed once the
+  output is written. Proven: SIGKILL at 50 % then `--resume` gives the same bytes as an
+  uninterrupted run (1 M files: 31.6 s instead of 54.9 s).
+- Scanner: the set walk 2 uses to tell ignored entries from seen ones holds 128-bit XXH3
+  keys instead of paths and is built only when walk 2 can run; the symlink lookup set
+  only when there is a symlink. 1 M files: scanner peak 493 → 259 MB, full JSON merge
+  542 → 435 MB.
+- Tests: three superseded tests removed (coverage unchanged, 15,151 lines compared),
+  six added; 303 passed.
+
 ### Archive twin and ISO dates (2026-10-31, session 9)
 
 - `--max-tokens N` is a contract: a file larger than one part is split into pieces that

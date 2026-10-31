@@ -360,6 +360,7 @@ docs/adr/                    architecture decision records
 | `--list-only`, `--emit-selection FILE` | Show / save what would be merged, as a plan you can edit. |
 | `--budget-tokens N` | Exit 5 if the output would be over N tokens. |
 | `outline FILE` | Headings of a Markdown file, sheets of a workbook — to write selectors. |
+| `--checkpoint` / `--resume` | Keep `OUT.tm-checkpoint/` beside the output so a stopped run (Ctrl-C, kill, crash, deadline) continues with `--resume`: files unchanged since (size and modification time) are not read again and the output equals an uninterrupted run's. Not with `--redact`; needs an explicit OUTPUT (ADR 0024). |
 | `--complete [--embed-binary MB]` | Archive twin (Markdown only): a manifest plus the bytes of every file its text cannot rebuild, so `scripts/e2e/tm_verify.py restore` rebuilds each file byte for byte. A file that cannot come back (over the cap, withheld under `--redact`, unreadable) is named and the exit code is 3. |
 | `--max-tokens N` | Parts of at most N tokens; a file larger than a part is split into pieces `path (piece k/n)` that join back into its exact text ([ADR 0023](docs/adr/0023-pieces-max-tokens-contract.md)). |
 | `restore ARCHIVE… --dest DIR [--overwrite] [--check]` | Rebuild every file of an archive twin under DIR, byte for byte: every part required, all or nothing, never outside DIR or through a symlink, never over a different existing file without `--overwrite` (exit 3). `--check` verifies without writing. |
