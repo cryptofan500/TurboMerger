@@ -66,12 +66,6 @@ impl Spool {
         })
     }
 
-    /// Everything appended so far is on disk (written and `fdatasync`ed).
-    pub(crate) fn sync(&mut self) -> io::Result<()> {
-        self.flush()?;
-        self.file.sync_data()
-    }
-
     pub(crate) fn append(&mut self, text: &str) -> io::Result<Span> {
         if !self.buf.is_empty() && self.buf.len() + text.len() > BUFFER {
             self.flush()?;

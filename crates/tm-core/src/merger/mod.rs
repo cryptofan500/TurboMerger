@@ -530,6 +530,11 @@ where
         &mut |next| -> Result<()> {
             let (i, p) = match next {
                 Next::Waiting { finished, oldest } => {
+                    // Waiting on a slow file: what is finished goes to the
+                    // journal meanwhile (S10: a journal waits for no file).
+                    if let Some(c) = ck.as_mut() {
+                        c.tick(&mut spool)?;
+                    }
                     // The stall line names the file the merge waits on
                     // longest, not the first of a batch.
                     let current = oldest
@@ -583,6 +588,11 @@ where
             dense_candidates.extend(p.dense);
             done += 1;
             if p.stream {
+                // A streamed file can take minutes: journal what is finished
+                // before it (S10: a 1 GiB log held 22 s of entries back).
+                if let Some(c) = ck.as_mut() {
+                    c.flush(&mut spool)?;
+                }
                 // Archives, big gzip and files past `STREAM_ABOVE`: segment by
                 // segment straight into the spool, in this file's place in
                 // the order, so no size is too big and memory stays bounded.
@@ -1012,6 +1022,12 @@ where
     // The outputs are in place: the checkpoint has done its job — unless the
     // run finished early, when it is what the next --resume continues from.
     if let Some(c) = ck {
+        if c.failed_check > 0 {
+            outcome.notes.push(format!(
+                "checkpoint: {} journaled file(s) no longer matched the spool (power loss?) and were read again",
+                c.failed_check
+            ));
+        }
         if c.resumed > 0 {
             outcome.notes.push(format!(
                 "resumed: {} of {} files came from the checkpoint, the rest were read",
@@ -1052,7 +1068,7 @@ fn journal(
     skip: Option<&SkipEntry>,
 ) -> std::io::Result<()> {
     if let (Some(c), Some(stamp), false) = (ck.as_mut(), stamp, cancelled(cancel)) {
-        if let Some(e) = checkpoint::Entry::new(key, stamp, blocks, skip) {
+        if let Some(e) = checkpoint::Entry::new(key, stamp, blocks, skip, spool)? {
             c.record(&e, spool)?;
         }
     }

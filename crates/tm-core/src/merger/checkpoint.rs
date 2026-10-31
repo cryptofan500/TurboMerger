@@ -11,9 +11,13 @@
 //! `a_killed_run_resumes_to_the_same_bytes`, `a_changed_file_is_read_again`).
 //! The folder is removed once the outputs are in place.
 //!
-//! The journal is written only after the spool bytes it names are on disk
-//! (write + `fdatasync`), at most every [`FLUSH_EVERY`]; a torn last line is
-//! the worst a crash leaves, and it is ignored. Line 1 is a header with a
+//! A journal line is written only after the spool bytes it names were
+//! written, every [`FLUSH_EVERY`] and before each streamed (long) file; a
+//! killed process loses nothing the kernel already holds, and a torn last
+//! line is ignored. There is no `fdatasync` (it cost 28 % of the run on the
+//! S10 corpus): after a power loss the spool may lack bytes a journal line
+//! names, so every block carries the XXH3-64 of its text and `--resume`
+//! checks it — a file whose check fails is read again. Line 1 is a header with a
 //! fingerprint of everything that shapes a file's text (version, the
 //! executable, the root, the content options); `--resume` refuses a
 //! checkpoint made with anything else rather than mix two runs.
@@ -46,10 +50,10 @@ const TAG_TEXT: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
 # TurboMerger checkpoint (merge --checkpoint / --resume); removed when the merge is written.\n\
 # Cache directory tag: https://bford.info/cachedir/\n";
 /// Journal format: another one is refused, never guessed at.
-const FORMAT: u32 = 1;
-/// Journal lines go to disk at least this often (and at the end of the text
-/// stage, and on Ctrl-C).
-const FLUSH_EVERY: Duration = Duration::from_secs(5);
+const FORMAT: u32 = 2;
+/// Journal lines are written at least this often (and before each streamed
+/// file, at the end of the text stage, and on Ctrl-C).
+const FLUSH_EVERY: Duration = Duration::from_secs(2);
 /// …or when this much is waiting, so memory stays bounded.
 const FLUSH_BYTES: usize = 32 << 20;
 
@@ -125,6 +129,8 @@ struct JBlock {
     len: u64,
     lang: String,
     tokens: usize,
+    /// XXH3-64 of the block's text in the spool.
+    xxh: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     note: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -172,13 +178,15 @@ impl Entry {
         stamp: Stamp,
         blocks: &[Block],
         skip: Option<&SkipEntry>,
-    ) -> Option<Entry> {
+        spool: &Spool,
+    ) -> io::Result<Option<Entry>> {
         let mut out = Vec::with_capacity(blocks.len());
         for b in blocks {
             if !b.redactions.is_empty() || b.synthetic || b.piece.is_some() {
-                return None;
+                return Ok(None);
             }
             out.push(JBlock {
+                xxh: twox_hash::XxHash3_64::oneshot(spool.read(b.span)?.as_bytes()),
                 rel: b.relative.clone(),
                 off: b.span.offset,
                 len: b.span.len,
@@ -188,7 +196,7 @@ impl Entry {
                 compressed: b.compressed,
             });
         }
-        Some(Entry {
+        Ok(Some(Entry {
             path,
             size: stamp.size,
             mtime_ns: stamp.mtime_ns,
@@ -198,7 +206,7 @@ impl Entry {
                 reason: s.reason.clone(),
                 kind: kind_name(s.kind).into(),
             }),
-        })
+        }))
     }
 
     /// The blocks and the skip, as the merge holds them.
@@ -246,6 +254,8 @@ pub(super) struct Checkpoint {
     pub(super) resumed: usize,
     /// Files the checkpoint held when it was opened.
     pub(super) found: usize,
+    /// Journaled files whose spool bytes failed their check (read again).
+    pub(super) failed_check: usize,
 }
 
 impl Checkpoint {
@@ -274,6 +284,7 @@ impl Checkpoint {
         let jpath = dir.join(JOURNAL);
         let spath = dir.join(SPOOL);
         let mut kept: HashMap<String, Entry> = HashMap::new();
+        let mut failed_check = 0;
         if cfg.resume && jpath.is_file() {
             let spool_len = std::fs::metadata(&spath).map(|m| m.len()).unwrap_or(0);
             let (header, entries) = read_journal(&jpath)?;
@@ -288,13 +299,26 @@ impl Checkpoint {
                 None => {}
             }
             for e in entries {
-                // A later line for the same file wins; a span past the
-                // spool's end (it cannot happen, but a copied folder…) never
-                // comes back.
-                if e.end() <= spool_len {
-                    kept.insert(e.path.clone(), e);
-                }
+                // A later line for the same file wins.
+                kept.insert(e.path.clone(), e);
             }
+            // Every kept block must still be in the spool, byte for byte
+            // (a power loss can drop bytes a journal line names).
+            let check = Spool::at(&spath, spool_len)?;
+            kept.retain(|_, e| {
+                let ok = e.end() <= spool_len
+                    && e.blocks.iter().all(|b| {
+                        let span = Span {
+                            offset: b.off,
+                            len: b.len,
+                        };
+                        check
+                            .read(span)
+                            .is_ok_and(|t| twox_hash::XxHash3_64::oneshot(t.as_bytes()) == b.xxh)
+                    });
+                failed_check += usize::from(!ok);
+                ok
+            });
         }
         let end = kept.values().map(Entry::end).max().unwrap_or(0);
         // The journal is rewritten with what it keeps (header first), then
@@ -336,6 +360,7 @@ impl Checkpoint {
                 kept,
                 resumed: 0,
                 found,
+                failed_check,
             },
             spool,
         ))
@@ -358,16 +383,23 @@ impl Checkpoint {
         Ok(())
     }
 
-    /// Put the spool, then the waiting journal lines, on disk.
+    /// Write the spool's buffer, then the waiting journal lines.
     pub(super) fn flush(&mut self, spool: &mut Spool) -> io::Result<()> {
         self.last_flush = Instant::now();
         if self.pending.is_empty() {
             return Ok(());
         }
-        spool.sync()?;
+        spool.flush()?;
         self.journal.write_all(&self.pending)?;
-        self.journal.sync_data()?;
         self.pending.clear();
+        Ok(())
+    }
+
+    /// Flush when the interval is over (the merge calls this while it waits).
+    pub(super) fn tick(&mut self, spool: &mut Spool) -> io::Result<()> {
+        if self.last_flush.elapsed() >= self.every {
+            self.flush(spool)?;
+        }
         Ok(())
     }
 
@@ -467,12 +499,24 @@ mod tests {
 
     #[test]
     fn entries_round_trip_and_only_plain_blocks_are_journaled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spool = Spool::at(&tmp.path().join("s"), 0).unwrap();
+        spool.append("12345abc").unwrap();
         let stamp = Stamp {
             size: 3,
             mtime_ns: 9,
         };
         let skip = SkipEntry::new("a.bin", "binary content", SkipKind::Binary);
-        let e = Entry::new("a.rs".into(), stamp, &[block("a.rs", 5, 3)], Some(&skip)).unwrap();
+        let e = Entry::new(
+            "a.rs".into(),
+            stamp,
+            &[block("a.rs", 5, 3)],
+            Some(&skip),
+            &spool,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(e.blocks[0].xxh, twox_hash::XxHash3_64::oneshot(b"abc"));
         let line = serde_json::to_string(&e).unwrap();
         let back: Entry = serde_json::from_str(&line).unwrap();
         let (blocks, skip) = back.restore();
@@ -497,7 +541,9 @@ mod tests {
         }
         let mut redacted = block("b.rs", 0, 1);
         redacted.redactions.push(("token", 1));
-        assert!(Entry::new("b.rs".into(), stamp, &[redacted], None).is_none());
+        assert!(Entry::new("b.rs".into(), stamp, &[redacted], None, &spool)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -515,16 +561,15 @@ mod tests {
             size: 1,
             mtime_ns: 1,
         };
-        for (i, name) in ["a", "b"].iter().enumerate() {
+        for (i, name) in ["a", "b", "d"].iter().enumerate() {
             let span = spool.append("xy").unwrap();
             assert_eq!(span.offset, 2 * i as u64);
             let mut b = block(name, span.offset, span.len);
             b.utf8_note = None;
-            ck.record(
-                &Entry::new((*name).into(), stamp, &[b], None).unwrap(),
-                &mut spool,
-            )
-            .unwrap();
+            let e = Entry::new((*name).into(), stamp, &[b], None, &spool)
+                .unwrap()
+                .unwrap();
+            ck.record(&e, &mut spool).unwrap();
         }
         // A second run cannot open the checkpoint while this one holds it.
         let again = MergeConfig {
@@ -534,20 +579,27 @@ mod tests {
         assert!(Checkpoint::open(&out, &root, &again).is_err());
         ck.flush(&mut spool).unwrap();
         drop((ck, spool));
-        // A torn write after the two entries: half a line.
+        // After a power loss the spool may lack bytes a line names: one
+        // byte of b's text changes on disk.
+        let s = tmp.path().join("out.md.tm-checkpoint").join(SPOOL);
+        let mut bytes = std::fs::read(&s).unwrap();
+        bytes[2] = b'Q';
+        std::fs::write(&s, bytes).unwrap();
+        // A torn write after the three entries: half a line.
         let j = tmp.path().join("out.md.tm-checkpoint").join(JOURNAL);
         let mut f = OpenOptions::new().append(true).open(&j).unwrap();
         f.write_all(br#"{"path":"c","size":1,"mt"#).unwrap();
         drop(f);
         let (mut ck, spool) = Checkpoint::open(&out, &root, &again).unwrap();
-        assert_eq!(ck.found, 2);
+        assert_eq!((ck.found, ck.failed_check), (2, 1), "b fails its check");
+        assert!(ck.take("b", Some(stamp)).is_none());
         assert!(ck.take("a", Some(stamp)).is_some());
         let changed = Stamp {
             size: 1,
             mtime_ns: 2,
         };
         assert!(
-            ck.take("b", Some(changed)).is_none(),
+            ck.take("d", Some(changed)).is_none(),
             "a changed file is read again"
         );
         assert!(ck.take("c", Some(stamp)).is_none());
