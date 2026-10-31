@@ -31,6 +31,7 @@
 //! CLI's `__worker pdf` process). A worker that runs out of memory or
 //! crashes takes only itself down; the file is reported, the merge goes on.
 
+use std::cell::Cell;
 use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
@@ -296,54 +297,62 @@ pub fn pdf_pages(path: &Path) -> Result<Vec<String>, String> {
 /// whole PDF is read instead).
 pub fn pdf_parse(path: &Path, pictures: Option<&Path>) -> Result<PdfParse, String> {
     // pdf_oxide keeps resolver state per THREAD, not per document
-    // (`RESOLVING_STACK`, `RECURSION_DEPTH`, pdf_oxide 0.3.78 document.rs:329).
-    // A malformed PDF that panics leaves entries behind; the next document on
-    // that pool thread then gets false "circular reference" errors and loses
-    // fonts — raw glyph codes on a page, depending on which PDF ran there next
-    // (S11, HANDOFF_S8 §9: 3 of 120 arxiv PDFs, every time, with one thread).
-    // Each PDF is parsed on its own short-lived thread, so that state starts
-    // empty and dies with the document. The thread inherits the worker's
-    // lowered CPU and I/O priority.
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name("tm-pdf".into())
-            .stack_size(PDF_THREAD_STACK)
-            .spawn_scoped(scope, || pdf_parse_on_this_thread(path, pictures))
-            .map_err(|e| format!("PDF parse failed: no parser thread: {e}"))?
-            .join()
-            .unwrap_or_else(|_| Err("PDF parser panicked on a malformed file".into()))
-    })
+    // (`RESOLVING_STACK`, `RECURSION_DEPTH`, pdf_oxide 0.3.78 document.rs:329),
+    // pushed and popped around each object load. Only a panic skips the pop:
+    // the entries stay, and the next document on that thread gets false
+    // "circular reference" errors and loses fonts — raw glyph codes on a page,
+    // depending on which PDF runs there next (S11, HANDOFF_S8 §9: 3 of 120
+    // arxiv PDFs every time with one thread). So a thread that saw a parser
+    // panic parses no more PDFs itself: each goes to a short-lived thread whose
+    // state starts empty (it inherits the worker's lowered priority).
+    if PDF_THREAD_TAINTED.with(Cell::get) {
+        return std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("tm-pdf".into())
+                .stack_size(PDF_THREAD_STACK)
+                .spawn_scoped(scope, || pdf_parse_here(path, pictures).0)
+                .map_err(|e| format!("PDF parse failed: no parser thread: {e}"))?
+                .join()
+                .unwrap_or_else(|_| Err("PDF parser panicked on a malformed file".into()))
+        });
+    }
+    let (result, panicked) = pdf_parse_here(path, pictures);
+    if panicked {
+        PDF_THREAD_TAINTED.with(|t| t.set(true));
+    }
+    result
 }
 
-/// Stack of the per-PDF parser thread: generous, since only the pages it
-/// touches are ever resident.
+/// Stack of a fresh parser thread: generous, only touched pages are resident.
 const PDF_THREAD_STACK: usize = 16 << 20;
+
+thread_local! {
+    /// A pdf_oxide panic happened on this thread (see [`pdf_parse`]).
+    static PDF_THREAD_TAINTED: Cell<bool> = const { Cell::new(false) };
+}
 
 #[cfg(debug_assertions)]
 thread_local! {
-    /// Debug builds: PDFs parsed on this thread — never more than one.
-    static PDFS_ON_THIS_THREAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Debug builds: PDFs whose parse ran on this thread (tests read it).
+    static PDFS_PARSED_HERE: Cell<u32> = const { Cell::new(0) };
 }
 
-fn pdf_parse_on_this_thread(path: &Path, pictures: Option<&Path>) -> Result<PdfParse, String> {
+/// Debug builds: a file of this name panics inside the parse (tests only).
+#[cfg(debug_assertions)]
+const PANIC_HOOK_NAME: &str = "tm-test-pdf-parser-panic.pdf";
+
+/// The parse on the calling thread, and whether pdf_oxide panicked.
+fn pdf_parse_here(path: &Path, pictures: Option<&Path>) -> (Result<PdfParse, String>, bool) {
     #[cfg(debug_assertions)]
-    {
-        let n = PDFS_ON_THIS_THREAD.with(|c| {
-            c.set(c.get() + 1);
-            c.get()
-        });
-        // An assertion with a message instead of a panic: the merge names it.
-        if n != 1 {
-            return Err(format!(
-                "PDF parsed on a thread that already parsed {} PDF(s)",
-                n - 1
-            ));
-        }
-    }
+    PDFS_PARSED_HERE.with(|c| c.set(c.get() + 1));
     let owned = path.to_path_buf();
     // A malformed PDF must not panic the merge (debug/test: caught here;
     // release is panic=abort — see the module note).
     let parsed = catch_unwind(AssertUnwindSafe(|| -> Result<PdfParse, String> {
+        #[cfg(debug_assertions)]
+        if owned.file_name().and_then(|n| n.to_str()) == Some(PANIC_HOOK_NAME) {
+            panic!("pdf parser panic hook (debug test)");
+        }
         let doc = pdf_oxide::PdfDocument::open(&owned).map_err(|e| e.to_string())?;
         let pages = doc.page_count().map_err(|e| e.to_string())?;
         let mut out = PdfParse {
@@ -371,9 +380,9 @@ fn pdf_parse_on_this_thread(path: &Path, pictures: Option<&Path>) -> Result<PdfP
         Ok(out)
     }));
     match parsed {
-        Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(format!("PDF parse failed: {e}")),
-        Err(_) => Err("PDF parser panicked on a malformed file".into()),
+        Ok(Ok(v)) => (Ok(v), false),
+        Ok(Err(e)) => (Err(format!("PDF parse failed: {e}")), false),
+        Err(_) => (Err("PDF parser panicked on a malformed file".into()), true),
     }
 }
 
@@ -964,6 +973,33 @@ pub fn outline_file(path: &Path) -> Result<serde_json::Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn after_a_parser_panic_this_thread_parses_no_more_pdfs() {
+        // S11 (HANDOFF_S8 §9): pdf_oxide's per-thread resolver state stays
+        // dirty after a panic; later PDFs must not be parsed on that thread.
+        let tmp = tempfile::tempdir().unwrap();
+        let junk = tmp.path().join("a.pdf");
+        std::fs::write(&junk, "%PDF-1.7\nnot really\n").unwrap();
+        let boom = tmp.path().join(PANIC_HOOK_NAME);
+        std::fs::write(&boom, "%PDF-1.7\n").unwrap();
+        let here = || PDFS_PARSED_HERE.with(Cell::get);
+        let n0 = here();
+        let _ = pdf_parse(&junk, None);
+        assert_eq!(here(), n0 + 1, "a clean thread parses in place");
+        let err = pdf_parse(&boom, None).unwrap_err();
+        assert!(err.contains("panicked"), "{err}");
+        assert!(PDF_THREAD_TAINTED.with(Cell::get));
+        let n1 = here();
+        for _ in 0..3 {
+            let _ = pdf_parse(&junk, None);
+        }
+        assert_eq!(
+            here(),
+            n1,
+            "after the panic every parse ran on a fresh thread"
+        );
+    }
 
     #[test]
     fn ext_mapping() {
