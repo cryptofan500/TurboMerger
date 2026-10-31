@@ -150,7 +150,8 @@ fn build_secrets(root: &Path) {
     );
 }
 
-/// Eight ~1.2k-token files and one larger than a whole 3,000-token part.
+/// Eight ~1.2k-token files and one larger than a whole 3,000-token part
+/// (since S9 it is split into `(piece k/n)` blocks, ADR 0023).
 fn build_split(root: &Path) {
     for i in 0..8 {
         let body: String = (0..60)

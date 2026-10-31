@@ -447,6 +447,7 @@ fn emit_segment(
         // Continuations and archive members are output, not files on disk:
         // the project tree lists the file once, from its first segment.
         synthetic: member || part > 1,
+        piece: None,
     };
     (sink.emit)(block, &text).map_err(|e| format!("spool write failed: {e}"))?;
     out.blocks += 1;

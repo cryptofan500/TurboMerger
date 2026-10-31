@@ -187,6 +187,7 @@ pub(super) fn git_context_blocks(
                 redactions,
                 compressed: false,
                 synthetic: true,
+                piece: None,
             },
             content,
         ));

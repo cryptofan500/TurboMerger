@@ -10,6 +10,12 @@ Every fix ships with its repro turned into a test (96 → 156 Rust tests).
 
 ### Archive twin and ISO dates (2026-10-31, session 9)
 
+- `--max-tokens N` is a contract: a file larger than one part is split into pieces that
+  each fit (`path (piece k/n)`; `, line continues` when cut inside a line), cut before a
+  TM-GRID `@sheet`/`@cont` line or after a blank line where possible. Joined in order the
+  pieces are the file's exact text; `tm_verify.py` joins them (`--merged` takes every
+  part) and `restore` rebuilds split files across parts (ADR 0023). Before: a 47,079-token
+  part for a 4,000-token budget; after: 33 parts of at most 4,000 tokens.
 - **Security fix:** with `--complete --redact --embed-binary`, a redacted file's original
   bytes were embedded as base64, so the secret came back from the twin. Under `--redact`
   the twin embeds no source bytes; such files are `withheld`, named, and the exit code is 3.

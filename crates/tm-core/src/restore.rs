@@ -75,6 +75,9 @@ struct Index {
     /// `## <header>` blocks; a later block with the same header wins (a
     /// file named like the tree heading comes after the tree).
     text: HashMap<String, Span>,
+    /// `## <header> (piece k/n)` blocks of a file split to fit --max-tokens:
+    /// (k, n, ends inside a line, span).
+    pieces: HashMap<String, Vec<(u32, u32, bool, Span)>>,
     /// `## __binary__: <header>` blocks.
     binary: HashMap<String, Span>,
     /// A second embedded block for the same path (checked after the parts).
@@ -105,7 +108,7 @@ pub fn restore(
     // Check every entry before anything is written.
     let mut seen: HashMap<&str, ()> = HashMap::new();
     let mut lower: BTreeMap<String, &str> = BTreeMap::new();
-    let mut work: Vec<(&Entry, Span, bool)> = Vec::new(); // (entry, block, is_text)
+    let mut work: Vec<(&Entry, Vec<Span>, bool)> = Vec::new(); // (entry, blocks, is_text)
     for e in &index.entries {
         safe_relative(&e.path).map_err(|why| format!("{}: {why} — nothing was written", e.path))?;
         if seen.insert(&e.path, ()).is_some() {
@@ -130,9 +133,14 @@ pub fn restore(
                     .not_restorable
                     .push((e.path.clone(), format!("{}: {}", e.kind, e.reason)));
             }
-            "text" => match index.text.get(&head) {
-                Some(&span) => work.push((e, span, true)),
-                None => {
+            "text" => match (index.text.get(&head), index.pieces.get(&head)) {
+                (Some(&span), _) => work.push((e, vec![span], true)),
+                (None, Some(pieces)) => {
+                    let spans = joined_pieces(pieces)
+                        .map_err(|why| format!("{}: {why} — nothing was written", e.path))?;
+                    work.push((e, spans, true));
+                }
+                (None, None) => {
                     return Err(format!(
                         "{}: its text block is not in these parts — nothing was written",
                         e.path
@@ -140,7 +148,7 @@ pub fn restore(
                 }
             },
             "binary" => match index.binary.get(&head) {
-                Some(&span) => work.push((e, span, false)),
+                Some(&span) => work.push((e, vec![span], false)),
                 None => {
                     return Err(format!(
                         "{}: its embedded bytes are not in these parts — nothing was written",
@@ -158,7 +166,7 @@ pub fn restore(
     }
 
     // What is already there: identical files stay, different ones conflict.
-    let mut todo: Vec<(&Entry, Span, bool, PathBuf)> = Vec::new();
+    let mut todo: Vec<(&Entry, Vec<Span>, bool, PathBuf)> = Vec::new();
     for (e, span, is_text) in work {
         let target = dest.join(native(&e.path));
         if let Some(bad) = symlink_on_the_way(dest, &e.path) {
@@ -197,7 +205,7 @@ pub fn restore(
     let mut staged: Vec<(PathBuf, PathBuf, u32)> = Vec::new();
     let mut made_dirs: Vec<PathBuf> = Vec::new();
     let result = (|| -> Result<(), String> {
-        for (e, (part, start, end), is_text, target) in &todo {
+        for (e, spans, is_text, target) in &todo {
             let mut out: Box<dyn Write> = if opts.check_only {
                 Box::new(std::io::sink())
             } else {
@@ -216,11 +224,11 @@ pub fn restore(
                 Box::new(std::io::BufWriter::new(file))
             };
             let mut hashing = Hashing::new(&mut out);
-            let src = &mut readers[*part];
+            let mut src = BufReader::with_capacity(1 << 20, Spans::new(&mut readers, spans));
             let decoded = if *is_text {
-                rebuild_text(src, *start, *end, &e.eol, e.final_newline, &mut hashing)
+                rebuild_text(&mut src, &e.eol, e.final_newline, &mut hashing)
             } else {
-                decode_base64(src, *start, *end, &mut hashing)
+                decode_base64(&mut src, &mut hashing)
             };
             decoded.map_err(|err| format!("{}: {err}", e.path))?;
             let (n, sha) = hashing.finish();
@@ -390,7 +398,16 @@ fn index_parts(parts: &[PathBuf]) -> Result<Index, String> {
                             index.doubled.push(name.to_string());
                         }
                     } else {
-                        index.text.insert(h.clone(), span);
+                        match piece_of(h) {
+                            Some((base, k, n, cont)) => index
+                                .pieces
+                                .entry(base.to_string())
+                                .or_default()
+                                .push((k, n, cont, span)),
+                            None => {
+                                index.text.insert(h.clone(), span);
+                            }
+                        }
                     }
                     header = None;
                 }
@@ -636,29 +653,94 @@ impl Write for Hashing<'_> {
     }
 }
 
-fn block_lines(
-    src: &mut File,
-    start: u64,
-    end: u64,
-) -> std::io::Result<BufReader<std::io::Take<&mut File>>> {
-    src.seek(SeekFrom::Start(start))?;
-    Ok(BufReader::with_capacity(1 << 20, src.take(end - start)))
+/// `header` = `<path> (piece k/n)` or `<path> (piece k/n, line continues)`.
+fn piece_of(header: &str) -> Option<(&str, u32, u32, bool)> {
+    let rest = header.strip_suffix(')')?;
+    let at = rest.rfind(" (piece ")?;
+    let (base, tail) = (&rest[..at], &rest[at + " (piece ".len()..]);
+    let (nums, cont) = match tail.strip_suffix(", line continues") {
+        Some(t) => (t, true),
+        None => (tail, false),
+    };
+    let (k, n) = nums.split_once('/')?;
+    Some((base, k.parse().ok()?, n.parse().ok()?, cont))
+}
+
+/// The spans of a split file's pieces in order — every piece once, all of
+/// one split. A piece that ends inside a line loses the newline its fence
+/// added, so the pieces read on as one text.
+fn joined_pieces(pieces: &[(u32, u32, bool, Span)]) -> Result<Vec<Span>, String> {
+    let n = pieces[0].1;
+    let mut spans = Vec::with_capacity(n as usize);
+    for k in 1..=n {
+        let mut found = pieces.iter().filter(|p| p.0 == k);
+        let (Some(&(_, pn, cont, (part, start, end))), None) = (found.next(), found.next()) else {
+            return Err(format!("piece {k}/{n} is missing or given twice"));
+        };
+        if pn != n {
+            return Err(format!("pieces of two different splits ({pn} and {n})"));
+        }
+        spans.push((part, start, if cont { end.saturating_sub(1) } else { end }));
+    }
+    if pieces.len() as u32 != n {
+        return Err(format!("{} pieces for a split into {n}", pieces.len()));
+    }
+    Ok(spans)
+}
+
+/// The content of one or more block spans, in order, as one stream.
+struct Spans<'a> {
+    files: &'a mut [File],
+    spans: &'a [Span],
+    next: usize,
+    /// The span being read: its file and the bytes left in it.
+    cur: Option<(usize, u64)>,
+}
+
+impl<'a> Spans<'a> {
+    fn new(files: &'a mut [File], spans: &'a [Span]) -> Self {
+        Spans {
+            files,
+            spans,
+            next: 0,
+            cur: None,
+        }
+    }
+}
+
+impl Read for Spans<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if let Some((part, left)) = self.cur.filter(|&(_, left)| left > 0) {
+                let want = buf.len().min(left as usize);
+                let n = self.files[part].read(&mut buf[..want])?;
+                if n == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                self.cur = Some((part, left - n as u64));
+                return Ok(n);
+            }
+            let Some(&(part, start, end)) = self.spans.get(self.next) else {
+                return Ok(0);
+            };
+            self.next += 1;
+            self.files[part].seek(SeekFrom::Start(start))?;
+            self.cur = Some((part, end - start));
+        }
+    }
 }
 
 /// A text block back to the file (the rules of `render::rebuilt_from_block`
 /// and `tm_verify.py restore`): the fence's own last newline is not part of
 /// the file, `eol` and `final_newline` come from the manifest.
 fn rebuild_text(
-    src: &mut File,
-    start: u64,
-    end: u64,
+    r: &mut impl BufRead,
     eol: &str,
     final_newline: bool,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
     let crlf = eol == "crlf";
     let sep: &[u8] = if crlf { b"\r\n" } else { b"\n" };
-    let mut r = block_lines(src, start, end)?;
     let mut line: Vec<u8> = Vec::new();
     let mut first = true;
     loop {
@@ -683,14 +765,13 @@ fn rebuild_text(
 }
 
 /// A `base64` block back to bytes, line by line.
-fn decode_base64(src: &mut File, start: u64, end: u64, out: &mut dyn Write) -> std::io::Result<()> {
+fn decode_base64(r: &mut impl BufRead, out: &mut dyn Write) -> std::io::Result<()> {
     let bad = |what: &str| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("bad base64: {what}"),
         )
     };
-    let mut r = block_lines(src, start, end)?;
     let mut line: Vec<u8> = Vec::new();
     // Digits carried to the next line when a line is not a multiple of 4.
     let mut carry: Vec<u8> = Vec::new();

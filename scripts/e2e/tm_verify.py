@@ -33,6 +33,7 @@ Run with `python3 -P` (openpyxl may be a user-site package; -P keeps the script
 folder off sys.path).
 """
 import argparse
+import atexit
 import base64
 import csv
 import datetime as dt
@@ -286,8 +287,44 @@ def parse_meta(line, prefix):
 
 # ------------------------------------------------------------- merged Markdown
 
+PIECE_RE = re.compile(r"^(.*) \(piece (\d+)/(\d+)(, line continues)?\)$")
+
+
+def join_pieces(blocks):
+    """A file split to fit --max-tokens comes as blocks `path (piece k/n)`:
+    joined back in order into one block (the exact text). A missing, doubled
+    or out-of-order piece stops the check (it cannot be verified)."""
+    out, cur = [], None
+    for b in blocks:
+        m = PIECE_RE.match(b["path"])
+        if not m:
+            if cur:
+                raise SystemExit(f"tm_verify: {cur['path']}: piece {cur['next']}/{cur['n']} is missing")
+            out.append(b)
+            continue
+        base, k, n, cont = m.group(1), int(m.group(2)), int(m.group(3)), bool(m.group(4))
+        # md_blocks drops each block's last newline; a piece that ends inside a
+        # line never had one, the last piece is read like a whole block.
+        piece = b["content"] + ("" if cont or k == n else "\n")
+        if k == 1 and cur is None:
+            cur = {"path": base, "lang": b["lang"], "content": piece, "line": b["line"], "n": n, "next": 2}
+        elif cur and cur["path"] == base and cur["n"] == n and cur["next"] == k:
+            cur["content"] += piece
+            cur["next"] += 1
+        else:
+            raise SystemExit(f"tm_verify: {base}: piece {k}/{n} is out of order, doubled or from another file")
+        if cur["next"] > cur["n"]:
+            out.append({"path": cur["path"], "lang": cur["lang"], "content": cur["content"], "line": cur["line"],
+                        "pieces": cur["n"]})
+            cur = None
+    if cur:
+        raise SystemExit(f"tm_verify: {cur['path']}: piece {cur['next']}/{cur['n']} is missing")
+    return out
+
+
 def md_blocks(text):
-    """Every '## path' + fenced block → list of dict(path, lang, content, line)."""
+    """Every '## path' + fenced block → list of dict(path, lang, content, line),
+    with the pieces of a split file joined (`join_pieces`)."""
     lines = text.split("\n")
     out, i = [], 0
     while i < len(lines):
@@ -303,7 +340,7 @@ def md_blocks(text):
                 i = j + 1
                 continue
         i += 1
-    return out
+    return join_pieces(out)
 
 
 def decode_grid(content, gate, where):
@@ -892,7 +929,8 @@ def cmd_accounting(json_path, selection, gate=None):
     with open(json_path, encoding="utf-8") as f:
         doc = json.load(f)
     files = doc.get("files", [])
-    got = {norm_rel(x.get("path", "")): x for x in files}
+    # A file split to fit --max-tokens is listed once per piece.
+    got = {norm_rel(PIECE_RE.sub(r"\1", x.get("path", ""))): x for x in files}
     for rel, e in entries.items():
         if e.get("exclude"):
             continue
@@ -1405,6 +1443,39 @@ def cmd_selftest(bin_arg):
             ok = False
         else:
             print("  [ok] --complete --redact embeds no source bytes; withheld files are named (exit 3)")
+        # Pieces (S9): files larger than one --max-tokens part are split; every
+        # part fits, and the joined parts pass the same gates as one file.
+        with open(os.path.join(src, "long.md"), "w", encoding="utf-8", newline="") as f:
+            f.write("# Long\n\n" + "".join(f"line {i}: words, ünïcode, numbers {i * 7}\n" for i in range(3000)))
+        with open(os.path.join(src, "rows.csv"), "w", encoding="utf-8", newline="") as f:
+            f.write("id,name,note\r\n" + "".join(f'{i},Program {i},"a, b {i}"\r\n' for i in range(3000)))
+        split_plan = os.path.join(tmp, "split.toml")
+        with open(split_plan, "w", encoding="utf-8") as f:
+            f.write('version = 1\nmode = "explicit"\n[[file]]\npath = "long.md"\n[[file]]\npath = "rows.csv"\n'
+                    'columns = ["id", "name", "note"]\n')
+        pdir = os.path.join(tmp, "parts")
+        os.makedirs(pdir)
+        budget = 4000
+        r = subprocess.run([tm, "merge", src, os.path.join(pdir, "p.md"), "--selection", split_plan, "--format",
+                            "markdown", "--reproducible", "--max-tokens", str(budget), "--yes", "-q"],
+                           capture_output=True, text=True, env=env)
+        names = sorted(os.listdir(pdir), key=lambda n: int(re.search(r"part(\d+)-of", n).group(1)) if "part" in n else 0)
+        joined_parts = os.path.join(tmp, "parts_joined.md")
+        with open(joined_parts, "w", encoding="utf-8", newline="") as jf:
+            for n in names:
+                with open(os.path.join(pdir, n), encoding="utf-8", newline="") as f:
+                    jf.write(f.read() + "\n")
+        with open(joined_parts, encoding="utf-8", newline="") as f:
+            jtext = f.read()
+        pieces = len(re.findall(r"^## .* \(piece \d+/\d+", jtext, re.M))
+        over = [w for w in r.stderr.splitlines() if "over the" in w]
+        pg = cmd_grid(joined_parts, src, split_plan)
+        if r.returncode == 0 and len(names) > 2 and pieces > 2 and not over and pg.ok:
+            print(f"  [ok] {len(names)} parts of <= {budget} tokens, {pieces} pieces; joined, the grid gate passes")
+        else:
+            print(f"  [!!] split: exit {r.returncode}, {len(names)} parts, {pieces} pieces, over budget: {over[:1]}, "
+                  f"grid {'PASS' if pg.ok else pg.fails[:1]}")
+            ok = False
         ok &= detected == len(mutations)
     print("SELFTEST", "PASS" if ok else "FAIL")
     return EXIT_OK if ok else EXIT_GATE
@@ -1419,7 +1490,7 @@ def main():
     s.add_argument("--bin")
     for name in ("grid", "slices", "audit", "all"):
         p = sub.add_parser(name)
-        p.add_argument("--merged", required=True)
+        p.add_argument("--merged", required=True, nargs="+", help="the merged file, or every part in order")
         p.add_argument("--src-root", required=True)
         p.add_argument("--selection", required=name == "slices")
         if name == "audit":
@@ -1432,7 +1503,7 @@ def main():
     p.add_argument("--json", required=True)
     p.add_argument("--selection", required=True)
     p = sub.add_parser("cold")
-    p.add_argument("--merged", required=True)
+    p.add_argument("--merged", required=True, nargs="+")
     p.add_argument("--src-root", required=True)
     p.add_argument("--work", required=True)
     p = sub.add_parser("restore")
@@ -1446,6 +1517,19 @@ def main():
     a = ap.parse_args()
     if a.cmd == "selftest":
         return cmd_selftest(a.bin)
+    if isinstance(getattr(a, "merged", None), list):
+        # Every part of a split output, read as one text (pieces join across parts).
+        if len(a.merged) == 1:
+            a.merged = a.merged[0]
+        else:
+            joined = tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", suffix=".md", delete=False)
+            with joined:
+                for part in a.merged:
+                    with open(part, encoding="utf-8", newline="") as f:
+                        joined.write(f.read())
+                    joined.write("\n")
+            a.merged = joined.name
+            atexit.register(os.unlink, joined.name)
     if a.cmd == "grid":
         gates = [cmd_grid(a.merged, a.src_root, a.selection)]
     elif a.cmd == "slices":

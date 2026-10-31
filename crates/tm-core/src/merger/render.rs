@@ -156,9 +156,19 @@ pub(super) fn partition(ctx: &RenderCtx, max_tokens: Option<usize>) -> Vec<Vec<u
     parts
 }
 
+/// Tokens a later part has for file blocks under `budget`: its header and
+/// fixed lines (rendered empty, the way `partition` measures them) taken out.
+pub(super) fn part_room(probe: &RenderCtx, budget: usize) -> usize {
+    let fixed = render_to_string(probe, &[])
+        .map(|s| tokens::count(&s))
+        .unwrap_or(0);
+    budget.saturating_sub(fixed)
+}
+
 /// Tokens a block's wrapper adds around its content in `fmt`.
-fn block_overhead_tokens(b: &Block, fmt: OutputFormat) -> usize {
-    let path = display_path(&b.relative);
+pub(super) fn block_overhead_tokens(b: &Block, fmt: OutputFormat) -> usize {
+    let label = b.label();
+    let path = display_path(&label);
     let wrapper = match fmt {
         OutputFormat::Markdown => format!("## {}\n\n````{}\n````\n\n", path, b.lang),
         OutputFormat::Cxml => format!(
@@ -292,8 +302,8 @@ fn write_markdown<W: Write>(w: &mut W, ctx: &RenderCtx, blocks: &[&Block]) -> Re
             writeln!(
                 w,
                 "- [{}](#{}) — ~{} tok{}",
-                display_path(&b.relative),
-                anchor_for(&b.relative),
+                display_path(&b.label()),
+                anchor_for(&b.label()),
                 b.tokens,
                 part
             )?;
@@ -308,7 +318,7 @@ fn write_markdown<W: Write>(w: &mut W, ctx: &RenderCtx, blocks: &[&Block]) -> Re
     for b in blocks {
         let content = ctx.content(b)?;
         let fence = fence_for(&content);
-        writeln!(w, "## {}\n", display_path(&b.relative))?;
+        writeln!(w, "## {}\n", display_path(&b.label()))?;
         writeln!(w, "{}{}", fence, b.lang)?;
         w.write_all(content.as_bytes())?;
         if !content.ends_with('\n') {
@@ -501,7 +511,7 @@ fn write_plain<W: Write>(w: &mut W, ctx: &RenderCtx, blocks: &[&Block]) -> Resul
     }
     for b in blocks {
         let content = ctx.content(b)?;
-        writeln!(w, "\n{}", delim(&display_path(&b.relative)))?;
+        writeln!(w, "\n{}", delim(&display_path(&b.label())))?;
         w.write_all(content.as_bytes())?;
         if !content.ends_with('\n') {
             writeln!(w)?;
@@ -537,7 +547,7 @@ fn write_xml<W: Write>(w: &mut W, ctx: &RenderCtx, blocks: &[&Block]) -> Result<
         writeln!(
             w,
             "  <file path=\"{}\" tokens=\"{}\">",
-            xml_escape(&b.relative),
+            xml_escape(&b.label()),
             b.tokens
         )?;
         w.write_all(xml_escape(&content).as_bytes())?;
@@ -630,7 +640,7 @@ fn write_cxml<W: Write>(w: &mut W, ctx: &RenderCtx, blocks: &[&Block]) -> Result
     }
     for b in blocks {
         let content = ctx.content(b)?;
-        doc(w, index, &b.relative, &content)?;
+        doc(w, index, &b.label(), &content)?;
         index += 1;
     }
     writeln!(w, "</documents>")?;
@@ -664,7 +674,7 @@ fn write_json<W: Write>(w: &mut W, ctx: &RenderCtx, blocks: &[&Block]) -> Result
         write!(w, ",\n      \"language\": ")?;
         string(w, &b.lang)?;
         write!(w, ",\n      \"path\": ")?;
-        string(w, &b.relative)?;
+        string(w, &b.label())?;
         write!(w, ",\n      \"tokens\": {}\n    }}", b.tokens)?;
     }
     writeln!(w, "{}],", if blocks.is_empty() { "" } else { "\n  " })?;
@@ -859,6 +869,12 @@ pub(super) struct ArchiveEntry {
 }
 
 impl ArchiveEntry {
+    /// After `--max-tokens` split blocks into pieces: the file's block is its
+    /// first piece (`first_of[old index]`).
+    pub(super) fn remap(&mut self, first_of: &[usize]) {
+        self.block = self.block.map(|b| first_of[b]);
+    }
+
     /// Why this file cannot be restored byte for byte, when it cannot.
     pub(super) fn gap(&self) -> Option<String> {
         match &self.facts {

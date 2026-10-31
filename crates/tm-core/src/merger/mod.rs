@@ -14,6 +14,7 @@ mod git;
 mod pipeline;
 mod process;
 mod render;
+mod split;
 mod spool;
 mod stream;
 
@@ -296,6 +297,36 @@ pub(crate) struct Block {
     /// Git-context sections and similar: real output, but not part of the
     /// scanned file set, so the project tree must not list them.
     synthetic: bool,
+    /// Set when the file's text was split to fit `--max-tokens`.
+    piece: Option<Piece>,
+}
+
+/// One piece of a block split to fit `--max-tokens` (HANDOFF_S8 §6.10 item
+/// 3.3): pieces are exact slices of the block's text, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Piece {
+    /// This piece's number (from 1) and how many there are.
+    k: u32,
+    n: u32,
+    /// The piece ends inside a line that the next piece continues.
+    cont: bool,
+}
+
+impl Block {
+    /// The block's name in the output: its path, plus `(piece k/n)` when
+    /// the file was split (`, line continues` when the cut is inside a line).
+    fn label(&self) -> std::borrow::Cow<'_, str> {
+        match self.piece {
+            None => std::borrow::Cow::Borrowed(&self.relative),
+            Some(p) => std::borrow::Cow::Owned(format!(
+                "{} (piece {}/{}{})",
+                self.relative,
+                p.k,
+                p.n,
+                if p.cont { ", line continues" } else { "" }
+            )),
+        }
+    }
 }
 
 /// (relative_path, reason, kind) for a file dropped at merge time
@@ -684,7 +715,7 @@ where
     // Archive twin (`--complete`): every source file is read once before
     // anything is written, so the report and the exit code can name each one
     // that cannot come back byte for byte.
-    let archive = if cfg.complete {
+    let mut archive = if cfg.complete {
         let rel = |p: &Path| {
             let r = relative_display(root, p);
             if cfg.reproducible {
@@ -709,7 +740,6 @@ where
         .collect();
 
     let all_skips: Vec<&SkipEntry> = scan_skips.iter().chain(merge_skips.iter()).collect();
-    let all_blocks: Vec<&Block> = blocks.iter().collect();
     let folder = render::display_path(
         root.file_name()
             .and_then(|n| n.to_str())
@@ -723,6 +753,42 @@ where
             .clone()
             .unwrap_or_else(|| format!("local folder \"{}\"", folder))
     };
+
+    // --max-tokens is a contract (HANDOFF_S8 §6.11 C): a file larger than one
+    // part is split into pieces that each fit a later part — exact slices of
+    // its text, in order, named `(piece k/n)`.
+    let mut split_files = 0;
+    if let Some(budget) = cfg.max_tokens.filter(|&b| b > 0) {
+        let room = {
+            let refs: Vec<&Block> = blocks.iter().collect();
+            let probe = RenderCtx {
+                cfg,
+                root,
+                folder: folder.clone(),
+                source_label: source_label.clone(),
+                nonce: String::new(),
+                all: &refs,
+                part_of: vec![0; refs.len()],
+                idx: 1,
+                n_parts: 10,
+                total_scanned: total_files,
+                outcome: &outcome,
+                skips: &all_skips,
+                spool: None,
+                archive: &archive,
+                archive_set: String::new(),
+            };
+            render::part_room(&probe, budget)
+        };
+        let (first_of, n) = split::split_blocks(&mut blocks, &spool, |b| {
+            room.saturating_sub(render::block_overhead_tokens(b, cfg.format) + split::LABEL_TOKENS)
+        })?;
+        for e in &mut archive {
+            e.remap(&first_of);
+        }
+        split_files = n;
+    }
+    let all_blocks: Vec<&Block> = blocks.iter().collect();
     // Only the plain format prints the nonce; it costs a pass over the spool.
     let nonce = if cfg.format == OutputFormat::Plain {
         delimiter_nonce(&blocks, &spool)?
@@ -818,6 +884,11 @@ where
             "archive twin: {} of {} source files cannot be restored byte for byte (named under \"Archive twin\" in the Merge Report)",
             outcome.archive_gaps.len(),
             archive.len()
+        ));
+    }
+    if split_files > 0 {
+        outcome.notes.push(format!(
+            "{split_files} file(s) larger than one --max-tokens part were split into pieces named \"(piece k/n)\"; joined in order they are the file's text"
         ));
     }
     if cfg.complete && n_parts > 1 {

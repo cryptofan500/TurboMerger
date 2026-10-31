@@ -462,6 +462,7 @@ fn process_bytes(
             redactions,
             compressed,
             synthetic: false,
+            piece: None,
         },
         content,
     ))
@@ -535,6 +536,7 @@ fn process_document(
                     redactions: Vec::new(),
                     compressed: false,
                     synthetic: false,
+                    piece: None,
                 },
                 String::new(),
             ))
@@ -630,6 +632,7 @@ fn document_block(
             redactions,
             compressed: false,
             synthetic: false,
+            piece: None,
         },
         content,
     ))
