@@ -1531,7 +1531,12 @@ pub fn scan_with(
     let mut candidates: Vec<(PathBuf, u64)> = Vec::new();
     let mut skipped: Vec<SkipEntry> = Vec::new();
     let mut stats = ScanStats::default();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+    // Only walk 2 reads the set, and walk 2 runs only with ignore rules or
+    // user globs: a default run (gitignored files included) keeps no copy
+    // of the paths at all (S10, B11 ladder in the handoff §8).
+    let walk2_possible = options.respect_gitignore || overrides.is_some();
+    let mut seen = PathSet::default();
+    let mut ignore_file_seen = false;
 
     let mut walked = 0usize;
     for result in builder.build() {
@@ -1554,7 +1559,10 @@ pub fn scan_with(
                 continue;
             }
         };
-        seen.insert(entry.path().to_path_buf());
+        if walk2_possible {
+            seen.insert(entry.path());
+        }
+        ignore_file_seen = ignore_file_seen || names_ignore_file(entry.path());
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             // Pipes, sockets and devices are never opened — reading a FIFO
             // blocks forever — but they are recorded, so every entry is
@@ -1611,20 +1619,23 @@ pub fn scan_with(
     let pruned = std::mem::take(&mut *pruned.lock().expect("prune recorder"));
     // Walk 2 attributes what ignore rules hid; with no ignore file anywhere
     // (and no ancestor rules), there is nothing for it to find (D4).
-    let ignore_files_present = use_ancestors
-        || seen.iter().any(|p| names_ignore_file(p))
-        || pruned.iter().any(|p| names_ignore_file(&p.path));
+    let ignore_files_present =
+        use_ancestors || ignore_file_seen || pruned.iter().any(|p| names_ignore_file(&p.path));
     let mut budget = COUNT_CAP_TOTAL;
-    let candidate_rels: HashSet<String> = candidates
-        .iter()
-        .map(|(p, _)| relative_display(root, p))
-        .collect();
+    // Symlinks ask whether their target is merged under its own name; with
+    // no symlink there is nothing to ask, so no second copy of every path.
+    let mut candidate_rels = PathSet::default();
+    if pruned.iter().any(|p| p.symlink) {
+        for (p, _) in &candidates {
+            candidate_rels.insert_str(&relative_display(root, p));
+        }
+    }
     for p in pruned {
         let rel = relative_display(root, &p.path);
         if p.symlink {
             stats.symlinks += 1;
             match resolve_symlink(&p.path, &root_canon) {
-                LinkTarget::InRootFile(target_rel) if candidate_rels.contains(&target_rel) => {
+                LinkTarget::InRootFile(target_rel) if candidate_rels.contains_str(&target_rel) => {
                     skipped.push(SkipEntry::new(
                         rel,
                         format!("symlink to {} (content included there)", target_rel),
@@ -1822,6 +1833,59 @@ fn names_ignore_file(path: &Path) -> bool {
     )
 }
 
+/// A set of paths kept as their 128-bit XXH3, not as `PathBuf`s (HANDOFF_S8
+/// 4.4, DeepSeek A2): 16 bytes a path instead of a 24-byte header plus a
+/// heap copy of the path (≈ 100–200 B). Walk 1 fills it, walk 2 asks it.
+/// No path is kept to confirm a hit: with N seen and M asked paths the
+/// chance of any false hit is about N·M / 2¹²⁸ (≈ 10⁻²⁴ at 20 M each), and
+/// a false hit would only move one ignored entry out of the ignore counts.
+#[derive(Default)]
+pub(crate) struct PathSet(HashSet<u128, std::hash::BuildHasherDefault<KeyIsHash>>);
+
+impl PathSet {
+    fn key(bytes: &[u8]) -> u128 {
+        twox_hash::XxHash3_128::oneshot(bytes)
+    }
+    pub(crate) fn insert(&mut self, path: &Path) {
+        self.0
+            .insert(Self::key(path.as_os_str().as_encoded_bytes()));
+    }
+    pub(crate) fn contains(&self, path: &Path) -> bool {
+        self.0
+            .contains(&Self::key(path.as_os_str().as_encoded_bytes()))
+    }
+    fn insert_str(&mut self, s: &str) {
+        self.0.insert(Self::key(s.as_bytes()));
+    }
+    fn contains_str(&self, s: &str) -> bool {
+        self.0.contains(&Self::key(s.as_bytes()))
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// The set's keys are already XXH3 hashes: fold them instead of hashing
+/// them again with SipHash.
+#[derive(Default)]
+pub(crate) struct KeyIsHash(u64);
+
+impl std::hash::Hasher for KeyIsHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        // Only reached for keys other than u128 (none in this module).
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    fn write_u128(&mut self, n: u128) {
+        self.0 = (n as u64) ^ ((n >> 64) as u64);
+    }
+}
+
 fn o_has_whitelist(options: &ScanOptions) -> bool {
     !options.include_globs.is_empty()
 }
@@ -1865,7 +1929,8 @@ fn find_ignored(
     root: &Path,
     // Taken, not borrowed: walk 1 is done with it, and a copy for the walk's
     // threads doubled its memory (S8, DeepSeek A2 — ~150–300 B per path).
-    seen: HashSet<PathBuf>,
+    // Since S10 it holds 16-byte hashes, not paths.
+    seen: PathSet,
     include_venv: bool,
     include_hidden: bool,
     protect_secrets: bool,
@@ -1922,6 +1987,90 @@ fn find_ignored(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_path_set_keeps_hashes_and_tells_paths_apart() {
+        // S10 (4.4): walk 2's set holds 16-byte XXH3 keys, not paths.
+        let mut set = PathSet::default();
+        let paths = ["r/a", "r/a/b", "r/ab", "r/a b", "r/ä", "r/A"];
+        for p in &paths[..3] {
+            set.insert(Path::new(p));
+        }
+        assert_eq!(set.len(), 3);
+        for p in &paths[..3] {
+            assert!(set.contains(Path::new(p)), "{p}");
+        }
+        for p in &paths[3..] {
+            assert!(!set.contains(Path::new(p)), "{p} is not in the set");
+        }
+        set.insert(Path::new("r/a"));
+        assert_eq!(set.len(), 3, "a path inserted twice is one key");
+        // Relative-path strings key the same bytes as the paths they name.
+        let mut rels = PathSet::default();
+        rels.insert_str("src/main.rs");
+        assert!(rels.contains_str("src/main.rs") && rels.contains(Path::new("src/main.rs")));
+        assert!(!rels.contains_str("src/main.r"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let latin1 = Path::new(std::ffi::OsStr::from_bytes(b"r/caf\xe9"));
+            set.insert(latin1);
+            assert!(set.contains(latin1));
+            assert!(!set.contains(Path::new("r/café")), "bytes, not lossy text");
+        }
+        let mut h = KeyIsHash::default();
+        std::hash::Hasher::write_u128(&mut h, 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
+        assert_eq!(
+            std::hash::Hasher::finish(&h),
+            0x0123_4567_89ab_cdef ^ 0xfedc_ba98_7654_3210
+        );
+    }
+
+    #[test]
+    fn walk_2_still_names_every_ignored_entry() {
+        // The set changed from paths to hashes; what walk 2 reports did not.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("generated/deep")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".gitignore"), "generated/\n*.log\n").unwrap();
+        std::fs::write(root.join("generated/deep/x.js"), "x\n").unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/b.log"), "log\n").unwrap();
+        std::fs::write(root.join("src/c.log"), "log\n").unwrap();
+        let opts = ScanOptions {
+            respect_gitignore: true,
+            ..Default::default()
+        };
+        let scan = scan_text_files(root, &opts).unwrap();
+        let rels: Vec<String> = scan
+            .files
+            .iter()
+            .map(|f| relative_display(root, f))
+            .collect();
+        assert!(rels.contains(&"src/a.rs".to_string()), "{rels:?}");
+        assert!(!rels
+            .iter()
+            .any(|r| r.ends_with(".log") || r.starts_with("generated")));
+        let rules: Vec<(&str, &str)> = scan
+            .skipped
+            .iter()
+            .filter(|s| s.kind == SkipKind::IgnoredByRule)
+            .map(|s| (s.path.as_str(), s.reason.as_str()))
+            .collect();
+        assert!(
+            rules
+                .iter()
+                .any(|(p, r)| p.ends_with("generated/") && r.contains("1 file in 1 directory")),
+            "{rules:?}"
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|(p, r)| p.ends_with("*.log") && r.contains("2 files")),
+            "{rules:?}"
+        );
+    }
 
     #[test]
     fn test_word_boundary_detection() {
