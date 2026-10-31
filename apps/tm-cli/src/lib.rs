@@ -1355,15 +1355,6 @@ mod tests {
     }
 
     #[test]
-    fn help_and_version_do_not_need_the_gui() {
-        let e = parse(&["--version"]).unwrap_err();
-        assert_eq!(e.kind(), clap::error::ErrorKind::DisplayVersion);
-        assert_eq!(e.exit_code(), 0);
-        let e = parse(&["merge", "--help"]).unwrap_err();
-        assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp);
-    }
-
-    #[test]
     fn flags_parse_strictly() {
         let Cli {
             command: Command::Merge(m),

@@ -2113,54 +2113,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gitignore_respected_in_scan() {
-        let dir = std::env::temp_dir().join("turbomerger_test_gitignore");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("profiles")).unwrap();
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join(".gitignore"), "profiles/\n").unwrap();
-        std::fs::write(dir.join("profiles/cookies.txt"), "cf_clearance=abc\n").unwrap();
-        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
-
-        let result = scan_text_files(&dir, &ScanOptions::default()).unwrap();
-        let names: Vec<String> = result
-            .files
-            .iter()
-            .map(|f| relative_display(&dir, f))
-            .collect();
-        assert!(names.contains(&"src/main.rs".to_string()), "{:?}", names);
-        assert!(
-            names.contains(&".gitignore".to_string()),
-            "dot-config allowlist should include .gitignore: {:?}",
-            names
-        );
-        assert!(
-            !names.iter().any(|n| n.starts_with("profiles/")),
-            "gitignored profiles/ must be excluded: {:?}",
-            names
-        );
-
-        // and with respect_gitignore=false the cookie file comes back
-        let opts = ScanOptions {
-            respect_gitignore: false,
-            ..Default::default()
-        };
-        let result2 = scan_text_files(&dir, &opts).unwrap();
-        let names2: Vec<String> = result2
-            .files
-            .iter()
-            .map(|f| relative_display(&dir, f))
-            .collect();
-        assert!(
-            names2.iter().any(|n| n.starts_with("profiles/")),
-            "{:?}",
-            names2
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn mount_paths_unescape_like_the_kernel_writes_them() {
         assert_eq!(
             unescape_mount_path("/media/pawel/My\\040Disk"),

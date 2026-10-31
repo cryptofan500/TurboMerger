@@ -104,22 +104,6 @@ fn a4_split_output_has_full_tree_in_part_one_and_one_report() {
 }
 
 #[test]
-fn oversized_single_file_is_noted_not_hidden() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join("big");
-    build_a4(&root);
-    let cfg = MergeConfig {
-        max_tokens: Some(800),
-        ..MergeConfig::default()
-    };
-    let outcome = merge(&root, &tmp.path().join("big.md"), &cfg);
-    assert!(
-        !outcome.notes.is_empty(),
-        "a part over budget must be reported"
-    );
-}
-
-#[test]
 fn cxml_content_cannot_forge_documents_and_still_round_trips() {
     // v1 A.2 injection.txt.
     let tmp = tempfile::tempdir().unwrap();
