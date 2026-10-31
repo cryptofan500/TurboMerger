@@ -539,6 +539,18 @@ pub fn merge_exit_code(files_merged: usize, skips: &[&SkipEntry], fail_on_skip: 
 }
 
 fn run_merge(a: MergeCmd) -> i32 {
+    // Before resolving the source: a remote one is cloned right there, and
+    // --checkpoint/--resume refuse remote sources (S11 B5: it cloned, then
+    // failed with exit 1, instead of a usage error before any network use).
+    if (a.checkpoint || a.resume)
+        && !std::path::Path::new(&a.src).exists()
+        && tm_core::remote::parse_remote_explicit(&a.src).is_some()
+    {
+        eprintln!(
+            "error: --checkpoint / --resume need a local folder (a remote clone is temporary)"
+        );
+        return EXIT_USAGE;
+    }
     let source = match resolve_source(&a.src) {
         Ok(r) => r,
         Err(e) => {

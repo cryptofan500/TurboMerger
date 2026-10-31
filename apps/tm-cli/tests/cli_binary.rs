@@ -775,9 +775,15 @@ fn resume_refuses_what_it_cannot_continue() {
         vec!["merge", "src", "o.md", "--resume", "--redact"],
         vec!["merge", "src", "--resume"],
         vec!["merge", "src", "o.md", "--resume", "--checkpoint"],
+        vec!["merge", "gh:owner/repo", "o.md", "--checkpoint"],
     ] {
         let o = tm(&args, tmp.path());
         assert_eq!(o.status.code(), Some(2), "{args:?}");
+        // Refused before anything is cloned (S11 B5).
+        assert!(
+            !String::from_utf8_lossy(&o.stderr).contains("cloning"),
+            "{args:?}"
+        );
     }
     assert!(!tmp.path().join("o.md.tm-checkpoint").exists());
     // A checkpoint made with other content options is not mixed in.
