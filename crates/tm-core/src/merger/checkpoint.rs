@@ -487,6 +487,16 @@ impl Checkpoint {
         ))
     }
 
+    /// Whether `path` can come from the checkpoint (unchanged since), without
+    /// taking it: entries are expanded one at a time, when the merge reaches
+    /// them, so the compact index is all a resumed run holds (S12).
+    pub(super) fn holds(&self, path: &str, stamp: Option<Stamp>) -> bool {
+        let (Some(k), Some(s)) = (self.kept.get(&path_key(path)), stamp) else {
+            return false;
+        };
+        k.size == s.size && k.mtime_ns == s.mtime_ns
+    }
+
     /// The journaled entry for `path`, if the file is unchanged since.
     pub(super) fn take(&mut self, path: &str, stamp: Option<Stamp>) -> Option<Entry> {
         let k = self.kept.remove(&path_key(path))?;

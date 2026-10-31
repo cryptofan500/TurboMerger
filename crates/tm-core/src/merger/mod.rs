@@ -473,15 +473,14 @@ where
     } else {
         Vec::new()
     };
-    let mut restored: Vec<Option<checkpoint::Entry>> = match ck.as_mut() {
+    let is_restored: Vec<bool> = match ck.as_ref() {
         Some(c) if c.found > 0 => ordered
             .iter()
             .zip(&stamps)
-            .map(|(p, s)| c.take(&key(p), *s))
+            .map(|(p, s)| c.holds(&key(p), *s))
             .collect(),
         _ => Vec::new(),
     };
-    let is_restored: Vec<bool> = restored.iter().map(Option::is_some).collect();
     for (w, _) in weights.iter_mut().zip(&is_restored).filter(|(_, r)| **r) {
         *w = 0;
     }
@@ -564,7 +563,19 @@ where
             };
             let path = ordered[i];
             // Taken from the checkpoint: its blocks and its skip, in its place.
-            if let Some(entry) = restored.get_mut(i).and_then(Option::take) {
+            let from_ck = is_restored.get(i).copied().unwrap_or(false);
+            if let (true, Some(c)) = (from_ck, ck.as_mut()) {
+                let Some(entry) = c.take(&key(path), stamps.get(i).copied().flatten()) else {
+                    // `holds` said yes and nothing else takes entries: unreachable,
+                    // but never silent.
+                    done += 1;
+                    merge_skips.push(SkipEntry::new(
+                        relative_display(root, path),
+                        "not processed — its checkpoint entry was gone",
+                        SkipKind::NotCaptured,
+                    ));
+                    return Ok(());
+                };
                 done += 1;
                 let (from_ck, skip) = entry.restore();
                 let rel = from_ck
@@ -577,9 +588,7 @@ where
                 if let Some(w) = watch {
                     w.bytes_done.fetch_add(lens[i], AtomicOrd::Relaxed);
                 }
-                if let Some(c) = ck.as_mut() {
-                    c.resumed += 1;
-                }
+                c.resumed += 1;
                 progress_callback(done, total_files, &rel);
                 return Ok(());
             }
