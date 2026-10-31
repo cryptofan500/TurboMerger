@@ -8,7 +8,24 @@ Stops the silent content loss, corruption and write-anywhere paths found in the
 2026-09-24 audit (`TURBOMERGER_refactor_september24_2026_v2.md`, findings N-xx).
 Every fix ships with its repro turned into a test (96 → 156 Rust tests).
 
-### Correctness fixes (2026-10-31, session 8)
+### Desktop guards (2026-10-31, session 8)
+
+- MERGE stops before writing one file over 1.5 M tokens or 50 MB (estimate from the scan,
+  or a quick count of the folder) and offers **Curate first**, **Split into parts of
+  180,000 tokens** or **Merge anyway**; a loaded plan or a set Max tokens skips the question.
+- An output over 30 MB gets **Show in Folder** as the main button; **Open File…** asks first.
+- Memory: the app uses two glibc heap arenas (`M_ARENA_MAX`) and returns freed memory
+  after every merge and scan (`malloc_trim`). 5,834-file test folder: 1,358 MB at the end of
+  a merge → 477 MB, idle afterwards 576 MB → 141 MB, for +9 % merge time.
+- **Load plan…** merges exactly what a `.tmsel.toml` lists (the CLI's `--selection`, slices
+  included); **Save as plan…** writes the curated list with the CLI's own writer.
+- Quick filters **Drop PDF / Web Captures** (.pdf, .mhtml, .har, .warc,
+  network_requests.json) and **Drop Files Over N MB**.
+- UTF-16 files are decoded before the scan counts their tokens; estimates scaled from the
+  first 8 MiB show "≈"; past 100,000 files the window points to the CLI; "Stalled on" waits
+  60 s and names the file's size; the redaction switch says it can change code.
+
+### Correctness fixes (2026-10-30, session 8)
 
 - A parser crash on one malformed file no longer aborts the whole merge: release builds
   unwind and every file is processed under a panic guard; the file is reported as not

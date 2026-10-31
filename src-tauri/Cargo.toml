@@ -36,5 +36,9 @@ open.workspace = true
 notify.workspace = true
 notify-debouncer-mini.workspace = true
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+# malloc_trim after each job (the desktop app runs on glibc's allocator).
+libc = "0.2.186"
+
 [dev-dependencies]
 tempfile.workspace = true

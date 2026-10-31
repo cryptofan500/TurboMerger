@@ -57,6 +57,19 @@ impl SelectionPlan {
     }
 
     /// The plan as TOML (`--emit-selection`).
+    /// The plan file as `--emit-selection` and the desktop's "Save as plan…"
+    /// write it: a comment header naming who wrote it and every file with its
+    /// size, then the TOML.
+    pub fn to_plan_file(&self, writer: &str, files: &[(String, u64)]) -> Result<String, String> {
+        let mut text =
+            format!("# Written by {writer}; edit, then pass it back with --selection.\n");
+        for (rel, bytes) in files {
+            text.push_str(&format!("# {bytes:>12} B  {rel}\n"));
+        }
+        text.push_str(&self.to_toml()?);
+        Ok(text)
+    }
+
     pub fn to_toml(&self) -> Result<String, String> {
         toml::to_string_pretty(self).map_err(|e| format!("cannot write selection TOML: {e}"))
     }

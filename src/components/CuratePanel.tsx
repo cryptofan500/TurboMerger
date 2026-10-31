@@ -182,7 +182,7 @@ function DirRow({
               >
                 {f.path.split("/").pop()}
               </span>
-              <span className="tree-tokens">~{fmtTokens(f.tokens)}</span>
+              <span className="tree-tokens" title={f.estimated ? "scaled from the first 8 MiB" : undefined}>{f.estimated ? "≈" : "~"}{fmtTokens(f.tokens)}</span>
             </div>
           ))}
         </>
@@ -692,7 +692,7 @@ export default function CuratePanel({
               >
                 {f.path}
               </span>
-              <span className="tree-tokens">~{fmtTokens(f.tokens)}</span>
+              <span className="tree-tokens" title={f.estimated ? "scaled from the first 8 MiB" : undefined}>{f.estimated ? "≈" : "~"}{fmtTokens(f.tokens)}</span>
             </div>
           ))}
         </div>

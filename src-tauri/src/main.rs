@@ -5,6 +5,7 @@
 )]
 
 fn main() {
+    tm_gui::limit_heap_arenas();
     // The command line is its own console binary, `turbomerger` (N-29). For
     // compatibility — scripts that still call this binary, and the AppImage,
     // whose arguments land here — a known subcommand or flag runs it

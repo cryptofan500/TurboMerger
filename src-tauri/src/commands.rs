@@ -29,7 +29,7 @@ use tm_core::{scanner, security, CancelToken};
 /// When a job's ETA may be shown (plan §10.3: early rates mislead).
 const ETA_AFTER: Duration = Duration::from_secs(60);
 /// No progress for this long is reported as a stall.
-const STALL_AFTER: Duration = Duration::from_secs(10);
+const STALL_AFTER: Duration = Duration::from_secs(60);
 /// A run expected to take longer than this is asked "proceed or cancel?"
 /// once, after `ETA_AFTER` (plan §10.5).
 const LONG_RUN: Duration = Duration::from_secs(600);
@@ -194,11 +194,51 @@ where
     F: FnOnce(CancelToken) -> Result<T, String> + Send + 'static,
 {
     let token = jobs.start(id)?;
-    let result = tauri::async_runtime::spawn_blocking(move || work(token))
-        .await
-        .map_err(|e| format!("job failed: {}", e));
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let out = work(token);
+        release_memory();
+        out
+    })
+    .await
+    .map_err(|e| format!("job failed: {}", e));
     jobs.end(id);
     result?
+}
+
+/// Two glibc heap arenas instead of up to 8 per core. Measured on the
+/// 5,834-file test folder (S8, release): RSS at the end of a merge 1,358 MB →
+/// 477 MB, and after [`release_memory`] 576 MB → 141 MB, for +9 % merge time.
+/// Call first thing in `main`, before any thread starts; a user's own
+/// `MALLOC_ARENA_MAX` wins.
+pub fn limit_heap_arenas() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        // SAFETY: mallopt only sets an allocator parameter; no thread runs yet.
+        unsafe {
+            libc::mallopt(libc::M_ARENA_MAX, 2);
+        }
+    }
+}
+
+/// Hand the heap a job freed back to the system. The desktop app uses
+/// glibc's allocator, which keeps freed memory in its per-thread arenas: after
+/// a 5,758-file merge the window sat at 1.2 GB until it was closed (S8).
+pub fn release_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim only returns free heap pages to the OS.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+/// The text of a file's first bytes as the merge reads it: UTF-16 (Windows
+/// exports, MetaTrader files) decoded, anything else as UTF-8. Counting the
+/// raw UTF-16 bytes as UTF-8 gave a meaningless estimate (DeepSeek #6).
+fn head_text(head: &[u8]) -> std::borrow::Cow<'_, str> {
+    match security::utf16_text_encoding(head) {
+        Some((enc, bom)) => enc.decode_without_bom_handling(&head[bom..]).0,
+        None => String::from_utf8_lossy(head),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -301,7 +341,7 @@ pub async fn scan_folder(
                     std::fs::File::open(path)
                         .and_then(|f| f.take(SCAN_COUNT_BYTES).read_to_end(&mut head))
                         .map(|n| {
-                            let t = tm_core::cache::count(&String::from_utf8_lossy(&head));
+                            let t = tm_core::cache::count(&head_text(&head));
                             if estimated && n > 0 {
                                 (t as f64 * size as f64 / n as f64) as usize
                             } else {
@@ -699,6 +739,25 @@ pub async fn restore_backup(root: String) -> Result<tm_core::applyback::RestoreO
 // OPENING THINGS (N-28)
 // ============================================================================
 
+/// A selection plan (`.tmsel.toml`, the CLI's `--selection`) for the next
+/// merge: parsed and checked here, then sent back with the merge options.
+#[tauri::command]
+pub fn read_selection_plan(path: String) -> Result<tm_core::selection::SelectionPlan, String> {
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+    tm_core::selection::SelectionPlan::from_toml(&text)
+}
+
+/// Write the curated file list as a selection plan, with the CLI's own
+/// writer, so `turbomerger merge SRC OUT --selection PLAN` rebuilds it.
+#[tauri::command]
+pub fn write_selection_plan(path: String, files: Vec<(String, u64)>) -> Result<usize, String> {
+    let paths: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
+    let plan = tm_core::selection::SelectionPlan::from_paths(&paths);
+    let text = plan.to_plan_file("TurboMerger (Save as plan…)", &files)?;
+    std::fs::write(&path, text).map_err(|e| format!("cannot write '{path}': {e}"))?;
+    Ok(files.len())
+}
+
 /// Open an output of this session with its default application.
 #[tauri::command]
 pub fn open_file(outputs: State<'_, Outputs>, path: String) -> Result<(), String> {
@@ -852,6 +911,7 @@ mod tests {
         outputs.record(&MergeResult {
             output_path: out.to_string_lossy().to_string(),
             output_paths: vec![out.to_string_lossy().to_string()],
+            output_bytes: 1,
             files_processed: 1,
             files_skipped: 0,
             total_bytes: 1,
@@ -880,5 +940,88 @@ mod tests {
             file_uri(Path::new("/home/a b/ü#1,2.md")),
             "file:///home/a%20b/%C3%BC%231%2C2.md"
         );
+    }
+
+    #[test]
+    fn a_saved_plan_reads_back_and_is_a_cli_selection() {
+        // S8 2.4: "Save as plan…" writes what `--selection` and "Load plan…" read.
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = tmp.path().join("p.tmsel.toml");
+        let files = vec![("a/b.md".to_string(), 12u64), ("c.xlsx".to_string(), 3400)];
+        let n = write_selection_plan(plan.to_string_lossy().into_owned(), files).unwrap();
+        assert_eq!(n, 2);
+        let text = std::fs::read_to_string(&plan).unwrap();
+        assert!(
+            text.starts_with("# Written by TurboMerger (Save as plan…)"),
+            "{text}"
+        );
+        let back = read_selection_plan(plan.to_string_lossy().into_owned()).unwrap();
+        let paths: Vec<&str> = back.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["a/b.md", "c.xlsx"]);
+        assert_eq!(back.mode, tm_core::selection::SelectionMode::Explicit);
+    }
+
+    #[test]
+    fn utf16_files_are_counted_as_their_text() {
+        // S8 2.7 (DeepSeek #6): the scan estimate read UTF-16 bytes as UTF-8.
+        let text = "MetaTrader settings: Lots=0.10 StopLoss=250 TakeProfit=500\r\n".repeat(40);
+        let mut le = vec![0xFF, 0xFE];
+        le.extend(text.encode_utf16().flat_map(|u| u.to_le_bytes()));
+        assert_eq!(head_text(&le), text);
+        assert_eq!(
+            tm_core::cache::count(&head_text(&le)),
+            tm_core::cache::count(&text)
+        );
+        assert_eq!(head_text(text.as_bytes()), text);
+    }
+
+    /// Resident memory of this process in kB (Linux), for the RSS probe.
+    fn rss_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    /// S8 2.3 probe, run by hand: `TM_RSS_DIR=<folder> cargo test -p tm-gui
+    /// rss_probe -- --ignored --nocapture`. Merges in this process (glibc
+    /// malloc, like the desktop app) and prints RSS before and after
+    /// `release_memory`.
+    #[test]
+    #[ignore]
+    fn rss_probe_after_a_big_merge() {
+        let Ok(dir) = std::env::var("TM_RSS_DIR") else {
+            return;
+        };
+        let out = tempfile::tempdir().unwrap();
+        // The desktop sends its options as JSON; unset fields take their defaults.
+        let options: MergeOptions = serde_json::from_value(serde_json::json!({
+            "folder_path": dir,
+            "output_path": out.path().join("probe.md"),
+            "include_venv": false,
+            "include_tree": true,
+            "content_detection": true,
+        }))
+        .unwrap();
+        let start = rss_kb();
+        // Two jobs: memory left after the second shows whether it grows.
+        for n in 1..=2 {
+            // As in `merge_folder`: only the small result outlives the job.
+            let result = run_merge(&options, None, &CancelToken::new(), &|_| {})
+                .expect("merge")
+                .result;
+            let after = rss_kb();
+            release_memory();
+            println!(
+                "RSS kB, job {n}: start {start}, after merge {after}, after release_memory {}; merged {} files, {} B written",
+                rss_kb(),
+                result.files_processed,
+                result.output_bytes
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -26,7 +26,32 @@ interface MergeResult {
   tokens_o200k: number;
   tokens_claude_est: number;
   skill_path: string | null;
+  /** Size of everything written (all parts). */
+  output_bytes?: number;
 }
+
+/** What MERGE would write, when it is too big for one file (S8 guard). */
+interface BigMerge {
+  tokens: number;
+  bytes: number;
+  files: number;
+}
+
+/** A selection plan (`.tmsel.toml`) loaded for the next merge. */
+interface LoadedPlan {
+  path: string;
+  // The parsed plan, sent back unchanged with the merge options.
+  plan: { complete?: boolean; file?: { path: string }[] };
+}
+
+// One file above either limit needs a click first: Geany froze opening a
+// 561 MB merge (S7 test, 5,758 files written as one 179 M-token file).
+const BIG_MERGE_TOKENS = 1_500_000;
+const BIG_MERGE_BYTES = 50 * 1048576;
+const BIG_OUTPUT_BYTES = 30 * 1048576;
+const SPLIT_TOKENS = "180000";
+// The curate tree builds every row in this window; past this, use the CLI.
+const GUI_CURATE_MAX_FILES = 100_000;
 
 /** One progress report from a running job (tm_core::progress snapshot). */
 interface JobProgress {
@@ -168,6 +193,9 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<JobProgress | null>(null);
   const [longRun, setLongRun] = useState<LongRunQuestion | null>(null);
+  const [bigMerge, setBigMerge] = useState<BigMerge | null>(null);
+  const [plan, setPlan] = useState<LoadedPlan | null>(null);
+  const [dropOverMb, setDropOverMb] = useState<string>("25");
   // The running merge/scan, so Cancel reaches exactly that job.
   const [jobId, setJobId] = useState<string | null>(null);
 
@@ -309,14 +337,15 @@ function App() {
     await invoke<boolean>("cancel_job", { job: jobId }).catch(console.error);
   };
 
-  const buildOptions = (src?: string) => {
+  const buildOptions = (src?: string, maxOverride?: string) => {
     const toList = (s: string) => s.split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
     // Exact include list only when the user actually excluded something in
     // the curate panel for THIS source.
     const selected =
-      scanReport && excluded.size > 0
+      !plan && scanReport && excluded.size > 0
         ? scanReport.included.map((e) => e.path).filter((p) => !excluded.has(p))
         : null;
+    const maxText = maxOverride ?? maxTokens;
     return {
       folder_path: src ?? sourcePath,
       output_path: outputPath || null,
@@ -331,7 +360,7 @@ function App() {
       keep_figures: extractImagesText && keepFigures,
       format,
       ordering,
-      max_tokens: maxTokens ? parseInt(maxTokens, 10) || 0 : 0,
+      max_tokens: maxText ? parseInt(maxText, 10) || 0 : 0,
       include_globs: toList(includeGlobs),
       exclude_globs: toList(excludeGlobs),
       remove_empty_lines: removeEmptyLines,
@@ -343,11 +372,41 @@ function App() {
       emit_skill: emitSkill,
       selected_paths: selected,
       force_include: [...forceInclude],
+      selection: plan ? plan.plan : null,
+      complete: plan?.plan.complete ?? false,
     };
   };
 
-  const handleMerge = async () => {
+  // What MERGE would write as ONE file: the curated scan when there is one,
+  // else a cheap count of the folder (bytes / 4 ≈ tokens).
+  const mergeEstimate = async (): Promise<BigMerge | null> => {
+    if (scanReport) {
+      const kept = scanReport.included.filter((e) => !excluded.has(e.path));
+      return {
+        tokens: kept.reduce((n, e) => n + e.tokens, 0),
+        bytes: kept.reduce((n, e) => n + e.size, 0),
+        files: kept.length,
+      };
+    }
+    try {
+      const c = await invoke<{ files: number; bytes: number }>("count_folder", { path: sourcePath });
+      return { tokens: Math.round(c.bytes / 4), bytes: c.bytes, files: c.files };
+    } catch {
+      return null;
+    }
+  };
+
+  const handleMerge = async (force = false, maxOverride?: string) => {
     if (!sourcePath) return;
+    const maxText = maxOverride ?? maxTokens;
+    if (!force && !isRemote && !plan && !(maxText && parseInt(maxText, 10) > 0)) {
+      const est = await mergeEstimate();
+      if (est && (est.tokens > BIG_MERGE_TOKENS || est.bytes > BIG_MERGE_BYTES)) {
+        setBigMerge(est);
+        return;
+      }
+    }
+    setBigMerge(null);
     const job = newJobId();
     try {
       setJobId(job);
@@ -356,7 +415,7 @@ function App() {
       setResult(null);
       setProgress(null);
 
-      const options = buildOptions();
+      const options = buildOptions(undefined, maxOverride);
       const progress = progressChannel(true);
       const mergeResult = isRemote
         ? await invoke<MergeResult>("pack_remote", {
@@ -508,6 +567,69 @@ function App() {
     setExcluded(next);
   };
 
+  const applyDropOver = () => {
+    if (!scanReport) return;
+    const limit = (parseFloat(dropOverMb) || 0) * 1048576;
+    if (limit <= 0) return;
+    const next = new Set(excluded);
+    for (const e of scanReport.included) if (e.size > limit) next.add(e.path);
+    setExcluded(next);
+  };
+
+  // PDFs and saved web pages/captures (MHTML, HAR, WARC, Monad Crawl
+  // network_requests.json): 15 % of the 561 MB test merge.
+  const applyDropWeb = () => {
+    if (!scanReport) return;
+    const next = new Set(excluded);
+    for (const e of scanReport.included) {
+      const p = e.path.toLowerCase();
+      if (/\.(pdf|mhtml|mht|har|warc)$/.test(p) || p.endsWith("network_requests.json")) next.add(e.path);
+    }
+    setExcluded(next);
+  };
+
+  const handleLoadPlan = async () => {
+    const picked = await open({
+      multiple: false,
+      title: "Load selection plan",
+      filters: [{ name: "Selection plan", extensions: ["toml"] }],
+    });
+    if (typeof picked !== "string") return;
+    try {
+      const parsed = await invoke<LoadedPlan["plan"]>("read_selection_plan", { path: picked });
+      setPlan({ path: picked, plan: parsed });
+      setError(null);
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  const handleSavePlan = async () => {
+    if (!scanReport) return;
+    const target = await save({
+      title: "Save selection as plan",
+      defaultPath: "selection.tmsel.toml",
+      filters: [{ name: "Selection plan", extensions: ["toml"] }],
+    });
+    if (!target) return;
+    const files = scanReport.included
+      .filter((e) => !excluded.has(e.path))
+      .map((e) => [e.path, e.size] as [string, number]);
+    try {
+      await invoke<number>("write_selection_plan", { path: target, files });
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  const openBig = async (path: string, bytes: number) => {
+    const ok = await ask(
+      `This file is ${formatBytes(bytes)}. A text editor may freeze opening it. Open it anyway?`,
+      { title: "Open a large file", kind: "warning" }
+    );
+    if (ok) openThing(path);
+  };
+
   const applyIncludeAll = () => {
     setExcluded(new Set());
   };
@@ -584,6 +706,12 @@ function App() {
           {autoScanNote && !scanReport && (
             <div style={{ marginTop: 8, fontSize: 13, color: "var(--text-secondary)" }}>{autoScanNote}</div>
           )}
+          {scanReport && scanReport.included.length > GUI_CURATE_MAX_FILES && (
+            <div style={{ marginTop: 8, fontSize: 13, color: "var(--warning)" }}>
+              {scanReport.included.length.toLocaleString()} files: curating here is for up to{" "}
+              {GUI_CURATE_MAX_FILES.toLocaleString()}. Above that use the CLI (turbomerger merge --files-from or --selection).
+            </div>
+          )}
           {scanReport && (
             <>
               <div
@@ -603,6 +731,7 @@ function App() {
                 <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>
                   <strong>Files:</strong> {scanReport.included.length - excluded.size} / {scanReport.included.length} |{" "}
                   <strong>Est. Tokens:</strong>{" "}
+                  {scanReport.included.some((e) => e.estimated && !excluded.has(e.path)) ? "≈" : ""}
                   {formatTokens(
                     scanReport.included.reduce(
                       (sum, e) => (excluded.has(e.path) ? sum : sum + e.tokens),
@@ -684,6 +813,38 @@ function App() {
                 >
                   Drop Media/Transcripts
                 </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ padding: "3px 8px", fontSize: 12 }}
+                  onClick={applyDropWeb}
+                  disabled={isWorking}
+                  title="Drop .pdf, .mhtml/.mht, .har, .warc and network_requests.json"
+                >
+                  Drop PDF / Web Captures
+                </button>
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ padding: "3px 8px", fontSize: 12 }}
+                    onClick={applyDropOver}
+                    disabled={isWorking}
+                    title="Drop every file larger than this many MB"
+                  >
+                    Drop Files Over
+                  </button>
+                  <input
+                    type="number"
+                    className="input"
+                    style={{ width: 64, padding: "2px 4px", fontSize: 12 }}
+                    min="0"
+                    value={dropOverMb}
+                    onChange={(e) => setDropOverMb(e.target.value)}
+                    aria-label="Size limit in MB"
+                  />
+                  <span style={{ fontSize: 12 }}>MB</span>
+                </span>
                 <button
                   type="button"
                   className="btn btn-secondary"
@@ -781,7 +942,7 @@ function App() {
           <label className="label">OPTIONS</label>
           {([
             [respectGitignore, setRespectGitignore, "Respect .gitignore / .turbomergerignore (leave ignored files out)"],
-            [redactSecrets, setRedactSecrets, "Redact secrets (API keys, tokens, private keys)"],
+            [redactSecrets, setRedactSecrets, "Redact secrets (API keys, tokens, private keys) — can also change code that looks like a secret; check the Merge Report"],
             [extractImagesText, setExtractImagesText, "Text from pictures and scanned PDF pages (OCR — slow)"],
             [includeTree, setIncludeTree, "Directory tree + table of contents"],
             [contentDetection, setContentDetection, "Include all text files (content-based detection)"],
@@ -881,9 +1042,9 @@ function App() {
             </button>
           ) : (
             <div className="merge-row">
-              <button className="btn btn-primary merge-main" onClick={handleMerge} disabled={!sourcePath || watching}>
+              <button className="btn btn-primary merge-main" onClick={() => void handleMerge()} disabled={!sourcePath || watching || isWorking}>
                 {status === "done" ? "MERGE AGAIN" : status === "error" ? "RETRY" : "MERGE"}
-                {scanReport && excluded.size > 0 ? " SELECTED" : ""}
+                {plan ? " PLAN" : scanReport && excluded.size > 0 ? " SELECTED" : ""}
               </button>
               <button
                 className="btn btn-secondary"
@@ -900,6 +1061,63 @@ function App() {
                 title="Re-merge automatically when files change"
               >
                 {watching ? "◉ Watching" : "Watch"}
+              </button>
+              <button
+                className="btn btn-secondary"
+                onClick={() => void handleLoadPlan()}
+                disabled={isRemote || isWorking}
+                title="Merge exactly the files (and parts) a .tmsel.toml plan lists — the CLI's --selection"
+              >
+                Load plan…
+              </button>
+              {scanReport && (
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => void handleSavePlan()}
+                  disabled={isWorking}
+                  title="Save the curated file list as a .tmsel.toml plan (rebuild it with one click, or with turbomerger merge --selection)"
+                >
+                  Save as plan…
+                </button>
+              )}
+            </div>
+          )}
+          {plan && (
+            <p className="hint">
+              Plan: {plan.path.split(/[\\/]/).pop()} ({(plan.plan.file ?? []).length} files
+              {plan.plan.complete ? ", archive twin" : ""}) — MERGE takes exactly these, relative to the source folder
+              {" · "}
+              <button className="link-btn" onClick={() => setPlan(null)}>clear</button>
+            </p>
+          )}
+          {bigMerge && !isWorking && (
+            <div className="checkbox-group" role="alertdialog" aria-label="Big merge">
+              <p className="progress-text" style={{ color: "var(--warning)" }}>
+                This would write ONE file of about {formatTokens(bigMerge.tokens)} tokens
+                ({formatBytes(bigMerge.bytes)}, {bigMerge.files.toLocaleString()} files) — too big for a chat window
+                or an editor. Choose:
+              </p>
+              <button
+                className="btn btn-primary"
+                onClick={() => {
+                  setBigMerge(null);
+                  if (scanReport) setCurateOpen(true);
+                  else void handleScan(undefined, true);
+                }}
+              >
+                Curate first
+              </button>
+              <button
+                className="btn btn-secondary"
+                onClick={() => {
+                  setMaxTokens(SPLIT_TOKENS);
+                  void handleMerge(true, SPLIT_TOKENS);
+                }}
+              >
+                Split into parts of {parseInt(SPLIT_TOKENS, 10).toLocaleString()} tokens
+              </button>
+              <button className="btn btn-danger" onClick={() => void handleMerge(true)}>
+                Merge anyway
               </button>
             </div>
           )}
@@ -963,7 +1181,12 @@ function App() {
             )}
             {progress && progress.stalled_ms !== null && (
               <p className="progress-text" style={{ color: "var(--warning)" }}>
-                Stalled on {progress.current || "the scan"} for {formatClock(progress.stalled_ms)} — Cancel stops it
+                Stalled on {progress.current || "the scan"}
+                {(() => {
+                  const e = scanReport?.included.find((x) => x.path === progress.current);
+                  return e ? ` (${formatBytes(e.size)})` : "";
+                })()}{" "}
+                for {formatClock(progress.stalled_ms)} — Cancel stops it
               </p>
             )}
             {longRun && isWorking && status !== "cancelling" && (
@@ -1020,10 +1243,23 @@ function App() {
                 ✓ Claude skill written: {result.skill_path}
               </p>
             )}
-            <div className="action-buttons">
-              <button className="btn btn-success" onClick={() => openThing(result.output_path)}>Open File</button>
-              <button className="btn btn-secondary" onClick={() => openFolder(result.output_path)}>Show in Folder</button>
-            </div>
+            {(result.output_bytes ?? 0) > BIG_OUTPUT_BYTES ? (
+              <>
+                <p className="detection-breakdown" style={{ color: "var(--warning)" }}>
+                  ⚠ {formatBytes(result.output_bytes ?? 0)} written — too big for most editors and chat windows.
+                  Use Show in Folder, or merge again with Max tokens set to split it.
+                </p>
+                <div className="action-buttons">
+                  <button className="btn btn-success" onClick={() => openFolder(result.output_path)}>Show in Folder</button>
+                  <button className="btn btn-secondary" onClick={() => void openBig(result.output_path, result.output_bytes ?? 0)}>Open File…</button>
+                </div>
+              </>
+            ) : (
+              <div className="action-buttons">
+                <button className="btn btn-success" onClick={() => openThing(result.output_path)}>Open File</button>
+                <button className="btn btn-secondary" onClick={() => openFolder(result.output_path)}>Show in Folder</button>
+              </div>
+            )}
             <div className="action-buttons">
               <button className="btn btn-secondary" onClick={() => openWeb("claude")}>claude.ai</button>
               <button className="btn btn-secondary" onClick={() => openWeb("chatgpt")}>chatgpt.com</button>

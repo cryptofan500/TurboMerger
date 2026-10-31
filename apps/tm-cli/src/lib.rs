@@ -665,17 +665,13 @@ fn run_merge(a: MergeCmd) -> i32 {
                         })
                 })
                 .collect();
-            let mut text = String::from("# Written by turbomerger --emit-selection; edit, then pass it back with --selection.\n");
-            for (rel, bytes) in &resolved.files {
-                text.push_str(&format!("# {bytes:>12} B  {rel}\n"));
-            }
-            match plan.to_toml() {
-                Ok(t) => text.push_str(&t),
+            let text = match plan.to_plan_file("turbomerger --emit-selection", &resolved.files) {
+                Ok(t) => t,
                 Err(e) => {
                     eprintln!("error: {e}");
                     return EXIT_ERROR;
                 }
-            }
+            };
             if let Err(e) = std::fs::write(out, text) {
                 eprintln!("error: cannot write '{}': {e}", out.display());
                 return EXIT_ERROR;

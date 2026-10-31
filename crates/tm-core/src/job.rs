@@ -33,6 +33,10 @@ pub struct MergeResult {
     pub figures_kept: usize,
     /// Remarks about the output (a part over its budget, figures kept, …).
     pub notes: Vec<String>,
+    /// Size of everything written (all parts), so a front end can tell a
+    /// file too big to open in an editor (the desktop app asks first).
+    #[serde(default)]
+    pub output_bytes: u64,
 }
 
 pub fn count_not_captured(scan: &[scanner::SkipEntry], merge: &[scanner::SkipEntry]) -> usize {
@@ -645,7 +649,14 @@ pub fn run_merge(
         }
     })?;
 
+    let output_bytes = outcome
+        .outputs
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
     let result = MergeResult {
+        output_bytes,
         output_path: outcome
             .outputs
             .first()

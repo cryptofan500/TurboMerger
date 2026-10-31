@@ -3,6 +3,8 @@
 
 mod commands;
 
+pub use commands::limit_heap_arenas;
+
 use std::sync::Mutex;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -34,6 +36,8 @@ pub fn run() {
             commands::preview_apply,
             commands::apply_accepted,
             commands::restore_backup,
+            commands::read_selection_plan,
+            commands::write_selection_plan,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -339,7 +339,7 @@ fn tools() -> Vec<Tool> {
     vec![
         Tool::new(
             "pack_directory",
-            "Merge a folder under the server's shared roots (or, with --allow-remote, a repo URL / gh:owner/repo) into one LLM-ready file (gitignore-aware, secrets always redacted). Returns a summary plus the output path(s); use read_output/grep_output to access the content.",
+            "Merge a folder under the server's shared roots (or, with --allow-remote, a repo URL / gh:owner/repo) into one LLM-ready file (gitignore-aware, secrets always redacted; redaction can also change code that looks like a secret, so read the Merge Report before applying edits). Returns a summary plus the output path(s); use read_output/grep_output to access the content.",
             schema(json!({
                 "type": "object",
                 "properties": {

@@ -4775,6 +4775,7 @@ version = "7.7.0"
 dependencies = [
  "dirs",
  "dunce",
+ "libc",
  "notify",
  "notify-debouncer-mini",
  "open",

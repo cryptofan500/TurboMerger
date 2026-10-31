@@ -33,7 +33,7 @@
   isolation under `panic = "abort"` (Phase 3 part 2, maintainer's decision ❓ g).
   Files over 64 MiB still parse one at a time (Phase 9: a bounded in-flight window).
 
-## Addendum S8 (2026-10-31): the release profile unwinds
+## Addendum S8 (2026-10-30): the release profile unwinds
 
 - **Finding:** a byte-corruption fuzz of one arXiv PDF (120 variants, release build)
   aborted the merge twice (`pdf_oxide` 0.3.78: `document.rs:25363` char boundary,
