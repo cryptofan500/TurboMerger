@@ -659,28 +659,10 @@ fn run_merge(a: MergeCmd) -> i32 {
         }
     }
     // After the plan: `complete = true` there counts like --complete.
-    if options.embed_binary.is_some() && !options.complete {
-        eprintln!("error: --embed-binary needs --complete (or `complete = true` in the plan)");
+    // The same check the desktop app runs (tm_core::job::check_options, S14).
+    if let Err(why) = tm_core::job::check_options(&options) {
+        eprintln!("error: {why}");
         return EXIT_USAGE;
-    }
-    if options.complete && a.format.as_str() != "markdown" {
-        eprintln!("error: the archive twin (--complete) is written in the markdown format only");
-        return EXIT_USAGE;
-    }
-    if options.checkpoint || options.resume {
-        let why = if options.redact_secrets {
-            Some("--checkpoint / --resume cannot be used with --redact (the checkpoint would keep unredacted text and secret values on disk)")
-        } else if options.remote {
-            Some("--checkpoint / --resume need a local folder (a remote clone is temporary)")
-        } else if a.out.is_none() {
-            Some("--checkpoint / --resume need an explicit OUTPUT path (the checkpoint sits beside it)")
-        } else {
-            None
-        };
-        if let Some(why) = why {
-            eprintln!("error: {why}");
-            return EXIT_USAGE;
-        }
     }
 
     if a.list_only || a.emit_selection.is_some() {

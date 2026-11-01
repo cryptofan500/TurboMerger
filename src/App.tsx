@@ -169,6 +169,16 @@ function App() {
   const [gitDiff, setGitDiff] = useState(saved.gitDiff ?? false);
   const [gitLogCount, setGitLogCount] = useState<string>(saved.gitLogCount ?? "");
   const [emitSkill, setEmitSkill] = useState(saved.emitSkill ?? false);
+  // CLI parity (S14): the merge options the CLI has and the app lacked. Per
+  // run, not saved; refused combinations come back from tm-core's check.
+  const [resumeMode, setResumeMode] = useState<"off" | "checkpoint" | "resume">("off");
+  const [completeTwin, setCompleteTwin] = useState(false);
+  const [embedBinaryMb, setEmbedBinaryMb] = useState<string>("");
+  const [budgetTokens, setBudgetTokens] = useState<string>("");
+  const [gridChunkRows, setGridChunkRows] = useState<string>("");
+  const [reproducible, setReproducible] = useState(false);
+  const [showSourcePath, setShowSourcePath] = useState(false);
+  const [budgetNote, setBudgetNote] = useState<string | null>(null);
   const [preset, setPreset] = useState<Preset>("custom");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showApply, setShowApply] = useState(false);
@@ -337,6 +347,11 @@ function App() {
     await invoke<boolean>("cancel_job", { job: jobId }).catch(console.error);
   };
 
+  // A positive whole number, or null (blank / 0 = off, as on the CLI).
+  const positive = (s: string) => {
+    const n = parseInt(s, 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
   const buildOptions = (src?: string, maxOverride?: string) => {
     const toList = (s: string) => s.split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
     // Exact include list only when the user actually excluded something in
@@ -373,7 +388,15 @@ function App() {
       selected_paths: selected,
       force_include: [...forceInclude],
       selection: plan ? plan.plan : null,
-      complete: plan?.plan.complete ?? false,
+      complete: (plan?.plan.complete ?? false) || completeTwin,
+      // Blank = no cap (CLI default); 0 is a real cap.
+      embed_binary: embedBinaryMb.trim() === "" ? null : Math.max(0, parseInt(embedBinaryMb, 10) || 0),
+      budget_tokens: positive(budgetTokens),
+      grid_chunk_rows: positive(gridChunkRows),
+      reproducible,
+      show_source_path: showSourcePath,
+      checkpoint: resumeMode === "checkpoint",
+      resume: resumeMode === "resume",
     };
   };
 
@@ -427,6 +450,12 @@ function App() {
           })
         : await invoke<MergeResult>("merge_folder", { options, job, progress });
       setResult(mergeResult);
+      const budget = positive(budgetTokens);
+      setBudgetNote(
+        budget !== null && mergeResult.tokens_o200k > budget
+          ? `Over the token budget: ~${mergeResult.tokens_o200k.toLocaleString()} tokens > ${budget.toLocaleString()} (the CLI would exit 5). The output was written.`
+          : null
+      );
       setStatus("done");
     } catch (err) {
       const msg = String(err);
@@ -1036,8 +1065,53 @@ function App() {
                 <input type="number" className="input" value={gitLogCount} placeholder="e.g. 10" min="0"
                   onChange={(e) => { setGitLogCount(e.target.value); setPreset("custom"); }} disabled={isWorking} />
               </div>
+              <div style={{ marginTop: 12 }}>
+                <span className="field-label">Same as the CLI (only cutting inside a file stays CLI/plan-only)</span>
+                <div style={{ marginTop: 4 }}>
+                  <span className="field-label">Stop and continue later (--checkpoint / --resume; needs an output file, not with redaction)</span>
+                  <select className="input" value={resumeMode} disabled={isWorking || redactSecrets || isRemote}
+                    onChange={(e) => setResumeMode(e.target.value as "off" | "checkpoint" | "resume")}>
+                    <option value="off">Off</option>
+                    <option value="checkpoint">Keep a checkpoint beside the output</option>
+                    <option value="resume">Resume from the checkpoint beside the output</option>
+                  </select>
+                  {resumeMode !== "off" && !outputPath && (
+                    <span style={{ fontSize: 12, color: "#c0392b" }}>Choose an output file: the checkpoint sits beside it.</span>
+                  )}
+                </div>
+                <label className="checkbox-label" style={{ marginTop: 6 }}>
+                  <input type="checkbox" checked={completeTwin || (plan?.plan.complete ?? false)} disabled={isWorking || (plan?.plan.complete ?? false)}
+                    onChange={(e) => setCompleteTwin(e.target.checked)} />
+                  <span>Archive twin: every file rebuildable byte for byte (--complete; Markdown only)</span>
+                </label>
+                <div style={{ marginTop: 4 }}>
+                  <span className="field-label">Embed binaries up to N MB each (--embed-binary; blank = no cap)</span>
+                  <input type="number" className="input" value={embedBinaryMb} placeholder="no cap" min="0"
+                    disabled={isWorking || !(completeTwin || (plan?.plan.complete ?? false))}
+                    onChange={(e) => setEmbedBinaryMb(e.target.value)} />
+                </div>
+                <div style={{ marginTop: 4 }}>
+                  <span className="field-label">Token budget ceiling (--budget-tokens; warns when the output is over)</span>
+                  <input type="number" className="input" value={budgetTokens} placeholder="off" min="0"
+                    disabled={isWorking} onChange={(e) => setBudgetTokens(e.target.value)} />
+                </div>
+                <div style={{ marginTop: 4 }}>
+                  <span className="field-label">Spreadsheet rows per table chunk (--grid-chunk-rows; blank = one table per sheet)</span>
+                  <input type="number" className="input" value={gridChunkRows} placeholder="one table per sheet" min="0"
+                    disabled={isWorking} onChange={(e) => setGridChunkRows(e.target.value)} />
+                </div>
+                <label className="checkbox-label" style={{ marginTop: 6 }}>
+                  <input type="checkbox" checked={reproducible} disabled={isWorking} onChange={(e) => setReproducible(e.target.checked)} />
+                  <span>Reproducible output: no timestamps or machine paths (--reproducible)</span>
+                </label>
+                <label className="checkbox-label">
+                  <input type="checkbox" checked={showSourcePath} disabled={isWorking} onChange={(e) => setShowSourcePath(e.target.checked)} />
+                  <span>Show the source folder path in the header (--show-source-path)</span>
+                </label>
+              </div>
             </div>
           )}
+          {budgetNote && <div style={{ marginTop: 8, fontSize: 13, color: "#c0392b" }}>{budgetNote}</div>}
         </section>
 
         <section className="section">

@@ -561,6 +561,31 @@ impl MergeRun {
 /// Resolve, scan, curate and merge one job — the path every shell (CLI,
 /// MCP, desktop, watch mode) takes. `output` overrides the resolved output
 /// path (watch mode writes to a stable name). Checks `cancel` per file.
+/// The option combinations no front end may run (S14: moved out of the CLI so
+/// the desktop app refuses exactly what `turbomerger merge` refuses).
+pub fn check_options(o: &MergeOptions) -> Result<(), String> {
+    if o.embed_binary.is_some() && !o.complete {
+        return Err("--embed-binary needs --complete (or `complete = true` in the plan)".into());
+    }
+    if o.complete && o.format.as_deref().is_some_and(|f| f != "markdown") {
+        return Err("the archive twin (--complete) is written in the markdown format only".into());
+    }
+    if o.checkpoint || o.resume {
+        if o.redact_secrets {
+            return Err("--checkpoint / --resume cannot be used with --redact (the checkpoint would keep unredacted text and secret values on disk)".into());
+        }
+        if o.remote {
+            return Err(
+                "--checkpoint / --resume need a local folder (a remote clone is temporary)".into(),
+            );
+        }
+        if o.output_path.as_deref().is_none_or(|p| p.trim().is_empty()) {
+            return Err("--checkpoint / --resume need an explicit OUTPUT path (the checkpoint sits beside it)".into());
+        }
+    }
+    Ok(())
+}
+
 pub fn run_merge(
     options: &MergeOptions,
     output: Option<&Path>,
@@ -568,6 +593,7 @@ pub fn run_merge(
     progress: &(dyn Fn(Progress) + Sync),
 ) -> Result<MergeRun, JobError> {
     let start = std::time::Instant::now();
+    check_options(options).map_err(JobError::Invalid)?;
     let mut job = resolve_job(options).map_err(JobError::Invalid)?;
     if let Some(o) = output {
         job.output_path = o.to_path_buf();
@@ -773,6 +799,83 @@ pub fn resolve_source(src: &str, on_clone: impl FnOnce(&str)) -> Result<Resolved
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_front_end_refuses_what_the_cli_refuses() {
+        // S14: the desktop app sends MergeOptions straight to run_merge, so
+        // these refusals must live here, not only in the CLI.
+        let base = || MergeOptions {
+            output_path: Some("/tmp/out.md".into()),
+            ..MergeOptions::for_folder("/tmp/src")
+        };
+        let refused = |o: MergeOptions, why: &str| {
+            let err = check_options(&o).unwrap_err();
+            assert!(err.contains(why), "{err}");
+            let run = run_merge(&o, None, &CancelToken::new(), &|_| {});
+            assert!(
+                matches!(run, Err(JobError::Invalid(ref e)) if e.contains(why)),
+                "run_merge did not refuse: {why}"
+            );
+        };
+        assert!(check_options(&base()).is_ok());
+        refused(
+            MergeOptions {
+                embed_binary: Some(5),
+                ..base()
+            },
+            "--embed-binary needs --complete",
+        );
+        refused(
+            MergeOptions {
+                complete: true,
+                format: Some("json".into()),
+                ..base()
+            },
+            "markdown format only",
+        );
+        assert!(check_options(&MergeOptions {
+            complete: true,
+            embed_binary: Some(0),
+            ..base()
+        })
+        .is_ok());
+        for (checkpoint, resume) in [(true, false), (false, true)] {
+            let o = || MergeOptions {
+                checkpoint,
+                resume,
+                ..base()
+            };
+            assert!(check_options(&o()).is_ok());
+            refused(
+                MergeOptions {
+                    redact_secrets: true,
+                    ..o()
+                },
+                "cannot be used with --redact",
+            );
+            refused(
+                MergeOptions {
+                    remote: true,
+                    ..o()
+                },
+                "need a local folder",
+            );
+            refused(
+                MergeOptions {
+                    output_path: None,
+                    ..o()
+                },
+                "explicit OUTPUT path",
+            );
+            refused(
+                MergeOptions {
+                    output_path: Some("  ".into()),
+                    ..o()
+                },
+                "explicit OUTPUT path",
+            );
+        }
+    }
 
     #[test]
     fn run_merge_reports_progress_and_honours_cancel() {
