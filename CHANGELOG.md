@@ -8,6 +8,19 @@ Stops the silent content loss, corruption and write-anywhere paths found in the
 2026-09-24 audit (`TURBOMERGER_refactor_september24_2026_v2.md`, findings N-xx).
 Every fix ships with its repro turned into a test (96 → 156 Rust tests).
 
+### Desktop app = CLI, except cuts inside a file (2026-11-01, session 14)
+
+- Advanced options in the app for what only the CLI had: stop and continue later
+  (`--checkpoint` / `--resume`), the archive twin (`--complete`) with its binary
+  cap (`--embed-binary`), the token budget ceiling (`--budget-tokens`: the app
+  warns, the CLI exits 5), spreadsheet rows per table chunk (`--grid-chunk-rows`),
+  `--reproducible` and `--show-source-path`. Cutting inside a file (sections,
+  lines, columns, rows) stays with selection plans and the CLI.
+- The combinations the CLI refuses (`--embed-binary` without the twin, the twin
+  as JSON, checkpoint or resume with redaction, a remote source or no output
+  file) are refused by tm-core for every front end (`job::check_options`, called
+  by `run_merge`); before, only the CLI checked them.
+
 ### Restore on a full disk, streamed second reader, `.xlsb` (2026-10-31, session 13)
 
 - `turbomerger restore` compares what the files need (whole blocks, one inode
