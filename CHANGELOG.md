@@ -8,6 +8,43 @@ Stops the silent content loss, corruption and write-anywhere paths found in the
 2026-09-24 audit (`TURBOMERGER_refactor_september24_2026_v2.md`, findings N-xx).
 Every fix ships with its repro turned into a test (96 → 156 Rust tests).
 
+### Restore on a full disk, streamed second reader, `.xlsb` (2026-10-31, session 13)
+
+- `turbomerger restore` compares what the files need (whole blocks, one inode
+  each) with the free space under `--dest` before writing and refuses a restore
+  that cannot fit, naming both numbers. A disk that fills up anyway, an exhausted
+  quota or a file too large for the file system (FAT32: 4 GiB) stops it with a
+  plain message and nothing written: staged files and the folders it made are
+  removed, files being replaced are set aside until the end (a failure while
+  moving puts them back), and on Linux the staged files are flushed (`syncfs`)
+  before anything moves, so a full disk noticed only at writeback is caught too.
+  `--no-space-check` skips the check. Temporary files are created exclusively
+  (never through a file or symlink already at that name).
+- `scripts/e2e/tm_verify.py restore` streams the archive (two passes over byte
+  ranges): the 5.47 GiB S10 twin restores at 33 MB peak, 210/210 byte-identical
+  (the old whole-text read peaked at 6.5x the archive and was killed at a 4 GiB
+  cap). It refuses a restore that cannot fit and stops cleanly on a full disk;
+  the grid gate names `.xlsb` / `.xls` / `.ods` grids as "no independent reader"
+  instead of crashing.
+- `.xlsb` proven end to end on a real BIFF12 workbook built by the test:
+  detected, read as TM-GRID/1 (shared and inline strings, RK integers, doubles,
+  booleans, a styled date, a hidden sheet) and restored byte for byte from a twin.
+  The desktop "Docs & Tables Only" chip keeps `.xlsb`, `.xlsm` and `.ods` (it
+  dropped them).
+
+### Compact resume index (2026-10-31, session 12)
+
+- `--resume` holds the journal as a compact index (XXH3-128 of each path →
+  sizes and block spans, no path strings) and expands an entry only when the
+  merge reaches its file. 1 M files: resumed peak 658 MB vs 588 MB plain (was
+  959 vs 605 MB) — about 157 B per journaled file instead of 616 B.
+- At 5 M files (session 13, teal `78de130`): plain 326.5 s / 2.60 GB peak,
+  checkpointed 332.2 s / 2.73 GB, SIGKILL at half then `--resume` 298.3 s /
+  2.99 GB; the three outputs are byte-identical (1,243,508,835 B). Two kill
+  points on one 1 M-file tree split the resume cost into about 61 B per
+  journaled file (the index) plus about 62 B per file of the whole run, heap
+  not mapped files; that model predicts the 5 M figure within 6 %.
+
 ### PDF determinism and CLI matrix (2026-10-31, session 11)
 
 - A malformed PDF that panics inside pdf_oxide no longer garbles the PDFs parsed after
