@@ -807,3 +807,158 @@ fn resume_refuses_what_it_cannot_continue() {
         String::from_utf8_lossy(&o.stderr)
     );
 }
+
+/// S13 (HANDOFF_S8 §6.11 F, §10.4): a twin of four text files and a binary
+/// of `kib` KiB, for the disk-full tests below. Over 1024 KiB (restore's write
+/// buffer) the failing write comes while decoding; under it, at the flush.
+#[cfg(unix)]
+fn twin_for_full_disk(tmp: &Path, kib: u32) -> std::path::PathBuf {
+    let src = tmp.join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    for i in 0..4 {
+        fs::write(
+            src.join(format!("d/t{i}.txt")),
+            format!("line {i}\n").repeat(500),
+        )
+        .unwrap();
+    }
+    let blob: Vec<u8> = (0..kib * 1024)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    fs::write(src.join("blob.bin"), blob).unwrap();
+    // A plan names the binary: a folder walk skips it, so no twin would hold it.
+    let plan = tmp.join("all.tmsel.toml");
+    let mut toml = String::from("version = 1\nmode = \"explicit\"\ncomplete = true\n");
+    for rel in ["blob.bin", "d/t0.txt", "d/t1.txt", "d/t2.txt", "d/t3.txt"] {
+        toml.push_str(&format!("[[file]]\npath = \"{rel}\"\n"));
+    }
+    fs::write(&plan, toml).unwrap();
+    let twin = tmp.join("twin.md");
+    let o = tm(
+        &[
+            "merge",
+            src.to_str().unwrap(),
+            twin.to_str().unwrap(),
+            "--selection",
+            plan.to_str().unwrap(),
+            "--yes",
+            "-q",
+        ],
+        tmp,
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    twin
+}
+
+/// Run `turbomerger restore TWIN --dest MNT/out EXTRA…` with a tmpfs of
+/// `size` mounted at MNT inside an unprivileged mount namespace; returns
+/// (exit code, stderr, files left under MNT), or None when this machine
+/// cannot mount one (no `unshare`, user namespaces off).
+#[cfg(target_os = "linux")]
+fn restore_on_tmpfs(
+    tmp: &Path,
+    twin: &Path,
+    size: &str,
+    extra: &[&str],
+) -> Option<(i32, String, Vec<String>)> {
+    let mnt = tmp.join(format!("mnt_{size}_{}", extra.len()));
+    fs::create_dir_all(&mnt).unwrap();
+    let script = r#"m=$1; size=$2; shift 2
+mount -t tmpfs -o "size=$size" none "$m" || exit 99
+"$@"; rc=$?
+find "$m" -type f -printf '@@file %P\n' >&2
+exit $rc"#;
+    let dest = mnt.join("out");
+    let o = Command::new("unshare")
+        .args(["-rm", "sh", "-c", script, "sh"])
+        .arg(&mnt)
+        .arg(size)
+        .arg(env!("CARGO_BIN_EXE_turbomerger"))
+        .args([
+            "restore",
+            twin.to_str().unwrap(),
+            "--dest",
+            dest.to_str().unwrap(),
+        ])
+        .args(extra)
+        .env("TURBOMERGER_STATE_DIR", tmp.join("state"))
+        .output()
+        .ok()?;
+    let code = o.status.code()?;
+    if code == 99 {
+        return None;
+    }
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    let files = err
+        .lines()
+        .filter_map(|l| l.strip_prefix("@@file "))
+        .map(str::to_string)
+        .collect();
+    Some((code, err, files))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn restore_onto_a_full_disk_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let twin = twin_for_full_disk(tmp.path(), 1536);
+    // 64 KiB cannot hold a 1.5 MiB file: refused before anything is written.
+    let Some((code, err, files)) = restore_on_tmpfs(tmp.path(), &twin, "64k", &[]) else {
+        eprintln!("skipped: no unprivileged mount namespace (unshare -rm) on this machine");
+        return;
+    };
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("not enough free space") && err.contains("nothing was written"),
+        "{err}"
+    );
+    assert!(files.is_empty(), "{files:?}");
+    // Without the check the disk fills up while staging: stopped, all or nothing.
+    let (code, err, files) =
+        restore_on_tmpfs(tmp.path(), &twin, "64k", &["--no-space-check"]).unwrap();
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("the disk is full under") && err.contains("nothing was written"),
+        "{err}"
+    );
+    assert!(files.is_empty(), "staged files left behind: {files:?}");
+    // Enough room: every file back, byte for byte (the harness itself works).
+    let (code, err, files) = restore_on_tmpfs(tmp.path(), &twin, "4m", &[]).unwrap();
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(files.len(), 5, "{files:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_too_large_for_the_destination_writes_nothing() {
+    // RLIMIT_FSIZE stands in for FAT32's 4 GiB cap: the write fails with EFBIG
+    // (SIGXFSZ ignored, as a shell `trap '' XFSZ` leaves it across exec).
+    let tmp = tempfile::tempdir().unwrap();
+    let twin = twin_for_full_disk(tmp.path(), 200);
+    let dest = tmp.path().join("back");
+    let o = Command::new("sh")
+        .args(["-c", "trap '' XFSZ; ulimit -f 128; exec \"$@\"", "sh"])
+        .arg(env!("CARGO_BIN_EXE_turbomerger"))
+        .args([
+            "restore",
+            twin.to_str().unwrap(),
+            "--dest",
+            dest.to_str().unwrap(),
+        ])
+        .env("TURBOMERGER_STATE_DIR", tmp.path().join("state"))
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("blob.bin: too large for the file system")
+            && err.contains("nothing was written"),
+        "{err}"
+    );
+    assert!(!dest.exists(), "the folder restore made is removed again");
+}

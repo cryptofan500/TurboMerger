@@ -4,15 +4,20 @@
 //!
 //! All or nothing. The archive parts are indexed first (streamed: offsets,
 //! never whole files), every manifest entry is checked (a safe relative path,
-//! its block present, no duplicate), and existing files are compared; then
+//! its block present, no duplicate), and existing files are compared; the
+//! space the files need is compared with the free space under `dest`; then
 //! every file is decoded into a temporary file beside its target and checked
-//! against the manifest's size and SHA-256. Only when all of them pass are
-//! they moved into place. Nothing is ever written outside `dest`, through a
-//! symlink, or over a different existing file without `overwrite`.
+//! against the manifest's size and SHA-256. Only when all of them pass (and,
+//! on Linux, the file system has written them out without an error) are they
+//! moved into place; an existing file being replaced is set aside first, so a
+//! failure part-way puts everything back. A full disk, an exhausted quota or
+//! a file too large for the file system stops the restore with a plain
+//! message and nothing written (S13). Nothing is ever written outside `dest`,
+//! through a symlink, or over a different existing file without `overwrite`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -24,6 +29,10 @@ pub struct RestoreOptions {
     pub overwrite: bool,
     /// Decode and check every file, write nothing.
     pub check_only: bool,
+    /// Do not compare the space the files need with the free space under
+    /// `dest` first (a compressing file system may hold more than the sizes
+    /// say). A disk that fills up still stops the restore, nothing written.
+    pub skip_space_check: bool,
 }
 
 /// What a restore did (or, with `check_only`, would do).
@@ -193,75 +202,386 @@ pub fn restore(
     if !report.conflicts.is_empty() {
         return Ok(report);
     }
+    if !opts.check_only && !opts.skip_space_check {
+        let need: Vec<u64> = todo.iter().map(|(e, ..)| e.bytes).collect();
+        if let Some(free) = free_space(dest) {
+            enough_space(dest, &need, &free)?;
+        }
+    }
 
     // Decode everything into temporary files, check each, then move them in.
-    if !opts.check_only {
-        std::fs::create_dir_all(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-    }
     let mut readers: Vec<File> = Vec::with_capacity(parts.len());
     for p in parts {
         readers.push(File::open(p).map_err(|e| format!("{}: {e}", p.display()))?);
     }
-    let mut staged: Vec<(PathBuf, PathBuf, u32)> = Vec::new();
+    let total: u64 = todo.iter().map(|(e, ..)| e.bytes).sum();
+    let mut written = 0u64;
+    let mut staged: Vec<Staged> = Vec::new();
+    let mut moved: Vec<Moved> = Vec::new();
     let mut made_dirs: Vec<PathBuf> = Vec::new();
-    let result = (|| -> Result<(), String> {
+    let result = (|| -> Result<(), Stop> {
+        let mut fs_handle = None;
+        if !opts.check_only {
+            create_dest(dest, &mut made_dirs)
+                .map_err(|err| Stop::Io(dest.display().to_string(), err))?;
+            // Opened before the first write: syncfs reports the writeback
+            // errors of this file system from here on (Linux ≥ 5.8).
+            fs_handle = File::open(dest).ok();
+        }
         for (e, spans, is_text, target) in &todo {
-            let mut out: Box<dyn Write> = if opts.check_only {
-                Box::new(std::io::sink())
+            let mut sink = std::io::sink();
+            let mut file_out: Option<BufWriter<File>> = None;
+            let out: &mut dyn Write = if opts.check_only {
+                &mut sink
             } else {
                 let parent = target.parent().unwrap_or(dest);
                 create_dirs(dest, parent, &mut made_dirs)
-                    .map_err(|err| format!("{}: {err}", e.path))?;
-                let tmp = parent.join(format!(
-                    ".{}.tm-restore-{}.tmp",
-                    target
-                        .file_name()
-                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
-                    std::process::id()
-                ));
-                let file = File::create(&tmp).map_err(|err| format!("{}: {err}", e.path))?;
-                staged.push((tmp, target.clone(), e.mode));
-                Box::new(std::io::BufWriter::new(file))
+                    .map_err(|err| Stop::Io(e.path.clone(), err))?;
+                let tmp = sibling(target, "tmp");
+                // create_new: never through a file or symlink already there.
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)
+                    .map_err(|err| {
+                        if err.kind() == std::io::ErrorKind::AlreadyExists {
+                            Stop::Said(format!(
+                                "{}: {} already exists (left by an interrupted restore?) — remove it; nothing was written",
+                                e.path,
+                                tmp.display()
+                            ))
+                        } else {
+                            Stop::Io(e.path.clone(), err)
+                        }
+                    })?;
+                staged.push(Staged {
+                    tmp,
+                    target: target.clone(),
+                    mode: e.mode,
+                });
+                file_out.insert(BufWriter::with_capacity(1 << 20, file))
             };
-            let mut hashing = Hashing::new(&mut out);
+            let mut hashing = Hashing::new(out);
             let mut src = BufReader::with_capacity(1 << 20, Spans::new(&mut readers, spans));
             let decoded = if *is_text {
                 rebuild_text(&mut src, &e.eol, e.final_newline, &mut hashing)
             } else {
                 decode_base64(&mut src, &mut hashing)
             };
-            decoded.map_err(|err| format!("{}: {err}", e.path))?;
+            if let Err(err) = decoded {
+                written += hashing.n;
+                return Err(if hashing.write_failed {
+                    Stop::Io(e.path.clone(), err)
+                } else {
+                    Stop::Said(format!("{}: {err} — nothing was written", e.path))
+                });
+            }
             let (n, sha) = hashing.finish();
-            out.flush().map_err(|err| format!("{}: {err}", e.path))?;
-            drop(out);
+            if let Some(w) = file_out {
+                // into_inner flushes; a full disk may only show up here.
+                w.into_inner()
+                    .map_err(|err| Stop::Io(e.path.clone(), err.into_error()))?;
+            }
+            written += n;
             if n != e.bytes || sha != e.sha256 {
-                return Err(format!(
+                return Err(Stop::Said(format!(
                     "{}: decoded {n} B sha256 {} ≠ manifest {} B {} (archive changed or damaged) — nothing was written",
                     e.path,
                     &sha[..12],
                     e.bytes,
                     e.sha256.get(..12).unwrap_or(&e.sha256)
-                ));
+                )));
             }
             report.bytes += n;
             report.restored.push(e.path.clone());
         }
-        for (tmp, target, mode) in &staged {
-            set_mode(tmp, *mode);
-            replace(tmp, target).map_err(|err| format!("{}: {err}", target.display()))?;
+        if let Some(h) = &fs_handle {
+            flush_fs(h).map_err(|err| Stop::Io("the staged files".into(), err))?;
         }
+        move_in(&staged, &mut moved).map_err(|(target, err)| Stop::Io(target, err))?;
         Ok(())
     })();
-    if let Err(e) = result {
-        for (tmp, _, _) in &staged {
-            let _ = std::fs::remove_file(tmp);
+    match result {
+        Ok(()) => {
+            for b in moved.iter().filter_map(|m| m.backup.as_ref()) {
+                if let Err(err) = std::fs::remove_file(b) {
+                    report.warnings.push(format!(
+                        "{}: the replaced file was kept here: {err}",
+                        b.display()
+                    ));
+                }
+            }
+            Ok(report)
         }
-        for d in made_dirs.iter().rev() {
-            let _ = std::fs::remove_dir(d);
+        Err(stop) => {
+            let k = staged.len();
+            let undone = undo(&moved, &staged, &made_dirs);
+            let msg = match stop {
+                Stop::Said(s) => s,
+                Stop::Io(what, err) => format!(
+                    "{} after {} of {} were staged; the {k} staged file(s){} and the folders restore made were removed — nothing was written",
+                    write_failure(&what, dest, &err),
+                    size(written),
+                    size(total),
+                    if moved.is_empty() { "" } else { ", the files already moved in" }
+                ),
+            };
+            Err(if undone.is_empty() {
+                msg
+            } else {
+                format!("{msg} (could not undo: {})", undone.join("; "))
+            })
         }
-        return Err(e);
     }
-    Ok(report)
+}
+
+/// Why staging stopped: a whole sentence already, or a failed write (named
+/// by `write_failure`, with how far the restore got).
+enum Stop {
+    Said(String),
+    Io(String, std::io::Error),
+}
+
+/// A decoded file in its temporary place beside `target`.
+struct Staged {
+    tmp: PathBuf,
+    target: PathBuf,
+    mode: u32,
+}
+
+/// A staged file moved onto its target; `backup` = the file it replaced,
+/// set aside until the whole restore has succeeded.
+struct Moved {
+    tmp: PathBuf,
+    target: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+/// `.<name>.tm-restore-<pid>.<ext>` beside `target`.
+fn sibling(target: &Path, ext: &str) -> PathBuf {
+    let name = target
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    target.with_file_name(format!(".{name}.tm-restore-{}.{ext}", std::process::id()))
+}
+
+/// Move every staged file onto its target. A file already there (only with
+/// `overwrite`) is renamed aside first, so a failure part-way can put it back.
+fn move_in(staged: &[Staged], moved: &mut Vec<Moved>) -> Result<(), (String, std::io::Error)> {
+    for s in staged {
+        set_mode(&s.tmp, s.mode);
+        let backup = match std::fs::symlink_metadata(&s.target) {
+            Ok(_) => {
+                let b = sibling(&s.target, "old");
+                std::fs::rename(&s.target, &b)
+                    .map_err(|err| (s.target.display().to_string(), err))?;
+                Some(b)
+            }
+            Err(_) => None,
+        };
+        if let Err(err) = std::fs::rename(&s.tmp, &s.target) {
+            if let Some(b) = &backup {
+                let _ = std::fs::rename(b, &s.target);
+            }
+            return Err((s.target.display().to_string(), err));
+        }
+        moved.push(Moved {
+            tmp: s.tmp.clone(),
+            target: s.target.clone(),
+            backup,
+        });
+    }
+    Ok(())
+}
+
+/// Undo a failed restore: files already moved in go back to their temporary
+/// names, the files they replaced come back, every temporary file and every
+/// folder this restore made is removed. Returns what could not be undone.
+fn undo(moved: &[Moved], staged: &[Staged], made_dirs: &[PathBuf]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for m in moved.iter().rev() {
+        if let Err(err) = std::fs::rename(&m.target, &m.tmp) {
+            problems.push(format!("{}: {err}", m.target.display()));
+            continue;
+        }
+        if let Some(b) = &m.backup {
+            if let Err(err) = std::fs::rename(b, &m.target) {
+                problems.push(format!(
+                    "{} is still at {}: {err}",
+                    m.target.display(),
+                    b.display()
+                ));
+            }
+        }
+    }
+    for s in staged {
+        let _ = std::fs::remove_file(&s.tmp);
+    }
+    for d in made_dirs.iter().rev() {
+        let _ = std::fs::remove_dir(d);
+    }
+    problems
+}
+
+/// A failed write in words: a full disk, an exhausted quota or a file too
+/// large for the file system say so; anything else is the OS error.
+fn write_failure(what: &str, dest: &Path, err: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::StorageFull => {
+            format!("{what}: the disk is full under {} ({err})", dest.display())
+        }
+        ErrorKind::QuotaExceeded => format!(
+            "{what}: the disk quota under {} is used up ({err})",
+            dest.display()
+        ),
+        ErrorKind::FileTooLarge => format!(
+            "{what}: too large for the file system under {} ({err}; FAT32 holds at most 4 GiB per file)",
+            dest.display()
+        ),
+        _ => format!("{what}: {err}"),
+    }
+}
+
+/// Free space for this user where `dest` is or will be made.
+#[derive(Debug, Clone, Copy)]
+struct FreeSpace {
+    bytes: u64,
+    /// Allocation unit: every file takes whole ones.
+    block: u64,
+    /// Free inodes, when the file system has a fixed number.
+    inodes: Option<u64>,
+}
+
+/// Refuse a restore that cannot fit before anything is written: each file's
+/// size rounded up to whole blocks, and one inode each.
+fn enough_space(dest: &Path, sizes: &[u64], free: &FreeSpace) -> Result<(), String> {
+    let block = free.block.max(1);
+    let need: u64 = sizes.iter().map(|&b| b.div_ceil(block) * block).sum();
+    if need > free.bytes {
+        return Err(format!(
+            "not enough free space for {}: the {} file(s) need {}, {} free — nothing was written (free some space or restore elsewhere; --no-space-check skips this check)",
+            dest.display(),
+            sizes.len(),
+            size(need),
+            size(free.bytes)
+        ));
+    }
+    if let Some(inodes) = free.inodes.filter(|&n| sizes.len() as u64 > n) {
+        return Err(format!(
+            "not enough free inodes for {}: {} file(s) to write, {inodes} free — nothing was written",
+            dest.display(),
+            sizes.len()
+        ));
+    }
+    Ok(())
+}
+
+fn size(n: u64) -> String {
+    const MIB: f64 = (1u64 << 20) as f64;
+    const GIB: f64 = (1u64 << 30) as f64;
+    match n {
+        n if n >= 1 << 30 => format!("{n} B ({:.2} GiB)", n as f64 / GIB),
+        n if n >= 1 << 20 => format!("{n} B ({:.1} MiB)", n as f64 / MIB),
+        n => format!("{n} B"),
+    }
+}
+
+/// The free space of the file system that holds `dest` (or would: its
+/// nearest existing ancestor). `None` when it cannot be read.
+fn free_space(dest: &Path) -> Option<FreeSpace> {
+    let abs = std::path::absolute(dest).ok()?;
+    let mut p = abs.as_path();
+    while !p.exists() {
+        p = p.parent()?;
+    }
+    free_space_at(p)
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // statvfs field types differ by platform
+fn free_space_at(p: &Path) -> Option<FreeSpace> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs fills the zeroed struct; c is NUL-terminated.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let frsize = st.f_frsize as u64;
+    Some(FreeSpace {
+        bytes: (st.f_bavail as u64).saturating_mul(frsize),
+        block: if frsize > 0 { frsize } else { 4096 },
+        inodes: (st.f_files as u64 > 0).then_some(st.f_favail as u64),
+    })
+}
+
+#[cfg(windows)]
+fn free_space_at(p: &Path) -> Option<FreeSpace> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut avail = 0u64;
+    // SAFETY: a NUL-terminated path; the two totals may be null.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut avail,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(FreeSpace {
+        bytes: avail,
+        block: 4096,
+        inodes: None,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn free_space_at(_: &Path) -> Option<FreeSpace> {
+    None
+}
+
+/// Have the kernel write the staged files out and report a writeback error
+/// (a full disk noticed only at that point) before anything is moved in.
+#[cfg(target_os = "linux")]
+fn flush_fs(handle: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a valid open descriptor.
+    if unsafe { libc::syncfs(handle.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Elsewhere a full disk is caught when the writes fail.
+#[cfg(not(target_os = "linux"))]
+fn flush_fs(_: &File) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Create `dest` and its missing parents, recording each one made so a
+/// failed restore leaves no new folder behind.
+fn create_dest(dest: &Path, made: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let mut missing: Vec<&Path> = Vec::new();
+    let mut d = dest;
+    while !d.as_os_str().is_empty() && !d.exists() {
+        missing.push(d);
+        match d.parent() {
+            Some(p) => d = p,
+            None => break,
+        }
+    }
+    for m in missing.into_iter().rev() {
+        match std::fs::create_dir(m) {
+            Ok(()) => made.push(m.to_path_buf()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && m.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Every part of one merge, each once, and every file listed: a missing,
@@ -562,15 +882,6 @@ fn file_matches(path: &Path, bytes: u64, sha: &str) -> bool {
     format!("{:x}", h.finalize()) == sha
 }
 
-/// Move `tmp` onto `target` (replacing it).
-fn replace(tmp: &Path, target: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    if target.exists() {
-        std::fs::remove_file(target)?;
-    }
-    std::fs::rename(tmp, target)
-}
-
 fn set_mode(path: &Path, mode: u32) {
     #[cfg(unix)]
     if mode != 0 {
@@ -621,11 +932,13 @@ fn display_path(s: &str) -> String {
         .collect()
 }
 
-/// A writer that counts and hashes what passes through.
+/// A writer that counts and hashes what passes through, and remembers when
+/// the writer under it failed (a full disk is not a damaged archive).
 struct Hashing<'a> {
     inner: &'a mut dyn Write,
     sha: Sha256,
     n: u64,
+    write_failed: bool,
 }
 
 impl<'a> Hashing<'a> {
@@ -634,6 +947,7 @@ impl<'a> Hashing<'a> {
             inner,
             sha: Sha256::new(),
             n: 0,
+            write_failed: false,
         }
     }
     fn finish(self) -> (u64, String) {
@@ -643,13 +957,16 @@ impl<'a> Hashing<'a> {
 
 impl Write for Hashing<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let k = self.inner.write(buf)?;
+        let k = self
+            .inner
+            .write(buf)
+            .inspect_err(|_| self.write_failed = true)?;
         self.sha.update(&buf[..k]);
         self.n += k as u64;
         Ok(k)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        self.inner.flush().inspect_err(|_| self.write_failed = true)
     }
 }
 
@@ -871,6 +1188,78 @@ mod tests {
         }
         assert!(b64_quads(b"ab$d").is_none());
         assert!(b64_quads(b"a=bc").is_none());
+    }
+
+    #[test]
+    fn the_space_check_counts_whole_blocks_and_inodes() {
+        let dest = Path::new("/restore/here");
+        let free = |bytes, inodes| FreeSpace {
+            bytes,
+            block: 4096,
+            inodes,
+        };
+        // Three files of 1 B take three blocks.
+        assert!(enough_space(dest, &[1, 1, 1], &free(3 * 4096, None)).is_ok());
+        let err = enough_space(dest, &[1, 1, 1], &free(3 * 4096 - 1, None)).unwrap_err();
+        assert!(
+            err.contains("not enough free space") && err.contains("nothing was written"),
+            "{err}"
+        );
+        // An empty file needs no block, but an inode.
+        assert!(enough_space(dest, &[0, 0], &free(0, Some(2))).is_ok());
+        let err = enough_space(dest, &[0, 0, 0], &free(0, Some(2))).unwrap_err();
+        assert!(err.contains("inodes"), "{err}");
+        // A file system without a fixed inode count (btrfs) is not refused for it.
+        assert!(enough_space(dest, &[0; 10], &free(0, None)).is_ok());
+        assert!(free_space(Path::new(".")).is_some_and(|f| f.block > 0));
+    }
+
+    #[test]
+    fn a_failed_move_puts_every_file_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let staged: Vec<Staged> = ["new.txt", "old.txt", "gone.txt"]
+            .iter()
+            .map(|n| Staged {
+                tmp: sibling(&d.join(n), "tmp"),
+                target: d.join(n),
+                mode: 0,
+            })
+            .collect();
+        std::fs::write(&staged[0].tmp, "fresh").unwrap();
+        std::fs::write(&staged[1].tmp, "replacement").unwrap();
+        std::fs::write(d.join("old.txt"), "mine").unwrap();
+        // gone.txt was never staged: moving it fails after two files moved in.
+        let mut moved = Vec::new();
+        let (what, _) = move_in(&staged, &mut moved).unwrap_err();
+        assert!(what.ends_with("gone.txt"), "{what}");
+        assert_eq!(moved.len(), 2);
+        assert_eq!(std::fs::read(d.join("old.txt")).unwrap(), b"replacement");
+        assert!(undo(&moved, &staged, &[]).is_empty());
+        let left: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["old.txt".to_string()],
+            "only the original is left"
+        );
+        assert_eq!(std::fs::read(d.join("old.txt")).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn write_failures_say_what_happened() {
+        use std::io::{Error, ErrorKind};
+        let dest = Path::new("/mnt/usb");
+        let full = write_failure("a.bin", dest, &Error::from(ErrorKind::StorageFull));
+        assert!(full.contains("the disk is full under /mnt/usb"), "{full}");
+        let big = write_failure("a.bin", dest, &Error::from(ErrorKind::FileTooLarge));
+        assert!(big.contains("too large for the file system"), "{big}");
+        let quota = write_failure("a.bin", dest, &Error::from(ErrorKind::QuotaExceeded));
+        assert!(quota.contains("quota"), "{quota}");
+        let other = write_failure("a.bin", dest, &Error::from(ErrorKind::PermissionDenied));
+        assert!(other.starts_with("a.bin: "), "{other}");
     }
 
     #[test]

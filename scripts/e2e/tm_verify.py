@@ -621,8 +621,12 @@ def verify_grid_against_oracle(block, g, entry, src_root, gate):
     ext = os.path.splitext(rel)[1].lower()
     if ext in (".csv", ".tsv", ".tab"):
         oracle = oracle_delimited(src, "\t" if ext != ".csv" else ",")
-    else:
+    elif ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
         oracle = oracle_workbook(src)
+    else:  # .xlsb / .xls / .ods: openpyxl cannot open them (S13: it raised, the gate crashed)
+        gate.fail(f"{where}: no independent reader for {ext} here (the oracle, openpyxl, reads .xlsx/.xlsm) — "
+                  "its cells were not checked against the source; the grid's own checks ran")
+        return
     with open(src, "rb") as f:
         data = f.read()
     fm = g["file"]

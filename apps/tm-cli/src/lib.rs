@@ -989,6 +989,10 @@ pub struct RestoreCmd {
     /// Decode and check every file against the manifest; write nothing
     #[arg(long)]
     pub check: bool,
+    /// Skip the free-space check before writing (e.g. on a compressing file
+    /// system); a disk that fills up still stops the restore with nothing written
+    #[arg(long)]
+    pub no_space_check: bool,
 }
 
 fn run_restore(a: RestoreCmd) -> i32 {
@@ -999,6 +1003,7 @@ fn run_restore(a: RestoreCmd) -> i32 {
     let opts = tm_core::restore::RestoreOptions {
         overwrite: a.overwrite,
         check_only: a.check,
+        skip_space_check: a.no_space_check,
     };
     let r = match tm_core::restore::restore(&a.archive, &dest, opts) {
         Ok(r) => r,

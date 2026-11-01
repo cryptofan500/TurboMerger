@@ -552,9 +552,14 @@ function App() {
     const next = new Set(excluded);
     for (const e of scanReport.included) {
       const p = e.path.toLowerCase();
+      // Every workbook format the engine reads as TM-GRID (S13: .xlsb,
+      // .xlsm and .ods were dropped by this chip).
       const isDocOrTable =
         p.endsWith(".xlsx") ||
+        p.endsWith(".xlsm") ||
+        p.endsWith(".xlsb") ||
         p.endsWith(".xls") ||
+        p.endsWith(".ods") ||
         p.endsWith(".md") ||
         p.endsWith(".markdown") ||
         p.endsWith(".csv") ||
@@ -851,7 +856,7 @@ function App() {
                   style={{ padding: "3px 8px", fontSize: 12 }}
                   onClick={applyDocsAndTables}
                   disabled={isWorking}
-                  title="Keep only XLSX, XLS, MD, CSV, TSV, TXT"
+                  title="Keep only spreadsheets (XLSX, XLSM, XLSB, XLS, ODS), MD, CSV, TSV, TXT"
                 >
                   Docs &amp; Tables Only
                 </button>
