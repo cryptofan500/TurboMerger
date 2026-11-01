@@ -19,8 +19,10 @@ Subcommands (exit 0 = pass, 5 = a gate failed, 2 = usage):
   cold       --merged M.md --src-root DIR --work DIR
              only M.md and this script go to an empty folder; workbooks are rebuilt
              there from the Markdown alone; the rebuilt cells must equal the originals.
-  restore    ARCHIVE.md --out DIR [--src-root DIR]
+  restore    ARCHIVE.md --out DIR [--src-root DIR] [--no-space-check]
              archive twin → files at their relative paths; size + SHA-256 per manifest.
+             Streamed: memory follows the number of files, not the archive's size.
+             Refuses to start when the files do not fit; stops cleanly on a full disk.
   decode     M.md --out DIR [--xlsx]      (used by `cold`; no source access)
   audit      --merged M.md --src-root DIR --out AUDIT.md
              side-by-side sample (source value vs decoded value) for human reading.
@@ -35,8 +37,10 @@ folder off sys.path).
 import argparse
 import atexit
 import base64
+import binascii
 import csv
 import datetime as dt
+import errno
 import hashlib
 import io
 import json
@@ -1084,74 +1088,354 @@ def cmd_cold(merged, src_root, work, selection=None):
 
 
 # ------------------------------------------------------------------ restore
+#
+# Streamed (S13, HANDOFF_S8 §8.4/§10.4): the archive is read twice in pieces of
+# at most CHUNK bytes. Pass 1 applies md_blocks' rules line by line and keeps
+# every block's content as byte ranges; pass 2 decodes each manifest entry from
+# its ranges straight into the target file while hashing it. Memory follows the
+# number of blocks, not the archive's size: the old whole-text read peaked at
+# 6.5 times the archive (2.79 GiB for a 0.42 GiB twin) and was killed at a 4 GiB
+# cap on the 5.47 GiB S10 twin; this one peaks at about 33 MB on both.
+
+CHUNK = 1 << 20
+FENCE_RE = re.compile(rb"^(`{3,})")
+B64_SPACE = b" \t\r\n\x0b\x0c"
+FULL_ERRNOS = {errno.ENOSPC, errno.EFBIG} | ({errno.EDQUOT} if hasattr(errno, "EDQUOT") else set())
+
 
 def display_path(rel):
     """TurboMerger's block-header form of a path: control characters as \\u{hex}."""
     return "".join(f"\\u{{{ord(c):x}}}" if unicodedata.category(c) == "Cc" else c for c in rel)
 
 
-def cmd_restore(archive, out_dir, src_root=None):
+class PieceJoiner:
+    """join_pieces for byte ranges: blocks arrive in archive order, the pieces of
+    a split file are joined into one list of segments (same rules, same errors).
+    A segment is a (start, end) byte range of the archive or literal bytes."""
+
+    def __init__(self, emit):
+        self.emit, self.cur = emit, None
+
+    def add(self, path, segs):
+        m = PIECE_RE.match(path)
+        if not m:
+            if self.cur:
+                raise SystemExit(f"tm_verify: {self.cur['path']}: piece {self.cur['next']}/{self.cur['n']} is missing")
+            self.emit(path, segs)
+            return
+        base, k, n, cont = m.group(1), int(m.group(2)), int(m.group(3)), bool(m.group(4))
+        # A piece that ends inside a line never had its last newline; the last
+        # piece is read like a whole block (md_blocks drops its last newline).
+        piece = list(segs) + ([] if cont or k == n else [b"\n"])
+        if k == 1 and self.cur is None:
+            self.cur = {"path": base, "segs": piece, "n": n, "next": 2}
+        elif self.cur and self.cur["path"] == base and self.cur["n"] == n and self.cur["next"] == k:
+            self.cur["segs"] += piece
+            self.cur["next"] += 1
+        else:
+            raise SystemExit(f"tm_verify: {base}: piece {k}/{n} is out of order, doubled or from another file")
+        if self.cur["next"] > self.cur["n"]:
+            self.emit(self.cur["path"], self.cur["segs"])
+            self.cur = None
+
+    def close(self):
+        if self.cur:
+            raise SystemExit(f"tm_verify: {self.cur['path']}: piece {self.cur['next']}/{self.cur['n']} is missing")
+
+
+def index_archive(f):
+    """Pass 1: md_blocks' rules (a '## ' line, one empty line, an opening fence of
+    three or more backticks, content up to the first line that equals the fence)
+    applied to a binary file read line by line, at most CHUNK bytes at a time.
+
+    Returns (blocks, binary, manifest, cut): every block's segments by header
+    (a later block wins), the `__binary__: ` blocks by name, the segments of the
+    first `__manifest__` block (or None), and the headers of blocks the file
+    ends inside (no closing fence)."""
+    blocks, binary, manifest, cut = {}, {}, [], []
+
+    def emit(path, segs):
+        if path == "__manifest__" and not manifest:
+            manifest.append(segs)
+        if path.startswith("__binary__: "):
+            binary[path[len("__binary__: "):]] = segs
+        blocks[path] = segs
+
+    joiner = PieceJoiner(emit)
+    scan, hdr1, hdr2, inside = range(4)
+    state, header, fence, start = scan, None, b"", 0
+    pos, at_start = 0, True
+
+    def rest_of_line():
+        """Read on to the end of the current line; its bytes without the newline."""
+        nonlocal pos, at_start
+        parts = []
+        while not at_start:
+            more = f.readline(CHUNK)
+            if not more:
+                break
+            pos += len(more)
+            at_start = more.endswith(b"\n") or len(more) < CHUNK
+            parts.append(more)
+        rest = b"".join(parts)
+        return rest[:-1] if rest.endswith(b"\n") else rest
+
+    while True:
+        raw = f.readline(CHUNK)
+        if not raw:
+            break
+        line_start = pos
+        pos += len(raw)
+        begins = at_start
+        eol = raw.endswith(b"\n")
+        at_start = eol or len(raw) < CHUNK  # a short read without "\n" is the file's last line
+        if not begins:
+            continue  # the rest of a line longer than CHUNK: never a header, blank or fence line
+        body = raw[:-1] if eol else raw
+        if state == inside:
+            if at_start and body == fence:
+                segs = [(start, line_start - 1)] if line_start > start else []
+                joiner.add(header, segs)
+                state = scan
+            continue
+        if state == hdr1:
+            if at_start and body == b"":
+                state = hdr2
+                continue
+            state = scan
+        elif state == hdr2:
+            m = FENCE_RE.match(body)
+            if m:
+                fence = m.group(1)
+                if not at_start:
+                    rest_of_line()
+                state, start = inside, pos
+                continue
+            state = scan
+        if body.startswith(b"## "):
+            whole = body if at_start else body + rest_of_line()
+            header, state = whole[3:].decode("utf-8", "surrogateescape"), hdr1
+    if state == inside:  # md_blocks keeps a cut-off block whole; restore names it
+        cut.append(header)
+        joiner.add(header, [(start, pos)] if pos > start else [])
+    joiner.close()
+    return blocks, binary, (manifest[0] if manifest else None), cut
+
+
+def read_segments(f, segs):
+    """The bytes of a block, CHUNK bytes at a time."""
+    for seg in segs:
+        if isinstance(seg, bytes):
+            if seg:
+                yield seg
+            continue
+        s, e = seg
+        f.seek(s)
+        left = e - s
+        while left > 0:
+            b = f.read(min(CHUNK, left))
+            if not b:
+                raise ValueError(f"the archive ends inside a block (byte {e - left:,})")
+            left -= len(b)
+            yield b
+
+
+def segment_lines(f, segs):
+    """The lines of a block (split on "\\n" only: a manifest path may hold U+2028)."""
+    carry = b""
+    for chunk in read_segments(f, segs):
+        parts = (carry + chunk).split(b"\n")
+        carry = parts.pop()
+        yield from parts
+    if carry:
+        yield carry
+
+
+def text_bytes(chunks, eol, final_newline):
+    """A text block back to the file's bytes, streamed — the rules of the old
+    whole-text reader: CRLF files had their CRs folded into the block, the CR
+    of the last CRLF sits before the closing fence, `final_newline` and `eol`
+    come from the manifest."""
+    crlf = eol == "crlf"
+    carry = b""
+    for c in chunks:
+        if crlf:
+            c, carry = carry + c, b""
+            if c.endswith(b"\r"):  # it may pair with a "\n" in the next piece
+                c, carry = c[:-1], b"\r"
+            c = c.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        if c:
+            yield c
+    if final_newline:
+        yield b"\r\n" if crlf else b"\n"
+
+
+def b64_bytes(chunks):
+    """A base64 block back to bytes, streamed and strict: whitespace is ignored,
+    anything else outside the alphabet, data after padding, or a length that is
+    not a multiple of 4 is an error (ValueError)."""
+    carry, ended = b"", False
+    for c in chunks:
+        c = c.translate(None, B64_SPACE)
+        if not c:
+            continue
+        if ended:
+            raise ValueError("bad base64: data after the padding")
+        c = carry + c
+        whole = len(c) // 4 * 4
+        carry = c[whole:]
+        if whole:
+            q = c[:whole]
+            yield binascii.a2b_base64(q, strict_mode=True)
+            ended = q.endswith(b"=")
+    if carry:
+        raise ValueError("bad base64: length is not a multiple of 4")
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for c in iter(lambda: f.read(CHUNK), b""):
+            h.update(c)
+    return h.hexdigest()
+
+
+def free_space(path):
+    """(bytes free to this user, block size, inodes free or None) where `path`
+    is or would be created."""
+    p = os.path.abspath(path)
+    while not os.path.exists(p) and os.path.dirname(p) != p:
+        p = os.path.dirname(p)
+    if hasattr(os, "statvfs"):
+        st = os.statvfs(p)
+        return st.f_bavail * st.f_frsize, st.f_frsize or 4096, (st.f_favail if st.f_files else None)
+    return shutil.disk_usage(p).free, 4096, None
+
+
+def gib(n):
+    return f"{n:,} B ({n / 2**30:.2f} GiB)"
+
+
+def cmd_restore(archive, out_dir, src_root=None, space_check=True):
     gate = Gate("restore")
-    with open(archive, encoding="utf-8", newline="") as f:
-        text = f.read()
-    blocks = md_blocks(text)
-    man = next((b for b in blocks if b["path"] == "__manifest__"), None)
-    if man is None:
+    with open(archive, "rb") as f:
+        blocks, bins, manifest, cut = index_archive(f)
+    for h in cut:
+        gate.fail(f"block `{h}` has no closing fence (archive cut off?)")
+    if manifest is None:
         gate.fail("no ## __manifest__ block")
         return gate
-    lines = [json.loads(x) for x in man["content"].splitlines() if x.strip()]
-    entries = [x for x in lines if "path" in x]
-    for h in (x for x in lines if "archive" in x):
-        if h.get("parts", 1) != 1:
-            gate.fail(f"this archive is part {h.get('part')} of {h.get('parts')}: use `turbomerger restore` with every part")
-            return gate
-    bins = {b["path"][len("__binary__: "):]: b["content"] for b in blocks if b["path"].startswith("__binary__: ")}
-    content = {b["path"]: b for b in blocks}
-    os.makedirs(out_dir, exist_ok=True)
-    for e in entries:
-        rel = e["path"]
-        parts = rel.replace("\\", "/").split("/")
-        if os.path.isabs(rel) or re.match(r"^[A-Za-z]:", rel) or ".." in parts or "" in parts:
-            gate.fail(f"{rel}: unsafe path (absolute, drive, empty or '..' part) — not written")
-            continue
-        if e.get("kind") in ("withheld", "missing"):
-            gate.fail(f"{rel}: {e['kind']} — {e.get('reason', 'no reason given')}")
-            continue
-        target = os.path.join(out_dir, rel)
-        os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
-        head = display_path(rel)
-        if head in bins:
-            data = base64.b64decode("".join(bins[head].split()))
-        elif e.get("kind") == "text" and head in content:
-            body = content[head]["content"]
-            if e.get("eol") == "crlf":
-                body = body.replace("\r\n", "\n")
-                if body.endswith("\r"):  # the CR of the last CRLF sits before the closing fence
-                    body = body[:-1]
-            if e.get("final_newline") and e["bytes"] > 0:
-                body += "\n"
-            if e.get("eol") == "crlf":
-                body = body.replace("\n", "\r\n")
-            data = body.encode("utf-8") if e["bytes"] > 0 else b""
-        else:
-            gate.fail(f"{rel}: {e.get('kind')} file has no embedded bytes (use --embed-binary)")
-            continue
-        with open(target, "wb") as f:
-            f.write(data)
-        if e.get("mode"):
-            os.chmod(target, e["mode"] & 0o777)
-        sha = hashlib.sha256(data).hexdigest()
-        if len(data) != e["bytes"] or sha != e["sha256"]:
-            gate.fail(f"{rel}: restored {len(data)} B sha {sha[:12]} ≠ manifest {e['bytes']} B {e['sha256'][:12]}")
-            continue
-        if src_root:
-            with open(os.path.join(src_root, rel), "rb") as f:
-                if hashlib.sha256(f.read()).hexdigest() != sha:
-                    gate.fail(f"{rel}: restored file ≠ the original on disk")
+    with open(archive, "rb") as mf, open(archive, "rb") as data:
+        def entries():
+            for no, line in enumerate(segment_lines(mf, manifest), 1):
+                if line.strip():
+                    try:
+                        yield json.loads(line)
+                    except ValueError as err:
+                        raise SystemExit(f"tm_verify: manifest line {no} is not JSON: {err}") from None
+
+        def source_of(e):
+            head = display_path(e["path"])
+            if head in bins:
+                return "binary", bins[head]
+            if e.get("kind") == "text" and head in blocks:
+                return "text", blocks[head]
+            return None, None
+
+        # Pass 2a: the part headers (a part of a split set is refused before anything
+        # is written) and what the files to write need on disk.
+        total, need, files = 0, 0, 0
+        _, block, _ = free_space(out_dir)
+        for e in entries():
+            if "archive" in e and e.get("parts", 1) != 1:
+                gate.fail(f"this archive is part {e.get('part')} of {e.get('parts')}: use `turbomerger restore` with every part")
+                return gate
+            if "path" in e:
+                total += 1
+                if e.get("kind") not in ("withheld", "missing") and source_of(e)[0]:
+                    need += -(-int(e.get("bytes", 0)) // block) * block
+                    files += 1
+        if space_check:
+            avail, _, inodes = free_space(out_dir)
+            short = None
+            if need > avail:
+                short = (f"not enough free space for {out_dir}: the {files} files need {gib(need)}, "
+                         f"{gib(avail)} free — nothing was written (--no-space-check skips this check)")
+            elif inodes is not None and files > inodes:
+                short = f"not enough free inodes for {out_dir}: {files} files, {inodes:,} free — nothing was written"
+            if short:
+                gate.fail(short)
+                gate.add("manifest_files", total)
+                return gate
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Pass 2b: every file decoded from its block straight into place.
+        stopped, not_written = None, 0
+        for e in entries():
+            if "path" not in e:
+                continue
+            rel = e["path"]
+            if stopped:
+                not_written += 1
+                continue
+            parts = rel.replace("\\", "/").split("/")
+            if os.path.isabs(rel) or re.match(r"^[A-Za-z]:", rel) or ".." in parts or "" in parts:
+                gate.fail(f"{rel}: unsafe path (absolute, drive, empty or '..' part) — not written")
+                continue
+            if e.get("kind") in ("withheld", "missing"):
+                gate.fail(f"{rel}: {e['kind']} — {e.get('reason', 'no reason given')}")
+                continue
+            kind, segs = source_of(e)
+            if kind is None:
+                gate.fail(f"{rel}: {e.get('kind')} file has no embedded bytes (use --embed-binary)")
+                continue
+            if kind == "binary":
+                chunks = b64_bytes(read_segments(data, segs))
+            elif e["bytes"] > 0:
+                chunks = text_bytes(read_segments(data, segs), e.get("eol"), e.get("final_newline"))
+            else:
+                chunks = iter(())
+            target = os.path.join(out_dir, rel)
+            h, n, opened = hashlib.sha256(), 0, False
+            try:
+                os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+                with open(target, "wb") as out:
+                    opened = True
+                    for c in chunks:
+                        out.write(c)
+                        h.update(c)
+                        n += len(c)
+            except (ValueError, OSError) as err:
+                if opened and os.path.isfile(target):
+                    os.remove(target)  # a half-written file is not the file
+                if not isinstance(err, OSError):
+                    gate.fail(f"{rel}: {err} — not written")
+                elif err.errno in FULL_ERRNOS:
+                    why = ("file too large for this file system" if err.errno == errno.EFBIG
+                           else "disk full" if err.errno == errno.ENOSPC else "disk quota exceeded")
+                    stopped = (f"{rel}: {why} ({err.strerror}) after {n:,} of {e['bytes']:,} B — "
+                               f"the partial file was removed; {gib(free_space(out_dir)[0])} free")
+                    gate.fail(stopped)
+                else:
+                    gate.fail(f"{rel}: {err}")
+                continue
+            if e.get("mode"):
+                os.chmod(target, e["mode"] & 0o777)
+            sha = h.hexdigest()
+            if n != e["bytes"] or sha != e["sha256"]:
+                gate.fail(f"{rel}: restored {n} B sha {sha[:12]} ≠ manifest {e['bytes']} B {e['sha256'][:12]}")
+                continue
+            if src_root:
+                orig = os.path.join(src_root, rel)
+                if not os.path.isfile(orig) or file_sha256(orig) != sha:
+                    gate.fail(f"{rel}: restored file ≠ the original on disk"
+                              + ("" if os.path.isfile(orig) else " (not found under --src-root)"))
                     continue
-        gate.add("byte_identical")
-        gate.add("bytes", len(data))
-    gate.add("manifest_files", len(entries))
+            gate.add("byte_identical")
+            gate.add("bytes", n)
+        if stopped:
+            gate.fail(f"restore stopped at the full disk: {not_written} more file(s) not written")
+    gate.add("manifest_files", total)
     return gate
 
 
@@ -1303,6 +1587,138 @@ def run_checks(md, js, root, sel):
     return gates
 
 
+DISK_FULL_SH = r'''m=$1; shift
+mount -t tmpfs -o size=8k none "$m" || exit 99
+"$@"
+echo "@@rc=$?"
+find "$m" -type f -printf '@@file %s %P\n'
+'''
+
+
+def disk_full_check(archive, tm):
+    """Both readers restore `archive` into an 8 KiB file system (a tmpfs in an
+    unprivileged mount namespace, `unshare -rm`): with the space check each must
+    refuse before writing; without it each must stop at the full disk with its
+    message — no traceback, no half-written file (the binary: no file at all).
+    Returns [(ok, line)], or None when this machine cannot mount a tmpfs."""
+    if not shutil.which("unshare"):
+        return None
+    me = os.path.abspath(__file__)
+    out = []
+    with tempfile.TemporaryDirectory(prefix="tm_verify_full_") as mnt:
+        def run(cmd):
+            r = subprocess.run(["unshare", "-rm", "sh", "-c", DISK_FULL_SH, "sh", mnt, *cmd],
+                               capture_output=True, text=True)
+            m = re.search(r"^@@rc=(\d+)$", r.stdout, re.M)
+            files = re.findall(r"^@@file (\d+) (.*)$", r.stdout, re.M)
+            return (int(m.group(1)) if m else None), files, r.stdout + r.stderr, r.returncode
+
+        dest = os.path.join(mnt, "out")
+        py = [sys.executable, "-P", me, "restore", archive, "--out", dest]
+        rc, files, text, raw = run(py)
+        if raw == 99 or rc is None:
+            return None
+        ok = rc == EXIT_GATE and "not enough free space" in text and not files and "Traceback" not in text
+        out.append((ok, f"tm_verify restore into 8 KiB: refused before writing (exit {rc}, {len(files)} files)"))
+        rc, files, text, _ = run(py + ["--no-space-check"])
+        m = re.search(r"FAIL (.+?): disk full", text)
+        half = [f for f in files if m and f[1] == "out/" + m.group(1)]
+        ok = rc == EXIT_GATE and m is not None and not half and "Traceback" not in text
+        out.append((ok, f"tm_verify restore --no-space-check: stopped at the full disk (exit {rc}), "
+                        f"failing file {'removed' if m and not half else 'LEFT HALF-WRITTEN' if half else 'not named'}"))
+        helptext = subprocess.run([tm, "restore", "--help"], capture_output=True, text=True).stdout
+        if "--no-space-check" not in helptext:
+            out.append((True, "[--] turbomerger restore has no free-space check (binary made before S13)"))
+            return out
+        nat = [tm, "restore", archive, "--dest", dest]
+        rc, files, text, _ = run(nat)
+        ok = rc == 1 and "not enough free space" in text and not files
+        out.append((ok, f"turbomerger restore into 8 KiB: refused before writing (exit {rc}, {len(files)} files)"))
+        rc, files, text, _ = run(nat + ["--no-space-check"])
+        ok = rc == 1 and "disk is full" in text and not files
+        out.append((ok, f"turbomerger restore --no-space-check: stopped at the full disk (exit {rc}), "
+                        f"{len(files)} files left (all or nothing)"))
+    return out
+
+
+def whole_text_rule(content, eol, final_newline):
+    """The pre-S13 whole-text restore rule for one text block (the reference)."""
+    body = content.decode("utf-8", "surrogateescape")
+    if eol == "crlf":
+        body = body.replace("\r\n", "\n")
+        if body.endswith("\r"):
+            body = body[:-1]
+    if final_newline:
+        body += "\n"
+    if eol == "crlf":
+        body = body.replace("\n", "\r\n")
+    return body.encode("utf-8", "surrogateescape")
+
+
+def streaming_equivalence(archive_texts):
+    """The streamed restore equals the in-memory rules however the input is cut:
+    index_archive (CHUNK of 5, 64 and 1 MiB bytes) finds the same blocks with
+    the same content as md_blocks, text_bytes equals the whole-text rule, and
+    b64_bytes decodes RFC 2045 lines cut at any byte. Returns failure lines."""
+    global CHUNK
+    import random  # noqa: PLC0415
+    rnd = random.Random(13)
+    fails = []
+    tricky = (
+        "intro\n## no blank\n```\nnot a block\n```\n\n## no fence\n\nplain\n"
+        "## a.md\n\n````md\n## inside\n```\nthree\n```\n````\n\n"
+        "## crlf.txt\n\n```\nx\r\ny\r\n```\n\n## long.txt\n\n```\n" + "w" * 300 + "\n" + "v" * 70 + "\n```\n\n"
+        "## big (piece 1/2, line continues)\n\n```\nhalf a li\n```\n\n## big (piece 2/2)\n\n```\nne\nend\n```\n\n"
+        "## p (piece 1/3)\n\n```\nl1\n```\n\n## p (piece 2/3, line continues)\n\n```\nl2 hal\n```\n\n"
+        "## p (piece 3/3)\n\n```\nf\nl3\n```\n\n"
+        "## empty\n\n```\n```\n\n## __binary__: b.bin\n\n```base64\nAAEC\nAw==\n```\n\n"
+        # Read 5 bytes at a time, the second piece of a line looks like a header / a fence.
+        "xxxxx## fake\n\n```\nnot a block\n```\n\n## held.md\n\n```\naaaaa```\nstill inside\n```\n\n"
+        "## cut\n\n```\nno closing fence\n"
+    )
+    ends_on_fence = "## last.md\n\n```\nthe file ends on the fence\n```"
+    saved = CHUNK
+    try:
+        for t_i, text in enumerate([tricky, ends_on_fence, *archive_texts]):
+            want = {b["path"]: b["content"] for b in md_blocks(text)}
+            raw = text.encode("utf-8", "surrogateescape")
+            for size in (5, 64, 1 << 20):
+                CHUNK = size
+                f = io.BytesIO(raw)
+                blocks, _, _, _ = index_archive(f)
+                got = {p: b"".join(read_segments(f, s)).decode("utf-8", "surrogateescape") for p, s in blocks.items()}
+                if got != want:
+                    diff = sorted(set(got.items()) ^ set(want.items()))[:1]
+                    fails.append(f"index_archive (text {t_i}, CHUNK {size}) ≠ md_blocks: {str(diff)[:120]}")
+    finally:
+        CHUNK = saved
+    for _ in range(400):
+        body = bytes(rnd.choice(b"ab\r\n\xc5\x82") for _ in range(rnd.randint(0, 40)))
+        for eol in ("lf", "crlf"):
+            for fin in (False, True):
+                want = whole_text_rule(body, eol, fin)
+                for size in (1, 2, 3, 7):
+                    got = b"".join(text_bytes(iter([body[i:i + size] for i in range(0, len(body), size)]), eol, fin))
+                    if got != want:
+                        fails.append(f"text_bytes({body!r}, {eol}, final_newline={fin}, cut {size}) ≠ whole-text rule")
+    for n in list(range(0, 12)) + [57, 58, 1000]:
+        data = bytes(rnd.randrange(256) for _ in range(n))
+        enc = base64.b64encode(data)
+        lines = b"".join(enc[i:i + 76] + b"\n" for i in range(0, len(enc), 76)) or b"\n"
+        for size in (1, 3, 4, 77):
+            got = b"".join(b64_bytes(iter([lines[i:i + size] for i in range(0, len(lines), size)])))
+            if got != data:
+                fails.append(f"b64_bytes: {n} bytes cut at {size} decode wrong")
+    for bad in (b"AAE$", b"AA=A", b"AAEC\nAw==\nAAAA\n", b"AAE", b"AAEC\nAw==\n\nQQ==\n"):
+        for size in (len(bad), 1, 3, 4, 10):
+            try:
+                b"".join(b64_bytes(iter([bad[i:i + size] for i in range(0, len(bad), size)])))
+                fails.append(f"b64_bytes accepted {bad!r} cut at {size}")
+            except ValueError:
+                pass
+    return fails
+
+
 def cmd_selftest(bin_arg):
     tm = find_bin(bin_arg)
     if not tm:
@@ -1423,6 +1839,12 @@ def cmd_selftest(bin_arg):
             ok = False
         else:
             print("  [ok] a one-byte change in the archive is detected by restore")
+        full = disk_full_check(ar, tm)
+        if full is None:
+            print("  [--] disk-full check skipped: no unprivileged mount namespace (unshare -rm) here")
+        for good, line in full or []:
+            print(f"  [{'ok' if good else '!!'}] {line}")
+            ok &= good
         # Redaction must never leak through the twin (HANDOFF_S8 §6.10 item 1).
         secret = "Vr7wKp2walKotwica91"
         with open(os.path.join(src, "secret.md"), "w", encoding="utf-8") as f:
@@ -1476,6 +1898,13 @@ def cmd_selftest(bin_arg):
             print(f"  [!!] split: exit {r.returncode}, {len(names)} parts, {pieces} pieces, over budget: {over[:1]}, "
                   f"grid {'PASS' if pg.ok else pg.fails[:1]}")
             ok = False
+        se = streaming_equivalence([atext, jtext])
+        for line in se[:5]:
+            print(f"  [!!] {line}")
+        if se:
+            ok = False
+        else:
+            print("  [ok] streamed restore = in-memory rules (blocks at CHUNK 5 / 64 / 1 MiB; text and base64 cut at any byte)")
         ok &= detected == len(mutations)
     print("SELFTEST", "PASS" if ok else "FAIL")
     return EXIT_OK if ok else EXIT_GATE
@@ -1510,6 +1939,8 @@ def main():
     p.add_argument("archive")
     p.add_argument("--out", required=True)
     p.add_argument("--src-root")
+    p.add_argument("--no-space-check", action="store_true",
+                   help="skip the free-space check before writing (a full disk still stops the restore cleanly)")
     p = sub.add_parser("decode")
     p.add_argument("merged")
     p.add_argument("--out", required=True)
@@ -1539,7 +1970,7 @@ def main():
     elif a.cmd == "cold":
         gates = [cmd_cold(a.merged, a.src_root, a.work)]
     elif a.cmd == "restore":
-        gates = [cmd_restore(a.archive, a.out, a.src_root)]
+        gates = [cmd_restore(a.archive, a.out, a.src_root, space_check=not a.no_space_check)]
     elif a.cmd == "decode":
         gates = [cmd_decode(a.merged, a.out, a.xlsx)]
     elif a.cmd == "audit":
