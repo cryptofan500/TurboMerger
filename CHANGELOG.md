@@ -8,6 +8,35 @@ Stops the silent content loss, corruption and write-anywhere paths found in the
 2026-09-24 audit (`TURBOMERGER_refactor_september24_2026_v2.md`, findings N-xx).
 Every fix ships with its repro turned into a test (96 → 156 Rust tests).
 
+### Named files are merged; `--version` names the commit (2026-11-07)
+
+- A file named in `--files-from`, `--selection` or a desktop plan is merged even if a
+  folder scan would leave it out as bloat (lockfiles such as `package-lock.json` and
+  `Cargo.lock`, minified bundles, `.map`, `turbomerger.toml` exclusions). Before, an SSM
+  list of 253 files gave 250 and exit 0. Folder scans are unchanged.
+- A named file a safety rule keeps out is now "not captured" (exit 3, reason "named but
+  withheld: …"), not quietly "excluded on purpose". The rules: a credential file while
+  redacting (also behind a link with another name); anything in `.ssh/`, `.aws/` or
+  `.gnupg/`; a previous TurboMerger output. A withheld file never goes into the archive
+  twin either. A named binary file without `--complete` is
+  "named but not merged" (exit 3); with `--complete`, the archive twin keeps it as before.
+- The desktop "include anyway" rescue no longer lifts credential protection while
+  redacting, nor a credential directory (F12). Such a rescue is refused and reported as
+  not captured.
+- `--list-only` uses the merge's own plan scan and exit rule, now including
+  `--fail-on-skip`. Named binaries kept by the twin are listed as `TWIN BYTES`.
+- Walk fix: a symlink to a credential file (while redacting) or into a credential
+  directory is left out. Before, it was merged under the link's name.
+- `turbomerger --version` prints `7.7.0+<commit> (<commit date>)`, with `.dirty` for
+  uncommitted changes (`apps/tm-cli/build.rs`). The Dev build printed a bare `7.7.0`,
+  like the retired 2026-08 package.
+- ADR 0020 addendum 2026-11-07; tests: `named_lockfiles_minified_and_cache_files_are_merged_walks_unchanged`,
+  `named_files_held_back_by_a_safety_rule_are_not_captured`,
+  `desktop_plan_and_rescue_paths_follow_named_equals_wanted`,
+  `named_lockfiles_are_merged_and_lists_agree_with_the_merge`,
+  `named_files_a_safety_rule_holds_back_exit_3_and_stay_out`,
+  `version_names_the_commit_it_was_built_from`.
+
 ### Desktop app = CLI, except cuts inside a file (2026-11-01, session 14)
 
 - Advanced options in the app for what only the CLI had: stop and continue later

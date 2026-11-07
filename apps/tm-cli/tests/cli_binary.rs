@@ -34,6 +34,33 @@ fn version_and_help_work_without_a_display() {
 }
 
 #[test]
+fn version_names_the_commit_it_was_built_from() {
+    // E2 (2026-11-07): the Dev build printed a bare 7.7.0, like the retired
+    // 2026-08 package. Built from git, the stamp names HEAD and its date.
+    let tmp = tempfile::tempdir().unwrap();
+    let head = Command::new("git")
+        .args([
+            "-C",
+            env!("CARGO_MANIFEST_DIR"),
+            "rev-parse",
+            "--short=7",
+            "HEAD",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let o = tm(&["--version"], tmp.path());
+    let v = stdout(&o);
+    let want = format!("turbomerger {}", env!("CARGO_PKG_VERSION"));
+    assert!(v.starts_with(&want), "{v}");
+    if let Some(sha) = head {
+        assert!(v.contains(&format!("+{sha}")), "{v} lacks {sha}");
+        assert!(v.trim_end().ends_with(')'), "{v}");
+    }
+}
+
+#[test]
 fn a3_usage_errors_exit_2_and_write_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("fx");
@@ -578,6 +605,232 @@ fn complete_plans_keep_every_named_file_and_name_what_cannot_come_back() {
         "the twin is Markdown only: {}",
         stderr(&o)
     );
+}
+
+/// The named-file fixture of the 2026-11-07 lockfile handoff (synthetic
+/// content only): five files a folder walk leaves out or keeps.
+const NAMED: [(&str, &str); 5] = [
+    ("app.js", "console.log('app');\n"),
+    (
+        "package-lock.json",
+        "{\n  \"name\": \"root-lock\",\n  \"lockfileVersion\": 3\n}\n",
+    ),
+    ("web/package-lock.json", "{\n  \"name\": \"web-lock\"\n}\n"),
+    (
+        "Cargo.lock",
+        "version = 4\n\n[[package]]\nname = \"cargo-lock-entry\"\n",
+    ),
+    ("vendor.min.js", "!function(){window.minifiedBundle=1}();\n"),
+];
+const SYNTHETIC_SECRET: &str = "sk-synthetic-0123456789abcdef0123";
+
+fn named_fixture(tmp: &Path) -> std::path::PathBuf {
+    let src = tmp.join("src");
+    fs::create_dir_all(src.join("web")).unwrap();
+    for (rel, body) in NAMED {
+        fs::write(src.join(rel), body).unwrap();
+    }
+    fs::write(src.join(".env"), format!("API_TOKEN={SYNTHETIC_SECRET}\n")).unwrap();
+    fs::write(src.join("logo.png"), b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+    fs::write(tmp.join("outside.txt"), "OUTSIDE-CONTENT\n").unwrap();
+    fs::create_dir_all(src.join(".ssh")).unwrap();
+    fs::write(src.join(".ssh/config"), "Host synthetic-ssh-entry\n").unwrap();
+    fs::write(src.join("prev_merged.md"), "# PREVIOUS-OUTPUT\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(tmp.join("outside.txt"), src.join("escape.txt")).unwrap();
+    src
+}
+
+fn tm_owned(args: &[String], cwd: &Path) -> Output {
+    let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    tm(&a, cwd)
+}
+
+#[test]
+fn named_lockfiles_are_merged_and_lists_agree_with_the_merge() {
+    // ADR 0020 addendum 2026-11-07, D8 "named = included": the SSM selection
+    // named 253 files and got 250 with exit 0 — three lockfiles were left out
+    // as "context bloat". A named file is merged; the walk is unchanged.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = named_fixture(tmp.path());
+    let src_s = src.to_string_lossy().into_owned();
+    let names: Vec<&str> = NAMED.iter().map(|f| f.0).collect();
+    let list = tmp.path().join("list.txt");
+    fs::write(&list, names.join("\n") + "\n").unwrap();
+    let plan = tmp.path().join("plan.toml");
+    // `ordering = "plan"`: what a --files-from list gets (`from_paths`).
+    let mut toml = String::from("version = 1\nmode = \"explicit\"\nordering = \"plan\"\n");
+    for n in &names {
+        toml.push_str(&format!("[[file]]\npath = \"{n}\"\n"));
+    }
+    fs::write(&plan, toml).unwrap();
+    let pick = |flag: &str| -> Vec<String> {
+        let file = if flag == "--files-from" { &list } else { &plan };
+        vec![flag.into(), file.to_string_lossy().into_owned()]
+    };
+    let merge = |out: &str, extra: &[String]| -> (Output, String) {
+        let out = tmp.path().join(out);
+        let mut args = vec![
+            "merge".to_string(),
+            src_s.clone(),
+            out.to_string_lossy().into_owned(),
+        ];
+        args.push("--yes".into());
+        args.extend_from_slice(extra);
+        let o = tm_owned(&args, tmp.path());
+        (o, fs::read_to_string(&out).unwrap_or_default())
+    };
+
+    for flag in ["--files-from", "--selection"] {
+        let (o, text) = merge(&format!("named{flag}.md"), &pick(flag));
+        assert_eq!(o.status.code(), Some(0), "{flag}: {}", stdout(&o));
+        assert!(
+            stdout(&o).contains("merged=5 scan_skipped=0 "),
+            "{flag}: {}",
+            stdout(&o)
+        );
+        for (rel, body) in NAMED {
+            assert!(text.contains(body), "{flag}: {rel} not merged verbatim");
+        }
+        assert!(!text.contains("context bloat"), "{flag}");
+        // --fail-on-skip: nothing named was skipped.
+        let mut strict = pick(flag);
+        strict.push("--fail-on-skip".into());
+        let (o, _) = merge(&format!("strict{flag}.md"), &strict);
+        assert_eq!(o.status.code(), Some(0), "{flag}: {}", stdout(&o));
+    }
+
+    // --list-only lists what the merge merges, the same for both flags.
+    let listed: Vec<String> = ["--files-from", "--selection"]
+        .iter()
+        .map(|flag| {
+            let mut extra = pick(flag);
+            extra.push("--list-only".into());
+            let (o, _) = merge("unused.md", &extra);
+            assert_eq!(o.status.code(), Some(0), "{flag}: {}", stdout(&o));
+            stdout(&o)
+        })
+        .collect();
+    assert_eq!(listed[0], listed[1]);
+    for n in &names {
+        assert!(listed[0].contains(n), "{n}: {}", listed[0]);
+    }
+    assert!(listed[0].contains("\n5 files, "), "{}", listed[0]);
+    assert!(!tmp.path().join("unused.md").exists());
+
+    // The folder walk is unchanged: lockfiles and bundles stay out on
+    // purpose, exit 0; --fail-on-skip fails it, and the list predicts that.
+    let (o, text) = merge("walk.md", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(text.contains("console.log('app');"));
+    for gone in [
+        "root-lock",
+        "web-lock",
+        "cargo-lock-entry",
+        "minifiedBundle",
+    ] {
+        assert!(!text.contains(gone), "walk merged {gone}");
+    }
+    assert!(text.contains("lock/system file (context bloat)"));
+    let (o, _) = merge("walk2.md", &["--fail-on-skip".into()]);
+    assert_eq!(o.status.code(), Some(3));
+    let (o, _) = merge("walk3.md", &["--fail-on-skip".into(), "--list-only".into()]);
+    assert_eq!(o.status.code(), Some(3), "{}", stdout(&o));
+}
+
+#[test]
+fn named_files_a_safety_rule_holds_back_exit_3_and_stay_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = named_fixture(tmp.path());
+    let src_s = src.to_string_lossy().into_owned();
+    let run = |out: &str, names: &[&str], extra: &[&str]| -> (Output, String) {
+        let list = tmp.path().join(format!("{out}.list"));
+        fs::write(&list, names.join("\n") + "\n").unwrap();
+        let out = tmp.path().join(out);
+        let mut args: Vec<String> = vec![
+            "merge".into(),
+            src_s.clone(),
+            out.to_string_lossy().into_owned(),
+            "--yes".into(),
+            "--files-from".into(),
+            list.to_string_lossy().into_owned(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let o = tm_owned(&args, tmp.path());
+        (o, fs::read_to_string(&out).unwrap_or_default())
+    };
+
+    // A named credential file while redacting: withheld, exit 3, its value
+    // nowhere in the output; the named lockfile is still merged.
+    let (o, text) = run("redacted.md", &["package-lock.json", ".env"], &["--redact"]);
+    assert_eq!(o.status.code(), Some(3), "{}", stdout(&o));
+    assert!(stdout(&o).contains("not_captured=1"), "{}", stdout(&o));
+    assert!(text.contains("root-lock"));
+    assert!(text.contains("named but withheld: env file"), "{text}");
+    assert!(!text.contains(SYNTHETIC_SECRET));
+    assert!(!stdout(&o).contains(SYNTHETIC_SECRET));
+    let (o, _) = run(
+        "redacted-list.md",
+        &["package-lock.json", ".env"],
+        &["--redact", "--list-only"],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", stdout(&o));
+    assert!(stdout(&o).contains("NOT CAPTURED  .env"), "{}", stdout(&o));
+    assert!(!stdout(&o).contains(SYNTHETIC_SECRET));
+    // Redaction off takes every text file, named ones included.
+    let (o, text) = run("open.md", &[".env"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(text.contains(SYNTHETIC_SECRET));
+
+    // A named picture: not text, so not merged without the archive twin
+    // (exit 3); --complete keeps its bytes (exit 0), and the list says so.
+    let (o, _) = run("pic.md", &["app.js", "logo.png"], &[]);
+    assert_eq!(o.status.code(), Some(3), "{}", stdout(&o));
+    assert!(stdout(&o).contains("not_captured=1"), "{}", stdout(&o));
+    let (o, text) = run("pic-twin.md", &["app.js", "logo.png"], &["--complete"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(text.contains("## __binary__: logo.png"));
+    let (o, _) = run(
+        "pic-list.md",
+        &["app.js", "logo.png"],
+        &["--complete", "--list-only"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains("TWIN BYTES    logo.png"),
+        "{}",
+        stdout(&o)
+    );
+
+    // A credential directory and a previous output stay out even with the
+    // archive twin and redaction off: no text, no embedded bytes.
+    let (o, text) = run(
+        "withheld-twin.md",
+        &["app.js", ".ssh/config", "prev_merged.md"],
+        &["--complete"],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", stdout(&o));
+    assert!(stdout(&o).contains("not_captured=2"), "{}", stdout(&o));
+    assert!(!text.contains("synthetic-ssh-entry") && !text.contains("PREVIOUS-OUTPUT"));
+    assert!(
+        !text.contains("## __binary__: .ssh/config")
+            && !text.contains("## __binary__: prev_merged.md")
+    );
+
+    // Missing, `..` and a symlink out of the folder: not captured, exit 3,
+    // nothing outside the source folder read.
+    let mut names = vec!["app.js", "missing.txt", "../outside.txt"];
+    if cfg!(unix) {
+        names.push("escape.txt");
+    }
+    let (o, text) = run("escape.md", &names, &[]);
+    assert_eq!(o.status.code(), Some(3), "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains(&format!("not_captured={}", names.len() - 1)),
+        "{}",
+        stdout(&o)
+    );
+    assert!(!text.contains("OUTSIDE-CONTENT"));
 }
 
 #[test]

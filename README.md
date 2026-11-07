@@ -357,7 +357,8 @@ docs/adr/                    architecture decision records
 |---|---|
 | `merge SRC OUT --selection PLAN.tmsel.toml` | Merge exactly the files (and parts of files) the plan lists; never walks `SRC` ([ADR 0020](docs/adr/0020-selection-plans-and-slices.md)). A missing file or a selector that matches nothing is "not captured" (exit 3). |
 | `--files-from LIST` (`-` = stdin, `-0` = NUL) | The same with a plain path list. |
-| `--list-only`, `--emit-selection FILE` | Show / save what would be merged, as a plan you can edit. |
+| (named files) | A file you name is merged even if a folder scan would leave it out as bloat: lockfiles, minified bundles, `.map`. Safety rules still hold, and a named file they keep out (a credential file while redacting, anything in `.ssh/` `.aws/` `.gnupg/`, a previous output, a binary without `--complete`) is "not captured", exit 3 ([ADR 0020 addendum 2026-11-07](docs/adr/0020-selection-plans-and-slices.md)). |
+| `--list-only`, `--emit-selection FILE` | Show / save what would be merged, as a plan you can edit. `--list-only` exits like the merge (3 when a named file is not captured; with `--fail-on-skip`, when any file is skipped). |
 | `--budget-tokens N` | Exit 5 if the output would be over N tokens. |
 | `outline FILE` | Headings of a Markdown file, sheets of a workbook — to write selectors. |
 | `--checkpoint` / `--resume` | Keep `OUT.tm-checkpoint/` beside the output so a stopped run (Ctrl-C, kill, crash, deadline) continues with `--resume`: files unchanged since (size and modification time) are not read again and the output equals an uninterrupted run's. Not with `--redact`; needs an explicit OUTPUT (ADR 0024). |

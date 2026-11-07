@@ -55,3 +55,45 @@
   (`mode`); not timestamps, owners, empty folders or symlinks (a symlink in the source is
   archived as the file it points to). Names that differ only in case, or that Windows
   refuses, are reported as warnings.
+
+## Addendum (2026-11-07): a named file is wanted
+
+- **Why.** An SSM selection named 253 files by exact path and got 250 with exit 0: its
+  three `package-lock.json` were "lock/system file (context bloat) [excluded on
+  purpose]". The explicit list ran the folder walk's bloat rules, and only a "not
+  captured" entry fails a merge, so named files went missing with no failure: the quiet
+  gap this ADR rules out. Decision D8 (Pawel, 2026-11-07): named = included.
+- **Rule.** In explicit mode (`--files-from`, `--selection`, desktop "Load plan…") a
+  named file is merged when its bytes are text or a document, whatever its name:
+  - The walk's bloat rules do not apply. That covers lockfiles and system files by name
+    (`package-lock.json`, `Cargo.lock`, `yarn.lock`, `go.sum`, `desktop.ini`, …), minified
+    bundles (`*.min.js`, `*.bundle.js`), `turbomerger.toml` extension exclusions, and the
+    pictures OCR skips as not worth reading. Extensions on the binary list only because
+    they are build caches (`.lock`, `.map`, `.tsbuildinfo`, `.eslintcache`) go to the
+    content check, so `.lockb` stays binary.
+  - The safety rules still apply. A named file they hold back is **not captured**: exit 3,
+    a Merge Report entry, and a `NOT CAPTURED` line in `--list-only`, with a reason that
+    starts `named but withheld:`. The rules: a credential file while secrets are redacted
+    (`.env`, key material, credential stores, also when a link with another name points
+    at one); anything inside `.ssh/`, `.aws/` or `.gnupg/` (never scanned, redaction on
+    or off); a previous TurboMerger output (`*_merged.md`, …). Paths outside the source
+    folder (`..`, absolute, a symlink that resolves outside) and missing paths were
+    already not captured. A withheld file never goes into the archive twin either:
+    no text and no embedded bytes.
+  - A named binary file has no text. Without `--complete` it is **not captured** ("named
+    but not merged", exit 3). With `--complete` its bytes go to the archive twin (a
+    `binary` entry, exit 0, `TWIN BYTES` in `--list-only`), as in the 2026-10-31 addendum.
+- **Unchanged.** A folder walk keeps every rule as before: lockfiles, bundles and
+  binaries are excluded on purpose, with exit 0. `--fail-on-skip` still turns any skipped
+  file into exit 3.
+- **Rescue** (desktop "include anyway", `MergeOptions::force_include`). It lifts the
+  walk's rules for the files it names. It never lifts credential protection while
+  redacting, nor a credential directory (finding F12): such a rescue is refused, and the
+  file is not captured.
+- **`--list-only`** runs the merge's own plan scan (`job::scan_plan`) and its exit rule:
+  3 when a named file is not captured, and with `--fail-on-skip` when any file is skipped.
+- **Walk fix.** In a walk, a symlink whose target is a credential file (while redacting)
+  or lies inside a credential directory is left out. Before this, it carried that file in
+  under its own name.
+- **Cost.** Named lockfiles add tokens (a big `package-lock.json` can be 100 k or more).
+  `--budget-tokens` (exit 5) bounds an output.

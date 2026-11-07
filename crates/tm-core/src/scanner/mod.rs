@@ -196,6 +196,21 @@ const VCS_DIRS: &[&str] = &[".git", ".svn", ".hg", ".bzr"];
 /// Credential directories: pruned everywhere, even with hidden files on.
 const CREDENTIAL_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg"];
 
+/// Start of the reason of every named file a safety rule holds back
+/// (addendum 2026-11-07). The archive twin skips these entries too.
+pub const WITHHELD: &str = "named but withheld: ";
+
+/// Does a (relative) path go through a credential directory? A file named in
+/// an explicit list or rescued by hand is held back like the walk holds back
+/// the whole directory (addendum 2026-11-07).
+pub fn in_credential_dir(path: &Path) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| CREDENTIAL_DIRS.contains(&s.to_ascii_lowercase().as_str()))
+    })
+}
+
 /// Directory names that never hold a project's own source: dependency trees,
 /// tool caches, build caches, OS junk, TurboMerger's own state. Pruned at any
 /// depth. Ambiguous names (`build`, `dist`, `out`, `debug`, `release`,
@@ -399,7 +414,11 @@ pub struct ScanResult {
 /// Paths are relative to `root` ('/' separators; an absolute path must lie
 /// inside the root). `..`, paths resolving outside the root (symlinks
 /// included) and missing files are recorded as not captured; a path listed
-/// twice is merged once.
+/// twice is merged once. A named file is wanted (addendum 2026-11-07): the
+/// walk's bloat rules do not apply, and a safety rule that still holds it
+/// back makes it not captured (`classify_as`). Binary files keep their
+/// `Binary` entry here; `job::scan_plan` decides whether the archive twin
+/// keeps their bytes.
 pub fn scan_explicit(
     root: &Path,
     paths: &[String],
@@ -447,11 +466,38 @@ pub fn scan_explicit(
             continue;
         }
         let candidate = root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if let Ok(real) = dunce::canonicalize(&candidate) {
+        let real = dunce::canonicalize(&candidate).ok();
+        if let Some(real) = &real {
             if !real.starts_with(&root_canon) {
                 skipped.push(SkipEntry::new(
                     rel.clone(),
                     "resolves outside the source folder".to_string(),
+                    SkipKind::NotCaptured,
+                ));
+                continue;
+            }
+        }
+        // Safety by location: a credential directory is never scanned, named
+        // or not, and while secrets are protected a link to a credential file
+        // is that file (`classify_as` checks the name that was given).
+        let real_rel = real
+            .as_deref()
+            .and_then(|r| r.strip_prefix(&root_canon).ok());
+        if in_credential_dir(Path::new(&rel)) || real_rel.is_some_and(in_credential_dir) {
+            skipped.push(SkipEntry::new(
+                rel.clone(),
+                format!("{WITHHELD}inside a credential directory (never scanned)"),
+                SkipKind::NotCaptured,
+            ));
+            continue;
+        }
+        if options.protect_secrets {
+            if let Some(why) = real.as_deref().and_then(sensitive_reason) {
+                skipped.push(SkipEntry::new(
+                    rel.clone(),
+                    format!(
+                        "{WITHHELD}{why} (credential files stay out while secrets are redacted)"
+                    ),
                     SkipKind::NotCaptured,
                 ));
                 continue;
@@ -482,7 +528,7 @@ pub fn scan_explicit(
 
         let len = meta.len();
 
-        match classify(&candidate, len, options) {
+        match classify_as(&candidate, len, options, true) {
             Verdict::TextByExt => {
                 files.push(candidate);
                 stats.by_extension += 1;
@@ -1041,26 +1087,53 @@ fn is_openable_archive(name_lower: &str) -> bool {
 /// is. A 100 MB `.zip` or a large file of zeros is binary — excluded on
 /// purpose — not text that was "too large" to capture (which exits 3).
 fn classify(path: &Path, len: u64, options: &ScanOptions) -> Verdict {
+    classify_as(path, len, options, false)
+}
+
+/// The reason a file named in an explicit list is not merged although it was
+/// asked for (ADR 0020 addendum 2026-11-07): always `NotCaptured`, exit 3.
+fn withheld(why: &str) -> Verdict {
+    Verdict::Skip(format!("{WITHHELD}{why}"), SkipKind::NotCaptured)
+}
+
+/// `classify` for a walk (`named == false`) or for a file named in an
+/// explicit list (`named == true`, ADR 0020 addendum 2026-11-07, "named =
+/// wanted"). For a named file the bloat rules do not apply — lockfiles and
+/// system files by name, minified bundles, the "not worth reading" pictures,
+/// `turbomerger.toml` exclusions, and extensions listed as binary only
+/// because they are build caches (`.lock`, `.map`, …): its bytes decide. The
+/// safety rules still apply — credential files while secrets are protected,
+/// previous TurboMerger outputs — and turn into a named-but-withheld
+/// `NotCaptured` entry instead of a quiet "excluded on purpose".
+fn classify_as(path: &Path, len: u64, options: &ScanOptions, named: bool) -> Verdict {
     let name = match path.file_name().and_then(|n| n.to_str()) {
         Some(n) => n,
         None => return Verdict::Skip("unrepresentable file name".into(), SkipKind::NotCaptured),
     };
     let name_lower = name.to_lowercase();
 
-    if SKIP_FILES.iter().any(|&s| s == name_lower) {
+    if !named && SKIP_FILES.iter().any(|&s| s == name_lower) {
         return Verdict::Skip(
             "lock/system file (context bloat)".into(),
             SkipKind::Excluded,
         );
     }
     if is_own_output(&name_lower) {
+        if named {
+            return withheld("previous TurboMerger output (rename it to merge it)");
+        }
         return Verdict::Skip("previous TurboMerger output".into(), SkipKind::Excluded);
     }
-    if is_minified_filename(name) {
+    if !named && is_minified_filename(name) {
         return Verdict::Skip("minified/bundled".into(), SkipKind::Excluded);
     }
     if options.protect_secrets {
         if let Some(reason) = sensitive_reason(path) {
+            if named {
+                return withheld(&format!(
+                    "{reason} (credential files stay out while secrets are redacted)"
+                ));
+            }
             return Verdict::Skip(reason.to_string(), SkipKind::Excluded);
         }
     }
@@ -1089,7 +1162,7 @@ fn classify(path: &Path, len: u64, options: &ScanOptions) -> Verdict {
                     SkipKind::NotCaptured,
                 );
             }
-            if picture && !options.ocr_all_pictures {
+            if picture && !options.ocr_all_pictures && !named {
                 if let Some(why) = crate::extract::non_content_picture(path) {
                     return Verdict::Skip(why, SkipKind::Excluded);
                 }
@@ -1104,16 +1177,22 @@ fn classify(path: &Path, len: u64, options: &ScanOptions) -> Verdict {
     // Known by name or extension: user overrides, binary types, text types.
     let known_text = match ext_lower.as_deref() {
         Some(ext) => {
-            // Step 1: Config exclude list (highest priority user override)
-            if options.extra_skip_exts.iter().any(|e| e == ext) {
+            // Step 1: Config exclude list (highest priority user override for
+            // a walk; a named file was asked for by name, like a glob miss).
+            if !named && options.extra_skip_exts.iter().any(|e| e == ext) {
                 return Verdict::Skip("excluded by turbomerger.toml".into(), SkipKind::Excluded);
             }
-            // Step 2: Known binary extension → skip, whatever its size
-            if BINARY_EXTENSIONS.contains(ext) || options.extra_binary_exts.iter().any(|e| e == ext)
+            // Step 2: Known binary extension → skip, whatever its size. The
+            // built-in list also holds text caches (`.lock`, `.map`,
+            // `.tsbuildinfo`): for a named file the content sniff decides.
+            if options.extra_binary_exts.iter().any(|e| e == ext)
+                || (BINARY_EXTENSIONS.contains(ext) && !(named && options.content_sniff))
             {
                 return Verdict::Skip("binary extension".into(), SkipKind::Binary);
             }
-            TEXT_EXTENSIONS.contains(ext) || options.extra_text_exts.iter().any(|e| e == ext)
+            !BINARY_EXTENSIONS.contains(ext)
+                && (TEXT_EXTENSIONS.contains(ext)
+                    || options.extra_text_exts.iter().any(|e| e == ext))
         }
         None => is_known_extensionless_file(&name_lower),
     };
@@ -1639,6 +1718,21 @@ pub fn scan_with(
         if p.symlink {
             stats.symlinks += 1;
             match resolve_symlink(&p.path, &root_canon) {
+                // A link must not carry a credential file in under another
+                // name (2026-11-07): `.env` behind `notes.txt` is the `.env`.
+                // First, so the report never says "content included there"
+                // for a file the credential rule keeps out.
+                LinkTarget::InRootFile(target_rel)
+                    if in_credential_dir(Path::new(&target_rel))
+                        || (protect_secrets
+                            && sensitive_reason(Path::new(&target_rel)).is_some()) =>
+                {
+                    skipped.push(SkipEntry::new(
+                        rel,
+                        format!("symlink to {target_rel} — a credential file, left out"),
+                        SkipKind::Excluded,
+                    ));
+                }
                 LinkTarget::InRootFile(target_rel) if candidate_rels.contains_str(&target_rel) => {
                     skipped.push(SkipEntry::new(
                         rel,
@@ -2327,5 +2421,213 @@ mod tests {
             .find(|s| s.path == "queue")
             .expect("the FIFO is recorded");
         assert!(fifo.reason.contains("named pipe"), "{}", fifo.reason);
+    }
+
+    /// ADR 0020 addendum 2026-11-07 ("named = wanted"): a file named in an
+    /// explicit list is merged although a walk leaves it out as bloat; the
+    /// walk itself does not change.
+    #[test]
+    fn named_lockfiles_minified_and_cache_files_are_merged_walks_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("web")).unwrap();
+        let text_files = [
+            ("app.js", "console.log('app');\n"),
+            ("package-lock.json", "{\"lockfileVersion\": 3}\n"),
+            ("web/package-lock.json", "{\"name\": \"web\"}\n"),
+            ("Cargo.lock", "version = 4\n\n[[package]]\nname = \"a\"\n"),
+            ("yarn.lock", "# yarn lockfile v1\n"),
+            ("vendor.min.js", "!function(){}();\n"),
+            ("app.js.map", "{\"version\":3,\"mappings\":\"AAAA\"}\n"),
+            ("desktop.ini", "[.ShellClassInfo]\n"),
+        ];
+        for (rel, body) in text_files {
+            std::fs::write(root.join(rel), body).unwrap();
+        }
+        // bun's binary lockfile stays binary: the bytes decide, not the name.
+        std::fs::write(
+            root.join("bun.lockb"),
+            b"\x89LOCKB\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0e\x0f\x10\x11\x12\x13\x14",
+        )
+        .unwrap();
+
+        let walk = scan_text_files(&root, &ScanOptions::default()).unwrap();
+        let walked: Vec<String> = walk
+            .files
+            .iter()
+            .map(|f| relative_display(&root, f))
+            .collect();
+        assert_eq!(walked, vec!["app.js"], "walk unchanged: {walked:?}");
+        let why = |p: &str| {
+            walk.skipped
+                .iter()
+                .find(|s| s.path == p)
+                .map(|s| (s.reason.clone(), s.kind))
+        };
+        assert_eq!(
+            why("package-lock.json"),
+            Some((
+                "lock/system file (context bloat)".into(),
+                SkipKind::Excluded
+            ))
+        );
+        assert_eq!(why("app.js.map").map(|w| w.1), Some(SkipKind::Binary));
+
+        let mut named: Vec<String> = text_files.iter().map(|(p, _)| p.to_string()).collect();
+        named.push("bun.lockb".into());
+        let scan = scan_explicit(&root, &named, &ScanOptions::default()).unwrap();
+        let merged: Vec<String> = scan
+            .files
+            .iter()
+            .map(|f| relative_display(&root, f))
+            .collect();
+        let want: Vec<String> = text_files.iter().map(|(p, _)| p.to_string()).collect();
+        assert_eq!(merged, want, "{:?}", scan.skipped);
+        assert_eq!(scan.skipped.len(), 1, "{:?}", scan.skipped);
+        assert_eq!(scan.skipped[0].path, "bun.lockb");
+        assert_eq!(scan.skipped[0].kind, SkipKind::Binary);
+
+        // Content detection off: the built-in binary list stands.
+        let off = ScanOptions {
+            content_sniff: false,
+            ..Default::default()
+        };
+        let scan = scan_explicit(&root, &["Cargo.lock".to_string()], &off).unwrap();
+        assert!(scan.files.is_empty());
+        assert_eq!(scan.skipped[0].kind, SkipKind::Binary);
+    }
+
+    /// The safety rules still hold for named files and say so: not captured
+    /// (exit 3), never a quiet "excluded on purpose".
+    #[test]
+    fn named_files_held_back_by_a_safety_rule_are_not_captured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "outside\n").unwrap();
+        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+        std::fs::write(root.join(".env"), "API_KEY=synthetic-not-a-secret\n").unwrap();
+        std::fs::write(root.join("id_rsa"), "synthetic key body\n").unwrap();
+        std::fs::write(root.join(".ssh/config"), "Host example\n").unwrap();
+        std::fs::write(root.join("old_merged.md"), "# previous output\n").unwrap();
+        std::fs::write(root.join("ok.txt"), "fine\n").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join(".env"), root.join("notes.txt")).unwrap();
+            std::os::unix::fs::symlink(outside.path().join("secret.txt"), root.join("escape.txt"))
+                .unwrap();
+        }
+        let named: Vec<String> = [
+            ".env",
+            "id_rsa",
+            ".ssh/config",
+            "old_merged.md",
+            "ok.txt",
+            "../outside.txt",
+            "missing.txt",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(
+            cfg!(unix)
+                .then(|| ["notes.txt".to_string(), "escape.txt".to_string()])
+                .into_iter()
+                .flatten(),
+        )
+        .collect();
+
+        let redacting = ScanOptions {
+            protect_secrets: true,
+            ..Default::default()
+        };
+        let scan = scan_explicit(&root, &named, &redacting).unwrap();
+        let merged: Vec<String> = scan
+            .files
+            .iter()
+            .map(|f| relative_display(&root, f))
+            .collect();
+        assert_eq!(merged, vec!["ok.txt"], "{:?}", scan.skipped);
+        assert_eq!(scan.skipped.len(), named.len() - 1, "{:?}", scan.skipped);
+        assert!(
+            scan.skipped.iter().all(|s| s.kind == SkipKind::NotCaptured),
+            "{:?}",
+            scan.skipped
+        );
+        let reason = |p: &str| {
+            scan.skipped
+                .iter()
+                .find(|s| s.path == p)
+                .map(|s| s.reason.clone())
+                .unwrap_or_default()
+        };
+        for p in [".env", "id_rsa", ".ssh/config", "old_merged.md"] {
+            assert!(
+                reason(p).starts_with("named but withheld: "),
+                "{p}: {}",
+                reason(p)
+            );
+        }
+        assert!(reason(".env").contains("env file"), "{}", reason(".env"));
+        #[cfg(unix)]
+        {
+            assert!(
+                reason("notes.txt").contains("env file"),
+                "{}",
+                reason("notes.txt")
+            );
+            assert!(
+                reason("escape.txt").contains("outside"),
+                "{}",
+                reason("escape.txt")
+            );
+            // The walk: a link no longer carries a credential file in by its
+            // own name. `.ssh/` is pruned, so before 2026-11-07 a link into
+            // it was merged under the link's name (the target is no
+            // candidate); a link to .env said "content included there".
+            std::os::unix::fs::symlink(root.join(".ssh/config"), root.join("hosts.txt")).unwrap();
+            let walk = scan_text_files(&root, &redacting).unwrap();
+            for link in ["notes.txt", "hosts.txt"] {
+                assert!(
+                    !walk.files.iter().any(|f| f.ends_with(link)),
+                    "{link}: {:?}",
+                    walk.files
+                );
+                assert!(
+                    walk.skipped
+                        .iter()
+                        .any(|s| s.path == link && s.reason.contains("credential file")),
+                    "{link}: {:?}",
+                    walk.skipped
+                );
+            }
+        }
+
+        // Redaction off: credential files by name are taken (as in a walk);
+        // a credential directory and previous outputs still are not.
+        let scan = scan_explicit(
+            &root,
+            &named,
+            &ScanOptions {
+                protect_secrets: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut merged: Vec<String> = scan
+            .files
+            .iter()
+            .map(|f| relative_display(&root, f))
+            .collect();
+        merged.sort();
+        let mut want = vec![".env", "id_rsa", "ok.txt"];
+        if cfg!(unix) {
+            want.push("notes.txt");
+        }
+        want.sort();
+        assert_eq!(merged, want, "{:?}", scan.skipped);
+        assert!(scan
+            .skipped
+            .iter()
+            .any(|s| s.path == ".ssh/config" && s.reason.contains("credential directory")));
     }
 }

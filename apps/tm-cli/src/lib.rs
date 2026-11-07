@@ -50,7 +50,8 @@ pub const EXIT_GATE_FAILED: i32 = 5;
 #[derive(Parser, Debug)]
 #[command(
     name = "turbomerger",
-    version,
+    // `7.7.0+<commit> (<date>)` from build.rs (E2, 2026-11-07).
+    version = env!("TM_VERSION_STAMP"),
     about = "Merge a codebase or document folder into LLM-ready files; apply LLM replies back safely.",
     after_help = "Run without arguments to open the desktop app. Exit codes: 0 complete, 1 error, 2 usage, 3 completed with content not captured, 4 cancelled or partial."
 )]
@@ -726,6 +727,9 @@ fn run_merge(a: MergeCmd) -> i32 {
                     }
                 );
             }
+            for p in &resolved.twin_only {
+                println!("TWIN BYTES    {p}  (binary: kept byte for byte by the archive twin)");
+            }
             for s in &resolved.not_captured {
                 println!("NOT CAPTURED  {}  ({})", s.0, s.1);
             }
@@ -739,10 +743,12 @@ fn run_merge(a: MergeCmd) -> i32 {
                     format!(", {} not captured", resolved.not_captured.len())
                 }
             );
-            return if resolved.not_captured.is_empty() {
-                EXIT_OK
-            } else {
+            // The merge's exit rule (merge_exit_code), so the list predicts it.
+            return if !resolved.not_captured.is_empty() || (a.fail_on_skip && resolved.file_skipped)
+            {
                 EXIT_SKIPS
+            } else {
+                EXIT_OK
             };
         }
     }
@@ -887,21 +893,22 @@ struct ResolvedFiles {
     files: Vec<(String, u64)>,
     /// (path, reason) of named files that cannot be captured.
     not_captured: Vec<(String, String)>,
+    /// Binary files a `--complete` plan names: their bytes go to the archive
+    /// twin, not to the text.
+    twin_only: Vec<String>,
+    /// Some file is skipped (excluded, binary or not captured): what
+    /// `--fail-on-skip` turns into exit 3, as in the merge.
+    file_skipped: bool,
 }
 
 fn resolve_plan_files(options: &tm_core::job::MergeOptions) -> Result<ResolvedFiles, String> {
     use tm_core::scanner::{self, SkipKind};
     let job = tm_core::job::resolve_job(options)?;
     let scan = match &options.selection {
+        // The merge's own plan scan (ADR 0020 addendum 2026-11-07), so the
+        // list and the merge never disagree.
         Some(plan) if plan.mode == tm_core::selection::SelectionMode::Explicit => {
-            let paths: Vec<String> = plan
-                .files
-                .iter()
-                .filter(|f| !f.exclude)
-                .map(|f| f.path.clone())
-                .collect();
-            scanner::scan_explicit(&job.root, &paths, &job.scan_options)
-                .map_err(|e| e.to_string())?
+            tm_core::job::scan_plan(&job, plan).map_err(|e| e.to_string())?
         }
         _ => {
             let flag = std::sync::atomic::AtomicBool::new(false);
@@ -931,7 +938,29 @@ fn resolve_plan_files(options: &tm_core::job::MergeOptions) -> Result<ResolvedFi
             .filter(|s| s.kind == SkipKind::NotCaptured)
             .map(|s| (s.path.clone(), s.reason.clone()))
             .collect(),
+        twin_only: if job.merge_config.complete && explicit_plan(options) {
+            skipped
+                .iter()
+                .filter(|s| s.kind == SkipKind::Binary)
+                .map(|s| s.path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        },
+        file_skipped: skipped.iter().any(|s| {
+            matches!(
+                s.kind,
+                SkipKind::Excluded | SkipKind::Binary | SkipKind::NotCaptured
+            )
+        }),
     })
+}
+
+fn explicit_plan(options: &tm_core::job::MergeOptions) -> bool {
+    options
+        .selection
+        .as_ref()
+        .is_some_and(|p| p.mode == tm_core::selection::SelectionMode::Explicit)
 }
 
 /// One-line summary of what a plan entry takes from its file.

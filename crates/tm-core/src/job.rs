@@ -397,6 +397,9 @@ pub struct Curation<'a> {
     pub exclude_dirs: &'a [String],
     /// Keep the scan order (a selection plan's order) instead of sorting.
     pub keep_order: bool,
+    /// Secrets are redacted: a rescue never lifts credential-file
+    /// protection (F12, 2026-11-07).
+    pub protect_secrets: bool,
 }
 
 impl<'a> Curation<'a> {
@@ -407,8 +410,41 @@ impl<'a> Curation<'a> {
             exclude_paths: &options.exclude_paths,
             exclude_dirs: &options.exclude_dirs,
             keep_order,
+            protect_secrets: options.redact_secrets,
         }
     }
+}
+
+/// The scan of an explicit plan (ADR 0020): exactly the named files, never a
+/// walk — one function for the merge and for `--list-only`, so both list the
+/// same files. A named binary file reaches the output only through the
+/// archive twin; without `--complete` it is named but not merged:
+/// `NotCaptured` (exit 3), never a quiet "binary" line (addendum 2026-11-07).
+pub fn scan_plan(
+    job: &ResolvedJob,
+    plan: &crate::selection::SelectionPlan,
+) -> std::io::Result<scanner::ScanResult> {
+    let paths: Vec<String> = plan
+        .files
+        .iter()
+        .filter(|f| !f.exclude)
+        .map(|f| f.path.clone())
+        .collect();
+    let mut scan = scanner::scan_explicit(&job.root, &paths, &job.scan_options)?;
+    if !job.merge_config.complete {
+        for s in scan
+            .skipped
+            .iter_mut()
+            .filter(|s| s.kind == scanner::SkipKind::Binary)
+        {
+            s.reason = format!(
+                "named but not merged: {} (binary bytes are kept only by the archive twin, --complete)",
+                s.reason
+            );
+            s.kind = scanner::SkipKind::NotCaptured;
+        }
+    }
+    Ok(scan)
 }
 
 /// Apply force-include rescues and the curated selection to a scan result.
@@ -426,6 +462,7 @@ pub fn apply_selection(
         exclude_paths,
         exclude_dirs,
         keep_order,
+        protect_secrets,
     } = *cur;
     for rel in force_include {
         let candidate = root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -438,6 +475,39 @@ pub fn apply_selection(
             continue;
         };
         if !canon.starts_with(&root_canon) || !candidate.is_file() {
+            continue;
+        }
+        // Safety rules a rescue never lifts (F12, addendum 2026-11-07): a
+        // credential directory is never scanned, and while secrets are
+        // redacted a credential file stays out. The target's name counts
+        // too: a link called notes.txt that points at .env is still the .env.
+        let in_cred_dir = scanner::in_credential_dir(Path::new(rel))
+            || canon
+                .strip_prefix(&root_canon)
+                .is_ok_and(scanner::in_credential_dir);
+        let why = if in_cred_dir {
+            Some("inside a credential directory (never scanned)".to_string())
+        } else if protect_secrets {
+            security::sensitive_reason(&candidate)
+                .or_else(|| security::sensitive_reason(&canon))
+                .map(|w| format!("{w} (credential files stay out while secrets are redacted)"))
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            let reason = format!("{}{why}", scanner::WITHHELD);
+            match skipped.iter_mut().find(|s| s.path == *rel) {
+                Some(s) => {
+                    s.reason = reason;
+                    s.kind = scanner::SkipKind::NotCaptured;
+                }
+                None => skipped.push(SkipEntry::new(
+                    rel.clone(),
+                    reason,
+                    scanner::SkipKind::NotCaptured,
+                )),
+            }
+            files.retain(|f| f != &candidate);
             continue;
         }
         if !files.contains(&candidate) {
@@ -609,14 +679,7 @@ pub fn run_merge(
     };
     let scan = if let Some(plan) = &options.selection {
         if plan.mode == crate::selection::SelectionMode::Explicit {
-            let paths: Vec<String> = plan
-                .files
-                .iter()
-                .filter(|f| !f.exclude)
-                .map(|f| f.path.clone())
-                .collect();
-            scanner::scan_explicit(&job.root, &paths, &job.scan_options)
-                .map_err(|e| JobError::Scan(e.to_string()))?
+            scan_plan(&job, plan).map_err(|e| JobError::Scan(e.to_string()))?
         } else {
             scanner::scan_with(&job.root, &job.scan_options, cancel.flag(), &on_scan).map_err(
                 |e| {
@@ -662,6 +725,9 @@ pub fn run_merge(
         let inside = dunce::canonicalize(&job.root).unwrap_or_else(|_| job.root.clone());
         job.merge_config.archive_also = skipped
             .iter()
+            // A file a safety rule holds back never rides along as bytes
+            // (credential directory, previous output; addendum 2026-11-07).
+            .filter(|s| !s.reason.starts_with(scanner::WITHHELD))
             .filter_map(|s| crate::selection::normalize_rel(&s.path).ok())
             .map(|rel| {
                 job.root
@@ -995,5 +1061,105 @@ mod tests {
             .map(|f| crate::scanner::relative_display(&root, f))
             .collect();
         assert_eq!(rels, vec!["a.rs", "notes.txt"]);
+    }
+
+    /// The desktop app's two pick paths, through `run_merge` as the app calls
+    /// it (ADR 0020 addendum 2026-11-07): "Load plan…" merges a named
+    /// lockfile; "include anyway" never lifts credential protection while
+    /// redacting (F12), and a refused rescue is not captured.
+    #[test]
+    fn desktop_plan_and_rescue_paths_follow_named_equals_wanted() {
+        use crate::scanner::SkipKind;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("r");
+        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+        std::fs::write(root.join("app.js"), "console.log(1);\n").unwrap();
+        std::fs::write(root.join("package-lock.json"), "{\"lockfileVersion\":3}\n").unwrap();
+        std::fs::write(root.join(".env"), "TOKEN=synthetic-value-0000\n").unwrap();
+        std::fs::write(root.join(".ssh/config"), "Host example\n").unwrap();
+        std::fs::write(root.join("pic.png"), b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+        let out = |n: &str| tmp.path().join(n);
+
+        // Load plan…: the named lockfile is merged, byte for byte.
+        let mut plan_opts = MergeOptions::for_folder(root.to_string_lossy());
+        plan_opts.selection = Some(crate::selection::SelectionPlan::from_paths(&[
+            "app.js".to_string(),
+            "package-lock.json".to_string(),
+        ]));
+        let run = run_merge(
+            &plan_opts,
+            Some(&out("plan.md")),
+            &CancelToken::new(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(run.result.files_processed, 2, "{:?}", run.scan_skipped);
+        assert!(run.scan_skipped.is_empty(), "{:?}", run.scan_skipped);
+        let text = std::fs::read_to_string(out("plan.md")).unwrap();
+        assert!(text.contains("{\"lockfileVersion\":3}\n"));
+
+        // A named picture without the archive twin is named but not merged;
+        // with --complete its bytes go to the twin (Binary, as before).
+        let mut pic = MergeOptions::for_folder(root.to_string_lossy());
+        pic.selection = Some(crate::selection::SelectionPlan::from_paths(&[
+            "app.js".to_string(),
+            "pic.png".to_string(),
+        ]));
+        let job = resolve_job(&pic).unwrap();
+        let scan = scan_plan(&job, pic.selection.as_ref().unwrap()).unwrap();
+        assert_eq!(scan.skipped.len(), 1);
+        assert_eq!(scan.skipped[0].kind, SkipKind::NotCaptured);
+        assert!(
+            scan.skipped[0].reason.contains("--complete"),
+            "{:?}",
+            scan.skipped
+        );
+        pic.complete = true;
+        let job = resolve_job(&pic).unwrap();
+        let scan = scan_plan(&job, pic.selection.as_ref().unwrap()).unwrap();
+        assert_eq!(scan.skipped[0].kind, SkipKind::Binary);
+
+        // include anyway: a lockfile is rescued; .env is not while redacting,
+        // and .ssh/ never is.
+        let mut rescue = MergeOptions::for_folder(root.to_string_lossy());
+        rescue.redact_secrets = true;
+        rescue.include_hidden = true;
+        rescue.force_include = vec![
+            "package-lock.json".to_string(),
+            ".env".to_string(),
+            ".ssh/config".to_string(),
+        ];
+        let run = run_merge(
+            &rescue,
+            Some(&out("rescue.md")),
+            &CancelToken::new(),
+            &|_| {},
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(out("rescue.md")).unwrap();
+        assert!(text.contains("lockfileVersion"));
+        assert!(!text.contains("synthetic-value-0000"), "secret file merged");
+        assert!(
+            !text.contains("Host example"),
+            "credential directory merged"
+        );
+        for p in [".env", ".ssh/config"] {
+            let s = run
+                .scan_skipped
+                .iter()
+                .find(|s| s.path == p)
+                .unwrap_or_else(|| panic!("{p} not reported: {:?}", run.scan_skipped));
+            assert_eq!(s.kind, SkipKind::NotCaptured, "{s:?}");
+            assert!(s.reason.starts_with("named but withheld: "), "{s:?}");
+        }
+        assert!(count_not_captured(&run.scan_skipped, &run.outcome.skipped) >= 2);
+
+        // Redaction off: credential protection follows it, .env is rescued.
+        rescue.redact_secrets = false;
+        let run = run_merge(&rescue, Some(&out("open.md")), &CancelToken::new(), &|_| {}).unwrap();
+        let text = std::fs::read_to_string(out("open.md")).unwrap();
+        assert!(text.contains("synthetic-value-0000"));
+        assert!(!text.contains("Host example"));
+        assert!(run.scan_skipped.iter().any(|s| s.path == ".ssh/config"));
     }
 }
