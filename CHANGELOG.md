@@ -30,6 +30,11 @@ Every fix ships with its repro turned into a test (96 → 156 Rust tests).
 - `turbomerger --version` prints `7.7.0+<commit> (<commit date>)`, with `.dirty` for
   uncommitted changes (`apps/tm-cli/build.rs`). The Dev build printed a bare `7.7.0`,
   like the retired 2026-08 package.
+- Measured with the installed Dev build (7.7.0+1ca3873): the 253-file list now merges
+  253 of 253 with exit 0 and no hand additions. 249 sections are byte-identical to their
+  files and 4 differ only at `[REDACTED]`. The three named `package-lock.json` raise the
+  output from about 326 k to 733 k o200k tokens. The same folder scanned without a list
+  still leaves the lockfiles out (exit 0). `tm_verify.py selftest` passes.
 - ADR 0020 addendum 2026-11-07; tests: `named_lockfiles_minified_and_cache_files_are_merged_walks_unchanged`,
   `named_files_held_back_by_a_safety_rule_are_not_captured`,
   `desktop_plan_and_rescue_paths_follow_named_equals_wanted`,

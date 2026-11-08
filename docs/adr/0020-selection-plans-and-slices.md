@@ -62,7 +62,7 @@
   three `package-lock.json` were "lock/system file (context bloat) [excluded on
   purpose]". The explicit list ran the folder walk's bloat rules, and only a "not
   captured" entry fails a merge, so named files went missing with no failure: the quiet
-  gap this ADR rules out. Decision D8 (Pawel, 2026-11-07): named = included.
+  gap this ADR rules out. Decision D8 (2026-11-07): named = included.
 - **Rule.** In explicit mode (`--files-from`, `--selection`, desktop "Load plan…") a
   named file is merged when its bytes are text or a document, whatever its name:
   - The walk's bloat rules do not apply. That covers lockfiles and system files by name
